@@ -14,7 +14,8 @@ import {
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import Constants from "expo-constants";
+import * as Device from "expo-device";
 import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import * as DocumentPicker from "expo-document-picker";
@@ -22,7 +23,6 @@ import {
   balance,
   Customer,
   Data,
-  demoData,
   Entry,
   initialData,
   money,
@@ -31,6 +31,7 @@ import {
   uid,
   validBackup,
 } from "./src/model";
+import * as api from "./src/api";
 import {
   Button,
   Card,
@@ -73,7 +74,6 @@ type Screen =
   | "account"
   | "audit";
 type Route = { screen: Screen; id?: string };
-const STORAGE = "digital-khata-v1";
 const monthLabel = (month: string) =>
   new Date(`${month}-01T12:00:00`).toLocaleDateString("en-IN", {
     month: "long",
@@ -111,6 +111,7 @@ const titles: Partial<Record<Screen, string>> = {
 function AppContent() {
   const [data, setData] = useState<Data>(initialData);
   const dataRef = useRef(data);
+  const persistedRef = useRef<Data | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const writeQueue = useRef<Promise<boolean>>(Promise.resolve(true));
@@ -122,6 +123,8 @@ function AppContent() {
   const [form, setForm] = useState<Record<string, string>>({});
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
+  const [otpHint, setOtpHint] = useState("");
+  const [notices, setNotices] = useState<{id:string;title:string;body:string;read:boolean;date:string}[]>([]);
   const [seconds, setSeconds] = useState(30);
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
@@ -132,27 +135,20 @@ function AppContent() {
     let live = true;
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(STORAGE);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (!validBackup(parsed)) throw new Error("Invalid stored data");
-          if (live) {
-            setData(parsed);
-            dataRef.current = parsed;
-            setRoute({
-              screen: parsed.signedIn
-                ? parsed.shop.name
-                  ? "home"
-                  : "setup"
-                : "welcome",
-            });
-          }
+        const remote = await api.restoreSession();
+        if (live && remote) {
+          const parsed = api.normalizeData(remote);
+          if (!validBackup(parsed)) throw new Error("Invalid server data");
+          setData(parsed);
+          dataRef.current = parsed;
+          persistedRef.current = parsed;
+          setRoute({ screen: parsed.shop.name ? "home" : "setup" });
         }
-      } catch {
+      } catch (error) {
         if (live) setLoadError(true);
         Alert.alert(
-          "Could not load your khata",
-          "Stored data could not be read. Please restart the app before adding new records.",
+          "Could not connect to your khata",
+          error instanceof Error ? error.message : "Check your internet connection and try again.",
         );
       } finally {
         if (live) setLoaded(true);
@@ -162,6 +158,28 @@ function AppContent() {
       live = false;
     };
   }, []);
+  useEffect(() => {
+    if (!data.signedIn) return;
+    if (Constants.appOwnership === "expo") return;
+    let live = true;
+    (async () => {
+      try {
+        const Notifications = await import("expo-notifications");
+        if (Platform.OS === "android") await Notifications.setNotificationChannelAsync("default", { name: "Digital Khata", importance: Notifications.AndroidImportance.DEFAULT });
+        if (!Device.isDevice || !process.env.EXPO_PUBLIC_EAS_PROJECT_ID) return;
+        const current = await Notifications.getPermissionsAsync();
+        const permission = current.granted ? current : await Notifications.requestPermissionsAsync();
+        if (!permission.granted) return;
+        const token = await Notifications.getExpoPushTokenAsync({ projectId: process.env.EXPO_PUBLIC_EAS_PROJECT_ID });
+        if (live) await api.registerPushToken(token.data, Platform.OS === "ios" ? "ios" : "android");
+      } catch { /* Push registration requires a configured EAS project and device. */ }
+    })();
+    return () => { live = false; };
+  }, [data.signedIn]);
+  useEffect(() => {
+    if (route.screen !== "notifications" || !data.signedIn) return;
+    api.getNotifications().then(result => setNotices(result.items)).catch(() => {});
+  }, [route.screen, data.signedIn]);
   useEffect(() => {
     if (route.screen !== "otp" || seconds <= 0) return;
     const t = setTimeout(() => setSeconds(seconds - 1), 1000);
@@ -184,18 +202,26 @@ function AppContent() {
   }, [history, route, data.signedIn]);
   function commit(next: Data): Promise<boolean> {
     if (loadError) return Promise.resolve(false);
+    const previous = dataRef.current;
     dataRef.current = next;
     const operation = writeQueue.current.then(async () => {
       try {
-        await AsyncStorage.setItem(STORAGE, JSON.stringify(next));
+        const persisted = persistedRef.current;
+        if (persisted?.signedIn && !next.signedIn) {
+          await api.logout();
+          persistedRef.current = null;
+        } else if (persisted?.signedIn) {
+          await api.syncChange(persisted, next);
+          persistedRef.current = next;
+        }
         setData(next);
         return true;
-      } catch {
-        setLoadError(true);
-        Alert.alert(
-          "Unable to save",
-          "Your change was not saved. Restart the app and check available storage before continuing.",
-        );
+      } catch (error) {
+        if (dataRef.current === next) {
+          dataRef.current = previous;
+          setData(previous);
+        }
+        Alert.alert("Unable to save", error instanceof Error ? error.message : "Please check your connection and try again.");
         return false;
       }
     });
@@ -237,7 +263,7 @@ function AppContent() {
               address: "",
               opening: "0",
               limit: "10000",
-              reminder: "true",
+              reminder: "false",
             },
       );
     }
@@ -623,17 +649,25 @@ function AppContent() {
         const file = new File(Paths.cache, name);
         if (file.exists) file.delete();
       }
-      await save(initialData, () => {
-        setPhone("");
-        setOtp("");
-        setForm({});
-        go("welcome", undefined, true);
-      });
+      if (lock.current) return;
+      lock.current = true;
+      setBusy(true);
+      await api.deleteAccount();
+      dataRef.current = initialData;
+      setData(initialData);
+      persistedRef.current = null;
+      setPhone("");
+      setOtp("");
+      setForm({});
+      go("welcome", undefined, true);
     } catch {
       Alert.alert(
         "Unable to delete",
         "Could not remove cached exports. Please restart the app and try again.",
       );
+    } finally {
+      lock.current = false;
+      setBusy(false);
     }
   }
   async function restore() {
@@ -650,16 +684,26 @@ function AppContent() {
           "This file is not a valid Digital Khata backup.",
         );
       Alert.alert(
-        "Replace local data?",
-        `Restore ${parsed.customers.length} customers and ${parsed.entries.length} transactions? Current local records will be replaced.`,
+        "Replace cloud data?",
+        `Restore ${parsed.customers.length} customers and ${parsed.entries.length} transactions? Current cloud records will be replaced.`,
         [
           { text: "Cancel", style: "cancel" },
           {
             text: "Restore",
-            onPress: () =>
-              save({ ...parsed, signedIn: true }, () =>
-                go("home", undefined, true),
-              ),
+            onPress: async () => {
+              if (lock.current) return;
+              lock.current = true;
+              setBusy(true);
+              try {
+                const restored = await api.restoreBackup({ ...parsed, signedIn: true });
+                  dataRef.current = restored;
+                  setData(restored);
+                  persistedRef.current = restored;
+                go("home", undefined, true);
+              } catch (error) {
+                Alert.alert("Restore failed", error instanceof Error ? error.message : "Please try again.");
+              } finally { lock.current = false; setBusy(false); }
+            },
           },
         ],
       );
@@ -740,25 +784,8 @@ function AppContent() {
             secondary
             onPress={() => go("login")}
           />
-          <Button
-            title="Explore demo shop"
-            secondary
-            onPress={() => {
-              if (data.shop.name || data.customers.length) {
-                Alert.alert(
-                  "A shop already exists",
-                  "Log in to your existing shop. Export a backup and delete the local account before loading new demo data.",
-                );
-                return;
-              }
-              save({ ...demoData(), language: data.language }, () =>
-                go("home", undefined, true),
-              );
-            }}
-          />
           <Hint>
-            Demo mode • Data is stored on this device. No real OTP or cloud
-            account is created.
+            Sign in securely with your mobile number. Your khata syncs to your account.
           </Hint>
         </>
       );
@@ -778,21 +805,28 @@ function AppContent() {
           />
           <Button
             title="Continue"
-            onPress={() => {
+            disabled={busy}
+            onPress={async () => {
               if (!phoneValid(phone))
                 return Alert.alert(
                   "Invalid mobile number",
                   "Enter a valid 10-digit Indian mobile number.",
                 );
-              setOtp("");
-              setSeconds(30);
-              go("otp");
+              setBusy(true);
+              try {
+                const result = await api.startOtp(`+91${phone}`);
+                setOtp("");
+                setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A verification code was sent by SMS.");
+                setSeconds(30);
+                go("otp");
+              } catch (error) {
+                Alert.alert("Could not send OTP", error instanceof Error ? error.message : "Please try again.");
+              } finally { setBusy(false); }
             }}
           />
           <Card>
             <Hint>
-              Local demo login: use verification code 123456. SMS verification
-              requires a connected authentication service.
+              We’ll send a one-time verification code to your mobile number.
             </Hint>
           </Card>
         </>
@@ -802,20 +836,23 @@ function AppContent() {
       content = (
         <>
           <Title>Enter OTP</Title>
-          <Hint>Demo verification for +91 {phone}</Hint>
+          <Hint>{otpHint || `Verification code sent to +91 ${phone}`}</Hint>
           <Field
-            label="6-digit verification code"
+            label="Verification code"
             keyboardType="number-pad"
-            maxLength={6}
+            maxLength={8}
             value={otp}
             onChangeText={setOtp}
             placeholder="• • • • • •"
           />
           <Pressable
             disabled={seconds > 0}
-            onPress={() => {
+            onPress={async () => {
               setSeconds(30);
-              Alert.alert("Demo code", "Use 123456. No SMS was sent.");
+              try {
+                const result = await api.startOtp(`+91${phone}`);
+                setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A new verification code was sent by SMS.");
+              } catch (error) { Alert.alert("Could not resend OTP", error instanceof Error ? error.message : "Please try again."); }
             }}
           >
             <Text style={s.link}>
@@ -827,28 +864,18 @@ function AppContent() {
           <Button
             title="Verify"
             disabled={busy}
-            onPress={() => {
-              if (otp !== "123456")
-                return Alert.alert(
-                  "Incorrect code",
-                  "Use 123456 for the local demo.",
-                );
-              if (data.shop.phone && data.shop.phone !== phone)
-                return Alert.alert(
-                  "Different shop number",
-                  "This device already has a shop. Use its mobile number or delete the local account before setting up another shop.",
-                );
-              save(
-                { ...data, signedIn: true, shop: { ...data.shop, phone } },
-                () => {
-                  if (data.shop.name) go("home", undefined, true);
-                  else {
-                    setRoute({ screen: "setup" });
-                    setHistory([]);
-                    setForm({ ...data.shop, phone });
-                  }
-                },
-              );
+            onPress={async () => {
+              if (!/^\d{4,8}$/.test(otp)) return Alert.alert("Invalid code", "Enter the verification code sent to your phone.");
+              setBusy(true);
+              try {
+                const remote = api.normalizeData(await api.verifyOtp(`+91${phone}`, otp));
+                dataRef.current = remote;
+                setData(remote);
+                persistedRef.current = remote;
+                if (remote.shop.name) go("home", undefined, true);
+                else { setRoute({ screen: "setup" }); setHistory([]); setForm({ ...remote.shop, phone }); }
+              } catch (error) { Alert.alert("Could not verify OTP", error instanceof Error ? error.message : "Check the code and try again."); }
+              finally { setBusy(false); }
             }}
           />
           <Button
@@ -1049,7 +1076,7 @@ function AppContent() {
             keyboardType: "decimal-pad",
           })}
           <Toggle
-            label="WhatsApp / SMS reminders"
+            label="Allow WhatsApp / SMS reminders"
             value={form.reminder === "true"}
             onChange={(v) => f("reminder", String(v))}
           />
@@ -1454,7 +1481,16 @@ function AppContent() {
     case "notifications":
       content = (
         <>
-          <Hint>Local activity and monthly statements</Hint>
+          <Hint>Account updates and delivery activity</Hint>
+          {notices.map((notice) => (
+            <Card key={notice.id} style={{ backgroundColor: notice.read ? "white" : colors.pale }}>
+              <Row title={notice.title} subtitle={`${notice.body}\n${new Date(notice.date).toLocaleString("en-IN")}`} value={notice.read ? "Read" : "New"} onPress={() => {
+                if (notice.read) return;
+                api.markNotificationsRead([notice.id]).then(() => setNotices(old => old.map(n => n.id === notice.id ? { ...n, read: true } : n))).catch(error => Alert.alert("Unable to update", error.message));
+              }} />
+            </Card>
+          ))}
+          <Hint>Recent activity</Hint>
           {data.audit.length === 0 && (
             <Empty
               title="You’re all caught up"
@@ -1630,14 +1666,14 @@ function AppContent() {
             title="Change PIN"
             onPress={() =>
               Alert.alert(
-                "PIN authentication not configured",
-                "Connect an authentication service before enabling PIN changes and recovery.",
+                "PIN not available",
+                "Mobile sign-in uses secure OTP verification. PIN setup is not available yet.",
               )
             }
           />
           <Row title="Logout / Account actions" onPress={() => go("account")} />
           <Hint>
-            PIN and real account authentication require a backend integration.
+            Sign-in and account data are connected to the Digital Khata server.
           </Hint>
           <Title>KHATA</Title>
           <Row title="Reminder Settings" onPress={() => go("reminders")} />
@@ -1657,7 +1693,7 @@ function AppContent() {
             value={data.language}
             onChange={(language) => commit({ ...data, language })}
           />
-          <Hint>All data stays on this device; save regular backups.</Hint>
+          <Hint>Your account data syncs with the server. Export backups regularly.</Hint>
         </>
       );
       break;
@@ -1670,10 +1706,7 @@ function AppContent() {
         });
       content = (
         <>
-          <Hint>
-            Reminder preferences are saved locally. Automatic delivery requires
-            a backend; share statements manually from Khata.
-          </Hint>
+          <Hint>Preferences sync to your account. Automatic delivery requires configured messaging providers; manual sharing remains available from Khata.</Hint>
           <Toggle
             label="Monthly Reminder"
             value={r.enabled}
@@ -1833,8 +1866,7 @@ function AppContent() {
             }
           />
           <Hint>
-            Plan designs from the PDF. Purchases and customer limits are not
-            enabled in this local version.
+            Plan designs from the PDF. Billing and customer limit enforcement are not configured.
           </Hint>
         </>
       );
@@ -1844,10 +1876,7 @@ function AppContent() {
         <>
           <Card>
             <Title>Are you sure you want to logout?</Title>
-            <Hint>
-              Your data will remain on this device. There is no cloud backup in
-              this version.
-            </Hint>
+            <Hint>Your khata is securely stored with your account and available after you log in again.</Hint>
             <Button
               title="Cancel"
               secondary
@@ -1864,10 +1893,9 @@ function AppContent() {
               }
             />
           </Card>
-          <Title>Delete local account</Title>
+          <Title>Delete account</Title>
           <Hint>
-            This permanently removes this shop, customers, transactions, and
-            activity history from this device. Export a backup first.
+            This permanently removes your shop, customers, transactions, and activity history from the server. Export a backup first.
           </Hint>
           <Field
             label="Type DELETE to confirm"
@@ -1881,7 +1909,7 @@ function AppContent() {
             disabled={form.confirm !== "DELETE" || busy}
             onPress={() =>
               Alert.alert(
-                "Permanently delete all local data?",
+                "Permanently delete your account data?",
                 "This cannot be undone. Exported backups will not be deleted.",
                 [
                   { text: "Cancel", style: "cancel" },
@@ -1901,8 +1929,7 @@ function AppContent() {
       content = (
         <>
           <Hint>
-            Local history of customer changes and transaction edits or
-            deletions. This is not a server-secured audit log.
+            Server-recorded customer and transaction activity for this shop.
           </Hint>
           {data.audit.map((a) => (
             <Card key={a.id}>
@@ -1939,8 +1966,7 @@ function AppContent() {
       >
         <Title>Your khata could not be opened safely</Title>
         <Hint>
-          Please restart the app and check device storage. Existing stored data
-          has not been replaced.
+          Check the API connection and try again. Your last server data remains unchanged.
         </Hint>
       </SafeAreaView>
     );

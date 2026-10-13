@@ -1,84 +1,97 @@
 # Digital Khata
 
-React Native Android application built from `share-1791834534587-Digital-Khata.pdf`, using Expo, TypeScript, and native React Native controls. The supplied PDF remains unchanged.
+Digital Khata is a React Native Android app backed by a separate Express and MongoDB service. Customer records, shop settings, ledger entries, activity history, and backup restores are stored in the API account rather than AsyncStorage. The mobile app keeps access credentials in Expo SecureStore.
 
-## Run
+## Run locally
 
-```bash
-npm install
-npm start
-```
+1. Install MongoDB Community Edition and start it as a local service. On macOS with Homebrew:
 
-Open the project in an Expo Go version compatible with Expo SDK 57 on an Android phone, or connect an Android device/emulator and run:
+   ```bash
+   brew tap mongodb/brew
+   brew install mongodb-community@8.0
+   ```
 
-```bash
-npm run android
-```
+   Edit the MongoDB config at `$(brew --prefix)/etc/mongod.conf` and add:
 
-On the welcome screen, choose **Explore demo shop** to load sample customers. Alternatively, enter a valid Indian mobile number and use demo OTP **123456**, then set up your shop. Once a shop exists, log in with that shop's number. Demo data cannot overwrite an existing shop.
+   ```yaml
+   replication:
+     replSetName: rs0
+   ```
 
-## Implemented
+   Start MongoDB and initiate its single-node replica set (the API uses transactions, which require a replica set):
 
-- Splash/loading, welcome, mobile login, demo verification, and shop setup.
-- Dashboard with ledger-derived balances, customer count, monthly udhari/collection, and recent transactions.
-- Customer creation/editing, name/phone search, All/Due/Paid/Overdue filters, credit limits, and reminder opt-out.
-- Udhari and payments with dates, notes, due dates, payment methods, validation, and duplicate-tap protection.
-- Transaction details, edits, confirmed deletion, and local before/after activity history.
-- Month-by-month khata: opening + udhari − payment = closing balance.
-- Statements, editable WhatsApp/SMS messages, and Android's native share sheet. Opening an external app does not automatically send a message.
-- Notifications with read state, six-month report bars, and customer balance distribution.
-- Shop profile, saved reminder/default-payment preferences, searchable help, and subscription previews.
-- CSV export, JSON backup, validated restore with replacement confirmation, logout, and confirmed local account deletion.
-- English/Hindi labels for the main interface. Detailed help, validation alerts, and service-integration notices remain in English.
+   ```bash
+   brew services start mongodb-community@8.0
+   mongosh --eval 'rs.initiate()'
+   ```
 
-All records are persisted in AsyncStorage on the device. Export backups from **More → Settings → Save backup**. Restore from **More → Settings → Restore backup**. Payments greater than the outstanding amount are recorded as customer credit (a negative balance). Overdue means a customer has a positive balance and at least one past-due credit entry; payments are not allocated to individual invoices.
+2. In a separate terminal, configure and start the API:
 
-## Android builds
+   ```bash
+   cp server/.env.example server/.env
+   ```
 
-Generate the native project, if needed:
+   Keep `MONGODB_URI=mongodb://127.0.0.1:27017/digital_khata?replicaSet=rs0`. Replace `JWT_SECRET` with a private random value of at least 32 characters. The example enables a development-only OTP (`123456`); it is for local development only.
+
+   ```bash
+   npm --prefix server install
+   npm --prefix server run indexes
+   npm --prefix server run dev
+   ```
+
+   The API listens on port `4000`. Check it at `http://localhost:4000/api/v1/health`. Leave this terminal running.
+3. Start the Android app:
+
+   ```bash
+   npm install
+   npm start
+   ```
+
+   The default API URL is `http://10.0.2.2:4000/api/v1` for an Android emulator. For a physical phone, create a root `.env.local` with `EXPO_PUBLIC_API_URL=http://YOUR_COMPUTER_LAN_IP:4000/api/v1`, then rebuild/restart the development app. Keep this HTTP development setup on a trusted network. Production app builds disable cleartext traffic and must use HTTPS.
+4. Because SecureStore and push notifications are native modules, use a development build for device testing:
+
+   ```bash
+   npx expo run:android
+   ```
+
+   In the local server setup, enter the development OTP shown on the verification screen. A production server never returns that code.
+
+To stop local MongoDB, run `brew services stop mongodb-community@8.0`.
+
+## Production configuration
+
+Use a managed MongoDB replica set such as Atlas with a dedicated database user limited to the application database. Set `NODE_ENV=production`, `DEV_OTP_ENABLED=false`, a unique strong `JWT_SECRET`, `MONGODB_URI`, and `APP_ORIGINS`. Terminate TLS at a trusted proxy, set `TRUST_PROXY=true` only behind that proxy, restrict inbound network access, and run `npm run indexes` during deployment. Keep `.env` files and provider tokens out of source control and logs. The included request limiter uses in-process memory; multi-instance deployments should enforce shared limits at an API gateway/WAF or add a shared rate-limit store.
+
+Real OTP needs Twilio Verify (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_VERIFY_SERVICE_SID`). Scheduled SMS reminders need a Twilio Messaging Service as well. WhatsApp delivery needs a Meta WhatsApp Cloud API phone number, access token, and approved template (`WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_TEMPLATE_NAME`). The reminder worker stays off unless `REMINDER_WORKER_ENABLED=true`; it also respects each customer's reminder opt-out. Provider accounts, verified sending numbers, template approval, user consent, and applicable messaging rules must be configured by the service operator.
+
+Push notifications require an EAS project (`EXPO_PUBLIC_EAS_PROJECT_ID` in the app build), Android Firebase/FCM credentials in EAS, and optionally an Expo access token on the server. Push registration is skipped until the project ID is configured. Expo Go is not a supported push target for this app's current SDK; use a development or production build.
+
+Set the API URL at build time using `EXPO_PUBLIC_API_URL`. Android emulator uses `10.0.2.2`; a physical device needs a reachable HTTPS API URL for production. The app does not include service credentials.
+
+## API capabilities
+
+The versioned API is under `/api/v1`. It provides OTP start/verify and refresh-token rotation, authenticated bootstrap, shop settings, searchable and cursor-paginated customers, cursor-paginated ledger/activity, idempotent transaction creation, transaction edit/delete, notification inbox/read state, Expo device registration, WhatsApp message delivery, cloud backup restore, and account deletion. MongoDB records are scoped to the authenticated shop. Money is stored as integer paise. Index definitions cover tenant-scoped lookups, search, customer/date ledger history, audit ordering, session TTL, push-token uniqueness, and idempotency. Multi-record transaction edits, backup restore, and account deletion use MongoDB transactions, so MongoDB must run as a replica set.
+
+The app keeps the existing statement share sheet behavior for user-reviewed messages. Automated reminders and API message delivery require configured providers; selecting a channel in the UI does not bypass provider setup or customer opt-out.
+
+## Android build
 
 ```bash
 npx expo prebuild --platform android
+npx expo run:android
 ```
 
-Build an APK with an Android SDK and compatible JDK installed:
-
-```bash
-cd android
-NODE_ENV=production ./gradlew assembleRelease
-```
-
-APK output: `android/app/build/outputs/apk/release/app-release.apk`.
-
-The generated local release configuration uses the Android debug signing key for installation during development. Configure your own release signing before publishing to Google Play. The `eas.json` file also supplies preview APK and production app-bundle profiles for a configured Expo/EAS account.
-
-## Service integration boundaries
-
-This is a functional local application, not a deployed multi-user service. The PDF calls for backend capabilities that require an API and service configuration:
-
-- Real OTP, authenticated accounts, PIN recovery, and cloud storage/sync.
-- Server-side customer search, authorization, transaction idempotency, and immutable audit history.
-- Scheduled reminders, delivery status, and automatic WhatsApp/SMS delivery.
-- Billing, subscription enforcement, real support contact details, and cloud account deletion/retention.
-
-The app explicitly labels demo/service-dependent features. Subscription buttons do not charge money, reminder settings do not schedule messages, and local login is not a security boundary. No support phone numbers or service credentials have been invented.
+Use your own release signing credentials before publishing. Keep the generated native project and all credentials out of source control.
 
 ## Project files
 
-- `App.tsx`: screen flows, navigation, persistence, and actions.
-- `src/model.ts`: data types, sample data, balances, monthly statements, and backup validation.
-- `src/ui.tsx`: reusable native controls and the PDF's green/orange design palette.
-- `src/i18n.tsx`: main-interface English/Hindi labels.
-- `app.json`: Android app identity and icon configuration.
-- `eas.json`: APK/AAB build profiles.
+- `App.tsx`: app screens and user actions.
+- `src/api.ts`: authenticated mobile API client and secure token storage.
+- `src/model.ts`: app data types, balances, statements, and backup validation.
+- `server/src/index.js`: Express API, auth, validation, tenant checks, and routes.
+- `server/src/models.js`: MongoDB models and indexes.
+- `server/src/providers.js`: OTP, SMS, WhatsApp, and Expo push adapters.
+- `server/src/reminders.js`: opt-in scheduled reminder worker.
+- `docker-compose.yml`: optional local MongoDB replica set and API service.
 
-## Validation
-
-```bash
-npm run typecheck
-npm run export:android
-```
-
-No test cases or test suites were added, as requested. Android compilation does not run unit tests. See `BUILD_STATUS.md` for actual build results and environment limitations.
-
-# Bhahi-Khata
+No test cases or test suites were added or run, as requested.
