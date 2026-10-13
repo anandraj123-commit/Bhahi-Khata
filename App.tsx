@@ -251,7 +251,11 @@ function AppContent() {
           ? data.entries.find((x) => x.id === id)
           : undefined;
       setForm({
-        customerId: e?.customerId || id || data.customers[0]?.id || "",
+        customerId:
+          e?.customerId ||
+          id ||
+          (screen === "credit" ? "" : data.customers[0]?.id) ||
+          "",
         amount: e ? String(e.amount) : "",
         date: e?.date || today(),
         note: e?.note || "",
@@ -1127,16 +1131,35 @@ function AppContent() {
     case "editTransaction":
       content = (
         <>
-          {route.screen !== "editTransaction" && (
+          {route.screen === "credit" && route.id ? (
             <>
-              <Title>Customer</Title>
+              <Field
+                label="Customer"
+                value={
+                  data.customers.find((c) => c.id === route.id)?.name || ""
+                }
+                editable={false}
+              />
+            </>
+          ) : route.screen !== "editTransaction" ? (
+            <>
               <Field
                 label="Find a customer"
                 value={search}
                 onChangeText={setSearch}
                 placeholder="Search name or phone"
               />
-              <ScrollView style={{ maxHeight: 180 }} nestedScrollEnabled>
+              <ScrollView
+                style={{
+                  maxHeight: 180,
+                  backgroundColor: "white",
+                  borderWidth: 1,
+                  borderColor: colors.border,
+                  borderRadius: 9,
+                  paddingHorizontal: 12,
+                }}
+                nestedScrollEnabled
+              >
                 {data.customers
                   .filter(
                     (c) =>
@@ -1144,16 +1167,68 @@ function AppContent() {
                       c.phone.includes(search),
                   )
                   .map((c) => (
-                    <Row
+                    <Pressable
                       key={c.id}
-                      title={c.name}
-                      value={form.customerId === c.id ? "✓" : ""}
+                      accessibilityRole="button"
+                      accessibilityState={{
+                        selected: form.customerId === c.id,
+                      }}
                       onPress={() => f("customerId", c.id)}
-                    />
+                      style={({ pressed }) => ({
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 10,
+                        padding: 12,
+                        marginVertical: 4,
+                        borderRadius: 8,
+                        borderWidth: 1,
+                        borderColor:
+                          form.customerId === c.id
+                            ? colors.green
+                            : colors.border,
+                        backgroundColor:
+                          form.customerId === c.id ? colors.green : "white",
+                        opacity: pressed ? 0.8 : 1,
+                      })}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text
+                          style={{
+                            color:
+                              form.customerId === c.id ? "white" : colors.dark,
+                            fontSize: 15,
+                            fontWeight: "600",
+                          }}
+                        >
+                          {c.name}
+                        </Text>
+                        <Text
+                          style={{
+                            color:
+                              form.customerId === c.id
+                                ? "#E7FFF0"
+                                : colors.muted,
+                            fontSize: 12,
+                            marginTop: 5,
+                          }}
+                        >
+                          {[
+                            c.phone,
+                            c.address,
+                            `Balance ${money(balance(data, c.id))}`,
+                          ]
+                            .filter(Boolean)
+                            .join(" • ")}
+                        </Text>
+                      </View>
+                      {form.customerId === c.id && (
+                        <Icon name="checkmark-circle" color="white" size={20} />
+                      )}
+                    </Pressable>
                   ))}
               </ScrollView>
             </>
-          )}
+          ) : null}
           {!data.customers.length ? (
             <Button title="+ Add Customer" onPress={() => go("customerForm")} />
           ) : (
