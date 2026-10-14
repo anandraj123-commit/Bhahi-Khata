@@ -30,32 +30,58 @@ export async function sendOtp(phone) {
     };
   throw new Error("OTP service is not configured");
 }
-export async function sendSms(phone, message) {
-  if (
-    !env.TWILIO_ACCOUNT_SID ||
-    !env.TWILIO_AUTH_TOKEN ||
-    !env.TWILIO_MESSAGING_SERVICE_SID
-  )
-    throw new Error("SMS messaging is not configured");
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`;
-  const body = new URLSearchParams({
-    To: phone,
-    MessagingServiceSid: env.TWILIO_MESSAGING_SERVICE_SID,
-    Body: message.slice(0, 1500),
-  });
-  const auth = Buffer.from(
-    `${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`,
-  ).toString("base64");
-  const response = await fetch(url, {
+export function isSmsConfigured() {
+  return Boolean(
+    env.FREE2SMS_API_KEY &&
+      env.FREE2SMS_SENDER_ID &&
+      env.FREE2SMS_SMS_TEMPLATE &&
+      ["transactional", "promotional", "otp"].includes(
+        env.FREE2SMS_ROUTE || "transactional",
+      ),
+  );
+}
+export async function sendSms(phone, { customer, shop, amount }) {
+  if (!isSmsConfigured()) throw new Error("SMS messaging is not configured");
+  const digits = String(phone).replace(/\D/g, "");
+  const number = digits.length === 12 && digits.startsWith("91")
+    ? digits.slice(2)
+    : digits;
+  if (!/^[6-9]\d{9}$/.test(number))
+    throw new Error("Free2SMS requires a valid Indian mobile number");
+  const values = {
+    customer: String(customer).replace(/[\r\n]/g, " ").trim().slice(0, 80),
+    shop: String(shop).replace(/[\r\n]/g, " ").trim().slice(0, 80),
+    amount: Number(amount).toFixed(2),
+  };
+  const message = env.FREE2SMS_SMS_TEMPLATE.replace(
+    /\{\{(customer|shop|amount)\}\}/g,
+    (_, key) => values[key],
+  );
+  if (/\{\{[^}]+\}\}/.test(message))
+    throw new Error("SMS template contains an unsupported placeholder");
+  const body = {
+    numbers: number,
+    message,
+    sender_id: env.FREE2SMS_SENDER_ID,
+    route: env.FREE2SMS_ROUTE || "transactional",
+    sms_type: "dlt",
+    ...(env.FREE2SMS_TEMPLATE_ID
+      ? { template_id: Number(env.FREE2SMS_TEMPLATE_ID) }
+      : {}),
+  };
+  const response = await fetch("https://free2sms.com/api/v1/send", {
     method: "POST",
     headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Bearer ${env.FREE2SMS_API_KEY}`,
+      "Content-Type": "application/json",
     },
-    body,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
   });
-  if (!response.ok) throw new Error("SMS provider request failed");
-  return response.json();
+  const result = await response.json().catch(() => null);
+  if (!response.ok || result?.success !== true)
+    throw new Error("Free2SMS rejected the SMS request");
+  return result;
 }
 export async function verifyOtp(phone, code) {
   if (

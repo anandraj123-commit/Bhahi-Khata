@@ -1,5 +1,6 @@
 export type Customer = {
   id: string;
+  createdAt?: string;
   name: string;
   phone: string;
   address: string;
@@ -126,6 +127,7 @@ export function validBackup(value: unknown): value is Data {
     d.customers.every(
       (c) =>
         typeof c.id === "string" &&
+        (c.createdAt === undefined || typeof c.createdAt === "string") &&
         typeof c.name === "string" &&
         typeof c.phone === "string" &&
         typeof c.address === "string" &&

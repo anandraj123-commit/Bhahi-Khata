@@ -79,6 +79,10 @@ const monthLabel = (month: string) =>
     month: "long",
     year: "numeric",
   });
+const monthForDate = (value: string) => {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+};
 const validDate = (value: string) =>
   /^\d{4}-\d{2}-\d{2}$/.test(value) &&
   !isNaN(Date.parse(value)) &&
@@ -186,7 +190,12 @@ function AppContent() {
     return () => clearTimeout(t);
   }, [route.screen, seconds]);
   const back = () => {
-    if (history.length) {
+    if (route.screen === "setup" && data.signedIn && !data.shop.name) {
+      setRoute({ screen: "login" });
+      setHistory([{ screen: "welcome" }]);
+      setSearch("");
+      setFilter("All");
+    } else if (history.length) {
       setRoute(history[history.length - 1]);
       setHistory(history.slice(0, -1));
       setSearch("");
@@ -291,6 +300,12 @@ function AppContent() {
     }
     if (screen === "setup") setForm({ ...data.shop });
     if (screen === "share" && id) setForm({ message: statementText(id) });
+    if (screen === "statement" && id) {
+      const createdAt = data.customers.find((c) => c.id === id)?.createdAt;
+      const earliestMonth = createdAt ? monthForDate(createdAt) : undefined;
+      if (earliestMonth && month < earliestMonth) setMonth(earliestMonth);
+      else if (month > today().slice(0, 7)) setMonth(today().slice(0, 7));
+    }
   }
   const f = (key: string, value: string) =>
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -333,14 +348,22 @@ function AppContent() {
     const m = monthly(data, id, month);
     return `Hello ${c?.name},\nYour ${monthLabel(month)} khata from ${data.shop.name}:\n\nOpening: ${money(m.opening)}\nUdhari: ${money(m.credit)}\nPayment: ${money(m.payment)}\nOutstanding: ${money(m.closing)}\n\nThank you!`;
   }
-  function changeMonth(delta: number) {
+  function changeMonth(
+    delta: number,
+    earliestMonth?: string,
+    latestMonth?: string,
+  ) {
     const date = new Date(`${month}-01T12:00:00`);
     date.setMonth(date.getMonth() + delta);
-    setMonth(
-      `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`,
-    );
+    const nextMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+    if (
+      (earliestMonth && nextMonth < earliestMonth) ||
+      (latestMonth && nextMonth > latestMonth)
+    )
+      return;
+    setMonth(nextMonth);
   }
-  const monthPicker = (
+  const monthPicker = (earliestMonth?: string, latestMonth?: string) => (
     <View
       style={[
         s.split,
@@ -349,16 +372,18 @@ function AppContent() {
     >
       <Pressable
         accessibilityLabel="Previous month"
-        onPress={() => changeMonth(-1)}
-        style={{ padding: 10 }}
+        disabled={Boolean(earliestMonth && month <= earliestMonth)}
+        onPress={() => changeMonth(-1, earliestMonth, latestMonth)}
+        style={{ padding: 10, opacity: earliestMonth && month <= earliestMonth ? 0.35 : 1 }}
       >
         <Icon name="chevron-back" />
       </Pressable>
       <Text style={s.rowTitle}>{monthLabel(month)}</Text>
       <Pressable
         accessibilityLabel="Next month"
-        onPress={() => changeMonth(1)}
-        style={{ padding: 10 }}
+        disabled={Boolean(latestMonth && month >= latestMonth)}
+        onPress={() => changeMonth(1, earliestMonth, latestMonth)}
+        style={{ padding: 10, opacity: latestMonth && month >= latestMonth ? 0.35 : 1 }}
       >
         <Icon name="chevron-forward" />
       </Pressable>
@@ -467,10 +492,13 @@ function AppContent() {
     )
       return Alert.alert(
         "Invalid balance",
-        "Opening balance and credit limit must be between ₹0 and ₹100 crore.",
+        "Opening outstanding and credit limit must be between ₹0 and ₹100 crore.",
       );
     const c: Customer = {
       id: route.id || uid(),
+      createdAt:
+        data.customers.find((x) => x.id === route.id)?.createdAt ||
+        new Date().toISOString(),
       name,
       phone: form.phone.trim(),
       address: form.address.trim(),
@@ -610,7 +638,7 @@ function AppContent() {
         ...data.customers
           .filter((c) => c.opening !== 0)
           .map((c) =>
-            [c.name, "opening", c.opening, "", "Opening balance", ""]
+            [c.name, "opening", c.opening, "", "Opening outstanding", ""]
               .map(quote)
               .join(","),
           ),
@@ -873,7 +901,7 @@ function AppContent() {
                 setData(remote);
                 persistedRef.current = remote;
                 if (remote.shop.name) go("home", undefined, true);
-                else { setRoute({ screen: "setup" }); setHistory([]); setForm({ ...remote.shop, phone }); }
+                else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ ...remote.shop, phone }); }
               } catch (error) { Alert.alert("Could not verify OTP", error instanceof Error ? error.message : "Check the code and try again."); }
               finally { setBusy(false); }
             }}
@@ -1062,15 +1090,17 @@ function AppContent() {
             placeholder: "98XXXXXXXX",
           })}
           {field("Address", "address", { placeholder: "Delhi" })}
-          {field("Opening Balance (₹)", "opening", {
+          {field("Opening Outstanding (₹)", "opening", {
             keyboardType: "decimal-pad",
             editable: !route.id,
           })}
-          {route.id && (
+          {route.id ? (
             <Hint>
-              Opening balance is fixed after creation. Use ledger entries to
+              Opening outstanding is fixed after creation. Use ledger entries to
               record subsequent changes.
             </Hint>
+          ) : (
+            <Hint>Amount the customer already owed before using Digital Khata.</Hint>
           )}
           {field("Credit Limit (₹, 0 = no limit)", "limit", {
             keyboardType: "decimal-pad",
@@ -1146,7 +1176,7 @@ function AppContent() {
             {!entries.length && (
               <Empty
                 title="No transactions yet"
-                description="Opening balance is included in the outstanding amount."
+                description="Opening outstanding is included in the outstanding amount."
               />
             )}
           </>
@@ -1356,7 +1386,7 @@ function AppContent() {
     case "khata":
       content = (
         <>
-          {monthPicker}
+          {monthPicker()}
           <Field
             label="Search customer"
             value={search}
@@ -1387,7 +1417,7 @@ function AppContent() {
                 >
                   <Card>
                     <Title>{c.name}</Title>
-                    <Row title="Opening" value={money(m.opening)} />
+                    <Row title="Opening Outstanding" value={money(m.opening)} />
                     <Row title="Udhari" value={money(m.credit)} />
                     <Row title="Payment" value={money(m.payment)} />
                     <Row
@@ -1413,12 +1443,15 @@ function AppContent() {
         const m = monthly(data, customer.id, month);
         content = (
           <>
-            {monthPicker}
+            {monthPicker(
+              customer.createdAt ? monthForDate(customer.createdAt) : undefined,
+              today().slice(0, 7),
+            )}
             <Card>
               <Title>{data.shop.name}</Title>
               <Hint>{data.shop.address}</Hint>
               <Text style={s.rowTitle}>{customer.name}</Text>
-              <Row title="Opening Balance" value={money(m.opening)} />
+              <Row title="Opening Outstanding" value={money(m.opening)} />
               {m.entries.map((e) => (
                 <Row
                   key={e.id}
@@ -1541,7 +1574,7 @@ function AppContent() {
       const max = Math.max(...trend.map((t) => t.value), 1);
       content = (
         <>
-          {monthPicker}
+          {monthPicker()}
           <View style={s.split}>
             {stat("Monthly Udhari", money(totalCredit), true)}
             {stat("Collection", money(totalPayment))}
@@ -1768,7 +1801,7 @@ function AppContent() {
         ],
         [
           "How is balance calculated?",
-          "Outstanding = opening balance + udhari − payments. A negative balance means the customer has paid in advance.",
+          "Outstanding = opening outstanding + udhari − payments. A negative balance means the customer has paid in advance.",
         ],
         [
           "How do I send WhatsApp reminders?",

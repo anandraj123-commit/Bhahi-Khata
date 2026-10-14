@@ -8,7 +8,12 @@ import {
   ReminderDelivery,
   Shop,
 } from "./models.js";
-import { sendPush, sendSms, sendWhatsApp } from "./providers.js";
+import {
+  isSmsConfigured,
+  sendPush,
+  sendSms,
+  sendWhatsApp,
+} from "./providers.js";
 
 function localParts(date, timezone) {
   const values = Object.fromEntries(
@@ -116,9 +121,7 @@ export function startReminderWorker(log) {
                 continue;
               if (
                 channel === "sms" &&
-                (!process.env.TWILIO_ACCOUNT_SID ||
-                  !process.env.TWILIO_AUTH_TOKEN ||
-                  !process.env.TWILIO_MESSAGING_SERVICE_SID)
+                !isSmsConfigured()
               )
                 continue;
               const phone = intlPhone(customer.phone);
@@ -146,7 +149,7 @@ export function startReminderWorker(log) {
                 else
                   await sendSms(
                     phone,
-                    `Hello ${customer.name}, your outstanding balance with ${shop.name} is ₹${due.toFixed(2)}. Please contact the shop if you have already paid.`,
+                    { customer: customer.name, shop: shop.name, amount: due },
                   );
                 await ReminderDelivery.updateOne(
                   { _id: claim._id },

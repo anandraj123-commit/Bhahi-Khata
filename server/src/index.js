@@ -22,7 +22,13 @@ import {
   User,
   ensureIndexes,
 } from "./models.js";
-import { sendOtp, verifyOtp, sendSms, sendWhatsApp } from "./providers.js";
+import {
+  isSmsConfigured,
+  sendOtp,
+  verifyOtp,
+  sendSms,
+  sendWhatsApp,
+} from "./providers.js";
 import { startReminderWorker } from "./reminders.js";
 
 const env = process.env,
@@ -160,7 +166,11 @@ const backupSchema = z
       phone: z.string().max(20),
       whatsapp: z.string().max(20),
     }),
-    customers: z.array(customerSchema).max(5000),
+    customers: z
+      .array(
+        customerSchema.extend({ createdAt: z.string().datetime().optional() }),
+      )
+      .max(5000),
     entries: z.array(entrySchema).max(50000),
     audit: z
       .array(
@@ -211,6 +221,7 @@ const digest = (value) => createHash("sha256").update(value).digest("hex");
 const paise = (value) => Math.round(value * 100);
 const customerOut = (d) => ({
   id: d.clientId,
+  createdAt: d.createdAt?.toISOString?.(),
   name: d.name,
   phone: d.phone,
   address: d.address,
@@ -574,6 +585,7 @@ api.post("/backup/restore", auth, writeLimit, async (req, res, next) => {
               openingPaise: paise(c.opening),
               limitPaise: paise(c.limit),
               reminder: c.reminder,
+              ...(c.createdAt ? { createdAt: new Date(c.createdAt) } : {}),
             })),
             { session, ordered: true },
           );
@@ -1074,11 +1086,7 @@ api.post("/messages/sms", auth, writeLimit, async (req, res, next) => {
     if (!customer) return error(res, 404, "Customer not found");
     if (!customer.reminder)
       return error(res, 403, "Customer has opted out of reminders");
-    if (
-      !env.TWILIO_ACCOUNT_SID ||
-      !env.TWILIO_AUTH_TOKEN ||
-      !env.TWILIO_MESSAGING_SERVICE_SID
-    )
+    if (!isSmsConfigured())
       return error(res, 503, "SMS messaging is not configured");
     const phone = customer.phone.replace(/\D/g, "");
     if (phone.length < 10)
@@ -1110,7 +1118,7 @@ api.post("/messages/sms", auth, writeLimit, async (req, res, next) => {
     const due = Math.max(0, (customer.openingPaise || 0) + total) / 100;
     await sendSms(
       phone.length === 10 ? `+91${phone}` : `+${phone}`,
-      `Hello ${customer.name}, your outstanding balance with ${shop.name} is ₹${due.toFixed(2)}. Please contact the shop if you have already paid.`,
+      { customer: customer.name, shop: shop.name, amount: due },
     );
     res.status(202).json({ accepted: true });
   } catch (e) {

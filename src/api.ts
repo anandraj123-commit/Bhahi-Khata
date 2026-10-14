@@ -222,6 +222,8 @@ export async function syncChange(previous: Data, next: Data) {
   for (const customer of next.customers) {
     const old = priorCustomers.get(customer.id);
     if (JSON.stringify(old) === JSON.stringify(customer)) continue;
+    const customerInput = { ...customer };
+    delete customerInput.createdAt;
     const action = next.audit.find(
       (a) =>
         !previous.audit.some((p) => p.id === a.id) &&
@@ -232,7 +234,7 @@ export async function syncChange(previous: Data, next: Data) {
       {
         method: old ? "PATCH" : "POST",
         body: JSON.stringify({
-          ...customer,
+          ...customerInput,
           ...(action ? { audit: action } : {}),
         }),
       },
