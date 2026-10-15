@@ -14,6 +14,23 @@ export function createApp() {
   app.disable("x-powered-by");
   app.set("trust proxy", env.TRUST_PROXY === "true" ? 1 : false);
   app.use(helmet({ contentSecurityPolicy: false }));
+  // Install request logging before parsers/CORS so their failures reach the
+  // same redacted request logger. Request bodies are never logged.
+  app.use(
+    pinoHttp({
+      logger: log,
+      genReqId: (req) =>
+        req.headers["x-request-id"]?.toString().slice(0, 80) ||
+        randomBytes(12).toString("hex"),
+      serializers: {
+        req: (req) => ({
+          id: req.id,
+          method: req.method,
+          url: req.url.split("?")[0],
+        }),
+      },
+    }),
+  );
   const origins = (env.APP_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
@@ -31,21 +48,6 @@ export function createApp() {
   );
   app.use(compression());
   app.use(express.json({ limit: "10mb", strict: true }));
-  app.use(
-    pinoHttp({
-      logger: log,
-      genReqId: (req) =>
-        req.headers["x-request-id"]?.toString().slice(0, 80) ||
-        randomBytes(12).toString("hex"),
-      serializers: {
-        req: (req) => ({
-          id: req.id,
-          method: req.method,
-          url: req.url.split("?")[0],
-        }),
-      },
-    }),
-  );
   app.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     next();

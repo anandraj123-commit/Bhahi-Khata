@@ -20,12 +20,20 @@ const auditInput = (audit: Data["audit"][number]) => {
   return { ...audit, ...(before ? { before } : {}), ...(after ? { after } : {}) };
 };
 type RefreshResult = "refreshed" | "invalid" | "unavailable";
-let refreshJob: Promise<RefreshResult> | null = null;
+type RefreshOutcome = RefreshResult | ApiTransportError;
+let refreshJob: Promise<RefreshOutcome> | null = null;
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly payload?: any) {
     super(message);
     this.name = "ApiError";
+  }
+}
+
+export class ApiTransportError extends Error {
+  constructor(readonly kind: "network" | "timeout") {
+    super(kind === "timeout" ? "The request timed out" : "Network unavailable");
+    this.name = "ApiTransportError";
   }
 }
 
@@ -49,11 +57,19 @@ async function request(
         ...options.headers,
       },
     });
+  } catch (error) {
+    throw new ApiTransportError(
+      controller.signal.aborted ||
+        (error instanceof Error && error.name === "AbortError")
+        ? "timeout"
+        : "network",
+    );
   } finally {
     clearTimeout(timeout);
   }
   if (response.status === 401 && retry && path !== "/auth/refresh") {
     const refreshed = await refresh();
+    if (refreshed instanceof ApiTransportError) throw refreshed;
     if (refreshed === "refreshed") return request(path, options, false);
     if (refreshed === "unavailable")
       throw new ApiError("Could not validate the server session", 503);
@@ -64,7 +80,7 @@ async function request(
     throw new ApiError(value.error || `Server error (${response.status})`, response.status, value);
   return value;
 }
-async function refresh(): Promise<RefreshResult> {
+async function refresh(): Promise<RefreshOutcome> {
   if (refreshJob) return refreshJob;
   refreshJob = (async () => {
     try {
@@ -73,14 +89,21 @@ async function refresh(): Promise<RefreshResult> {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20_000);
       let response: Response;
-      try {
-        response = await fetch(`${BASE}/auth/refresh`, {
+        try {
+          response = await fetch(`${BASE}/auth/refresh`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ refreshToken }),
-          signal: controller.signal,
-        });
-      } finally {
+            signal: controller.signal,
+          });
+        } catch (error) {
+          throw new ApiTransportError(
+            controller.signal.aborted ||
+              (error instanceof Error && error.name === "AbortError")
+              ? "timeout"
+              : "network",
+          );
+        } finally {
         clearTimeout(timeout);
       }
       if (!response.ok) {
@@ -94,8 +117,8 @@ async function refresh(): Promise<RefreshResult> {
       await storeTokens(tokens);
       await rotateOfflineSessionToken(refreshToken, tokens.refreshToken);
       return "refreshed";
-    } catch {
-      return "unavailable";
+    } catch (error) {
+      return error instanceof ApiTransportError ? error : "unavailable";
     } finally {
       refreshJob = null;
     }
@@ -124,7 +147,9 @@ export async function clearOfflineAuthorization() {
 }
 export async function restoreSession(): Promise<Data | null> {
   if (!(await SecureStore.getItemAsync(REFRESH))) return null;
-  if ((await refresh()) !== "refreshed") return null;
+  const refreshed = await refresh();
+  if (refreshed instanceof ApiTransportError) throw refreshed;
+  if (refreshed !== "refreshed") return null;
   return loadAccount();
 }
 export async function loadAccount(): Promise<Data> {

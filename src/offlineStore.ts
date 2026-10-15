@@ -21,6 +21,11 @@ export type PendingChange = {
   id: number;
   change: SyncDelta;
 };
+export type SyncQueueStatus = {
+  pending: number;
+  failed: number;
+  conflicts: number;
+};
 export type PendingConflict = {
   queueId: number;
   entryId: string;
@@ -388,13 +393,48 @@ export async function readOfflineSession(): Promise<OfflineSession | null> {
 export async function readNextChange(accountId: string): Promise<PendingChange | null> {
   const db = await openDatabase();
   if (!db) return null;
-  const conflicts = await db.getAllAsync<{ conflict_json: string }>(
-    "SELECT conflict_json FROM sync_queue WHERE account_id = ? AND state = 'conflict' AND conflict_json IS NOT NULL",
+  const blockedRows = await db.getAllAsync<{
+    state: string;
+    conflict_json: string | null;
+    change_json: string;
+  }>(
+    "SELECT state, conflict_json, change_json FROM sync_queue WHERE account_id = ? AND state IN ('conflict', 'failed')",
     accountId,
   );
-  const blocked = new Set<string>();
-  for (const item of conflicts) {
-    try { blocked.add((JSON.parse(item.conflict_json) as PendingConflict).entryId); } catch { /* Ignore corrupt metadata; queue remains intact. */ }
+  const blockedEntries = new Set<string>();
+  const blockedCustomerMutations = new Set<string>();
+  const blockedCustomerLedger = new Set<string>();
+  let blockedSettings = false;
+  for (const row of blockedRows) {
+    if (row.state === "conflict" && row.conflict_json) {
+      try {
+        const conflict = JSON.parse(row.conflict_json) as PendingConflict;
+        blockedEntries.add(conflict.entryId);
+      } catch {
+        // Keep the damaged conflict durable and do not infer a resolution.
+      }
+      continue;
+    }
+    try {
+      const failed = JSON.parse(row.change_json) as SyncDelta;
+      blockedSettings ||= !!failed.settings;
+      for (const item of failed.customers) {
+        const customer = item.after || item.before;
+        if (customer) {
+          blockedCustomerMutations.add(customer.id);
+          if (item.operation === "create" || item.operation === "delete")
+            blockedCustomerLedger.add(customer.id);
+        }
+      }
+      for (const item of failed.entries) {
+        const entry = item.after || item.before;
+        if (entry) {
+          blockedEntries.add(entry.id);
+        }
+      }
+    } catch {
+      // Keep corrupt queue records; valid unrelated operations can still sync.
+    }
   }
   const pending = await db.getAllAsync<{ id: number; change_json: string }>(
     "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND state = 'pending' ORDER BY id",
@@ -402,7 +442,16 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
   );
   for (const item of pending) {
     const change = JSON.parse(item.change_json) as SyncDelta;
-    if (change.entries.some((entry) => blocked.has((entry.after || entry.before)!.id))) continue;
+    const touchesBlockedSetting = !!change.settings && blockedSettings;
+    const touchesBlockedCustomer = change.customers.some((item) =>
+      blockedCustomerMutations.has((item.after || item.before)!.id),
+    );
+    const touchesBlockedEntry = change.entries.some((item) => {
+      const entry = item.after || item.before!;
+      return blockedEntries.has(entry.id) || blockedCustomerLedger.has(entry.customerId);
+    });
+    if (touchesBlockedSetting || touchesBlockedCustomer || touchesBlockedEntry)
+      continue;
     return { id: item.id, change };
   }
   return null;
@@ -564,6 +613,16 @@ export async function hasUnresolvedConflicts(accountId: string) {
   return (row?.count || 0) > 0;
 }
 
+export async function hasFailedChanges(accountId: string) {
+  const db = await openDatabase();
+  if (!db) return false;
+  const row = await db.getFirstAsync<{ count: number }>(
+    "SELECT COUNT(*) AS count FROM sync_queue WHERE account_id = ? AND state = 'failed'",
+    accountId,
+  );
+  return (row?.count || 0) > 0;
+}
+
 export async function acknowledgeChange(id: number) {
   const db = await openDatabase();
   if (db) await db.runAsync("DELETE FROM sync_queue WHERE id = ?", id);
@@ -571,12 +630,55 @@ export async function acknowledgeChange(id: number) {
 
 export async function noteSyncFailure(id: number, error: unknown) {
   const db = await openDatabase();
-  if (db)
+  if (db) {
+    const message =
+      error instanceof Error && error.name === "ApiError"
+        ? error.message.slice(0, 300)
+        : error instanceof Error && error.name === "ApiTransportError"
+          ? error.message
+          : "Synchronization failed";
     await db.runAsync(
       "UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?",
-      error instanceof Error ? error.message.slice(0, 500) : "Synchronization failed",
+      message,
       id,
     );
+  }
+}
+
+export async function markSyncFailurePermanent(id: number) {
+  const db = await openDatabase();
+  if (db)
+    await db.runAsync(
+      "UPDATE sync_queue SET state = 'failed' WHERE id = ? AND state = 'pending'",
+      id,
+    );
+}
+
+export async function readSyncQueueStatus(
+  accountId: string,
+): Promise<SyncQueueStatus> {
+  const db = await openDatabase();
+  if (!db) throw new Error("Encrypted offline storage is unavailable");
+  const rows = await db.getAllAsync<{ state: string; count: number }>(
+    "SELECT state, COUNT(*) AS count FROM sync_queue WHERE account_id = ? GROUP BY state",
+    accountId,
+  );
+  const counts = new Map(rows.map((row) => [row.state, row.count]));
+  return {
+    pending: counts.get("pending") || 0,
+    failed: counts.get("failed") || 0,
+    conflicts: counts.get("conflict") || 0,
+  };
+}
+
+export async function retryFailedChanges(accountId: string) {
+  const db = await openDatabase();
+  if (!db) throw new Error("Encrypted offline storage is unavailable");
+  const result = await db.runAsync(
+    "UPDATE sync_queue SET state = 'pending', last_error = NULL WHERE account_id = ? AND state = 'failed'",
+    accountId,
+  );
+  return result.changes;
 }
 
 export async function clearOfflineAccount(accountId: string) {

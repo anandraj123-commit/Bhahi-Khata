@@ -1,4 +1,5 @@
 import { LanguageContext, Text } from "./src/i18n";
+import ErrorBoundary from "./src/ErrorBoundary";
 import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -45,6 +46,8 @@ import {
   readCachedAccount,
   readPendingConflicts,
   readOfflineSession,
+  readSyncQueueStatus,
+  retryFailedChanges,
   refreshConflict,
   saveLocalChange,
   type PendingConflict,
@@ -108,6 +111,7 @@ const validDate = (value: string) =>
 const phoneValid = (value: string) => /^[6-9]\d{9}$/.test(value);
 const accountKey = (value: string) => value.replace(/\D/g, "");
 const isOfflineError = (error: unknown) =>
+  (error instanceof api.ApiTransportError && error.kind === "network") ||
   error instanceof TypeError ||
   (error instanceof Error &&
     (error.name === "AbortError" ||
@@ -119,10 +123,16 @@ const showOtpError = (title: string, error: unknown, fallback: string) =>
     isOfflineError(error) ? "You’re offline" : title,
     isOfflineError(error)
       ? "Connect to the internet to sign in."
-      : error instanceof Error
-        ? error.message
-        : fallback,
+      : errorMessage(error, fallback),
   );
+const errorMessage = (error: unknown, fallback: string) =>
+  error instanceof api.ApiTransportError
+    ? error.kind === "timeout"
+      ? "The request timed out. Check your connection and try again."
+      : "Could not connect. Check your internet connection and try again."
+    : error instanceof api.ApiError
+      ? error.message
+      : fallback;
 const titles: Partial<Record<Screen, string>> = {
   login: "Login",
   otp: "Verify Mobile",
@@ -169,10 +179,66 @@ function AppContent() {
   const [notices, setNotices] = useState<{id:string;title:string;body:string;read:boolean;date:string}[]>([]);
   const [seconds, setSeconds] = useState(30);
   const [busy, setBusy] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<{
+    pending: number;
+    failed: number;
+    conflicts: number;
+  } | null>(null);
   const lock = useRef(false);
+  const syncNotice = useRef<string | null>(null);
   const [faq, setFaq] = useState("");
   const [channel, setChannel] = useState("WhatsApp");
   const [plan, setPlan] = useState("Pro");
+  async function refreshSyncStatus(accountId = offlineAccountRef.current) {
+    if (!accountId || !offlineStorageAvailable()) {
+      setSyncStatus(null);
+      return;
+    }
+    try {
+      setSyncStatus(await readSyncQueueStatus(accountId));
+    } catch {
+      setSyncStatus(null);
+    }
+  }
+  function showSyncFailure(problem: unknown) {
+    const key =
+      problem instanceof api.ApiError &&
+      [400, 403, 404, 409, 413, 415, 422].includes(problem.status)
+        ? "permanent"
+        : problem instanceof api.ApiTransportError
+          ? problem.kind
+          : problem instanceof api.ApiError &&
+              (problem.status === 429 || problem.status >= 500)
+            ? "server"
+            : "other";
+    if (syncNotice.current === key) return;
+    syncNotice.current = key;
+    if (key === "permanent")
+      Alert.alert(
+        "Some changes need attention",
+        "Your changes remain saved on this phone and will not retry automatically. Open Settings to review the sync status and retry when appropriate.",
+      );
+    else if (key === "network")
+      Alert.alert(
+        "You’re offline",
+        "Your saved changes remain on this phone and will sync when the connection returns.",
+      );
+    else if (key === "timeout")
+      Alert.alert(
+        "Sync timed out",
+        "Your saved changes remain on this phone. Synchronization will retry later.",
+      );
+    else if (key === "server")
+      Alert.alert(
+        "Sync temporarily unavailable",
+        "Your saved changes remain on this phone. Synchronization will retry later.",
+      );
+    else
+      Alert.alert(
+        "Could not sync changes",
+        "Your saved changes remain on this phone. Check your account and connection before retrying.",
+      );
+  }
   useEffect(() => {
     let live = true;
     (async () => {
@@ -216,6 +282,11 @@ function AppContent() {
                 if (cached && validBackup(cached)) parsed = cached;
               } catch {
                 offlineAccountRef.current = null;
+                if (live)
+                  Alert.alert(
+                    "Offline data unavailable",
+                    "Your account is available online, but cached data could not be read on this device.",
+                  );
               }
             }
             if (offlineAccountRef.current === id) {
@@ -223,6 +294,11 @@ function AppContent() {
                 await cacheAuthenticatedAccount(id, parsed);
               } catch {
                 offlineAccountRef.current = null;
+                if (live)
+                  Alert.alert(
+                    "Offline data could not be saved",
+                    "Your account is available online. Keep an internet connection for changes until offline storage is available.",
+                  );
               }
             }
           }
@@ -287,7 +363,7 @@ function AppContent() {
           setLoadError(true);
           Alert.alert(
             "Could not connect to your khata",
-            error instanceof Error ? error.message : "Check your internet connection and try again.",
+            errorMessage(error, "Check your internet connection and try again."),
           );
         }
       } finally {
@@ -312,7 +388,13 @@ function AppContent() {
         if (!permission.granted) return;
         const token = await Notifications.getExpoPushTokenAsync({ projectId: process.env.EXPO_PUBLIC_EAS_PROJECT_ID });
         if (live) await api.registerPushToken(token.data, Platform.OS === "ios" ? "ios" : "android");
-      } catch { /* Push registration requires a configured EAS project and device. */ }
+      } catch {
+        if (live)
+          Alert.alert(
+            "Push notifications unavailable",
+            "You can continue using your khata. Notification registration can be retried later.",
+          );
+      }
     })();
     return () => { live = false; };
   }, [data.signedIn]);
@@ -325,6 +407,8 @@ function AppContent() {
       const revision = localRevision.current;
       void synchronizeAccount(id)
         .then((remote) => {
+          syncNotice.current = null;
+          void refreshSyncStatus(id);
           if (
             !live ||
             !remote ||
@@ -337,6 +421,7 @@ function AppContent() {
           setData(remote);
         })
         .catch((error) => {
+          void refreshSyncStatus(id);
           if (
             live &&
             error instanceof api.ApiError &&
@@ -347,6 +432,8 @@ function AppContent() {
             setData(initialData);
             setRoute({ screen: "login" });
             setHistory([]);
+          } else if (live) {
+            showSyncFailure(error);
           }
         })
         .finally(() => { if (live) void promptNextConflict(id); });
@@ -374,8 +461,19 @@ function AppContent() {
     if (data.signedIn && id) void promptNextConflict(id);
   }, [data.signedIn]);
   useEffect(() => {
+    void refreshSyncStatus();
+  }, [data.signedIn, data.shop.phone, route.screen]);
+  useEffect(() => {
     if (route.screen !== "notifications" || !data.signedIn) return;
-    api.getNotifications().then(result => setNotices(result.items)).catch(() => {});
+    api
+      .getNotifications()
+      .then((result) => setNotices(result.items))
+      .catch(() =>
+        Alert.alert(
+          "Unable to load notifications",
+          "Check your connection and open Notifications again to retry.",
+        ),
+      );
   }, [route.screen, data.signedIn]);
   useEffect(() => {
     if (route.screen !== "otp" || seconds <= 0) return;
@@ -431,11 +529,14 @@ function AppContent() {
               return true;
             }
             localRevision.current += 1;
+            void refreshSyncStatus(accountId);
             const revision = localRevision.current;
             persistedRef.current = next;
             setData(next);
             void synchronizeAccount(accountId, false)
               .then((remote) => {
+                syncNotice.current = null;
+                void refreshSyncStatus(accountId);
                 if (
                   remote &&
                   offlineAccountRef.current === accountId &&
@@ -446,7 +547,10 @@ function AppContent() {
                   setData(remote);
                 }
               })
-              .catch(() => {});
+              .catch((error) => {
+                void refreshSyncStatus(accountId);
+                showSyncFailure(error);
+              });
             return true;
           }
           await api.syncChange(persisted, next);
@@ -459,7 +563,7 @@ function AppContent() {
           dataRef.current = previous;
           setData(previous);
         }
-        Alert.alert("Unable to save", error instanceof Error ? error.message : "Please check your connection and try again.");
+        Alert.alert("Unable to save", errorMessage(error, "Please check your connection and try again."));
         return false;
       }
     });
@@ -472,6 +576,44 @@ function AppContent() {
     setBusy(true);
     try {
       if (await commit(next)) done();
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
+  }
+  async function retryFailedSync() {
+    const accountId = offlineAccountRef.current;
+    if (!accountId || lock.current) return;
+    const connection = await NetInfo.fetch();
+    if (connection.isConnected === false || connection.isInternetReachable === false) {
+      Alert.alert(
+        "You’re offline",
+        "Connect to the internet before retrying synchronization.",
+      );
+      return;
+    }
+    lock.current = true;
+    setBusy(true);
+    try {
+      const count = await retryFailedChanges(accountId);
+      if (!count) {
+        await refreshSyncStatus(accountId);
+        return;
+      }
+      syncNotice.current = null;
+      await synchronizeAccount(accountId);
+      const status = await readSyncQueueStatus(accountId);
+      setSyncStatus(status);
+      if (status.failed || status.conflicts || status.pending)
+        Alert.alert(
+          "Some changes still need attention",
+          "Your data remains saved on this phone. Review the sync status and resolve any transaction conflicts.",
+        );
+      else
+        Alert.alert("Synchronization complete", "All saved changes are synchronized.");
+    } catch (error) {
+      await refreshSyncStatus(accountId);
+      showSyncFailure(error);
     } finally {
       lock.current = false;
       setBusy(false);
@@ -1027,16 +1169,21 @@ function AppContent() {
               lock.current = true;
               setBusy(true);
               try {
-                const restored = await api.restoreBackup({ ...parsed, signedIn: true });
+                  const restored = await api.restoreBackup({ ...parsed, signedIn: true });
                   const accountId = offlineAccountRef.current;
                   if (accountId && offlineStorageAvailable())
-                    await cacheAuthenticatedAccount(accountId, restored).catch(() => {});
+                    await cacheAuthenticatedAccount(accountId, restored).catch(() =>
+                      Alert.alert(
+                        "Backup restored online",
+                        "The server restore succeeded, but the encrypted offline cache could not be refreshed on this device.",
+                      ),
+                    );
                   dataRef.current = restored;
                   setData(restored);
                   persistedRef.current = restored;
                 go("home", undefined, true);
               } catch (error) {
-                Alert.alert("Restore failed", error instanceof Error ? error.message : "Please try again.");
+                Alert.alert("Restore failed", errorMessage(error, "Please try again."));
               } finally { lock.current = false; setBusy(false); }
             },
           },
@@ -1847,7 +1994,7 @@ function AppContent() {
             <Card key={notice.id} style={{ backgroundColor: notice.read ? "white" : colors.pale }}>
               <Row title={notice.title} subtitle={`${notice.body}\n${new Date(notice.date).toLocaleString("en-IN")}`} value={notice.read ? "Read" : "New"} onPress={() => {
                 if (notice.read) return;
-                api.markNotificationsRead([notice.id]).then(() => setNotices(old => old.map(n => n.id === notice.id ? { ...n, read: true } : n))).catch(error => Alert.alert("Unable to update", error.message));
+                api.markNotificationsRead([notice.id]).then(() => setNotices(old => old.map(n => n.id === notice.id ? { ...n, read: true } : n))).catch(error => Alert.alert("Unable to update", errorMessage(error, "Please try again.")));
               }} />
             </Card>
           ))}
@@ -2021,6 +2168,37 @@ function AppContent() {
     case "settings":
       content = (
         <>
+          <Title>SYNC STATUS</Title>
+          {!syncStatus ? (
+            <Hint>Sync status is unavailable in this app build.</Hint>
+          ) : syncStatus.failed ? (
+            <Hint>
+              {syncStatus.failed} saved change{syncStatus.failed === 1 ? "" : "s"} failed to sync. They remain on this phone and will not retry automatically.
+            </Hint>
+          ) : null}
+          {!!syncStatus?.conflicts && (
+            <Hint>
+              {syncStatus.conflicts} transaction conflict{syncStatus.conflicts === 1 ? " needs" : "s need"} your decision. Both versions remain saved.
+            </Hint>
+          )}
+          {!!syncStatus?.pending && (
+            <Hint>
+              {syncStatus.pending} saved change{syncStatus.pending === 1 ? " is" : "s are"} waiting to sync.
+            </Hint>
+          )}
+          {syncStatus &&
+            !syncStatus.pending &&
+            !syncStatus.failed &&
+            !syncStatus.conflicts && (
+            <Hint>All saved changes are synchronized.</Hint>
+          )}
+          {!!syncStatus?.failed && (
+            <Button
+              title="Retry failed sync"
+              onPress={() => void retryFailedSync()}
+              disabled={busy}
+            />
+          )}
           <Title>ACCOUNT</Title>
           <Row title="Mobile Number" value={data.shop.phone} />
           <Row
@@ -2451,8 +2629,10 @@ function AppContent() {
 }
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <AppContent />
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <AppContent />
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }

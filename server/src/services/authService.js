@@ -17,13 +17,16 @@ export async function signAccess(user) {
     .setExpirationTime("15m")
     .sign(jwtKey);
 }
-export async function issueTokens(user) {
+export async function issueTokens(user, session) {
   const accessToken = await signAccess(user),
     refreshToken = randomBytes(48).toString("base64url");
-  await Session.create({
+  const refreshSession = {
     userId: user._id,
     tokenHash: digest(refreshToken),
     expiresAt: new Date(Date.now() + 30 * 86400_000),
-  });
+  };
+  if (session)
+    await Session.create([refreshSession], { session });
+  else await Session.create(refreshSession);
   return { accessToken, refreshToken, expiresIn: 900 };
 }

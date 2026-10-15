@@ -35,18 +35,42 @@ export async function isNewAccount(user) {
 }
 
 export async function rotateRefreshSession(refreshToken) {
-  const session = await Session.findOne({
-    tokenHash: digest(refreshToken),
-    expiresAt: { $gt: new Date() },
+  let result = null;
+  const tokenHash = digest(refreshToken);
+  await mongoose.connection.transaction(async (dbSession) => {
+    const stored = await Session.findOne({
+      tokenHash,
+      expiresAt: { $gt: new Date() },
+    }).session(dbSession);
+    if (!stored) {
+      result = null;
+      return;
+    }
+    const user = await User.findById(stored.userId).session(dbSession);
+    if (!user || user.disabledAt) {
+      result = { unavailable: true };
+      return;
+    }
+    const removed = await Session.deleteOne(
+      { _id: stored._id, tokenHash },
+      { session: dbSession },
+    );
+    if (removed.deletedCount !== 1) {
+      result = null;
+      return;
+    }
+    result = await issueTokens(user, dbSession);
   });
-  if (!session) return null;
-  const user = await User.findById(session.userId);
-  if (!user || user.disabledAt) return { unavailable: true };
-  await session.deleteOne();
-  return issueTokens(user);
+  return result;
 }
 
 export async function invalidateUserSessions(userId) {
-  await User.updateOne({ _id: userId }, { $inc: { sessionVersion: 1 } });
-  await Session.deleteMany({ userId });
+  await mongoose.connection.transaction(async (dbSession) => {
+    await User.updateOne(
+      { _id: userId },
+      { $inc: { sessionVersion: 1 } },
+      { session: dbSession },
+    );
+    await Session.deleteMany({ userId }, { session: dbSession });
+  });
 }

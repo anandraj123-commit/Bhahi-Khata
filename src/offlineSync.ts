@@ -4,8 +4,10 @@ import {
   acknowledgeChange,
   adoptServerDataIfQueueEmpty,
   hasPendingChanges,
+  hasFailedChanges,
   hasUnresolvedConflicts,
   markConflict,
+  markSyncFailurePermanent,
   noteSyncFailure,
   offlineStorageAvailable,
   readNextChange,
@@ -36,7 +38,11 @@ async function runOnce(accountId: string, pullRemote: boolean) {
           pending = await readNextChange(accountId);
           continue;
         }
+        const permanent =
+          error instanceof api.ApiError &&
+          [400, 403, 404, 409, 413, 415, 422].includes(error.status);
         await noteSyncFailure(pending.id, error);
+        if (permanent) await markSyncFailurePermanent(pending.id);
         if (error instanceof api.ApiError && error.status === 401)
           await api.clearOfflineAuthorization();
         throw error;
@@ -44,7 +50,11 @@ async function runOnce(accountId: string, pullRemote: boolean) {
       pending = await readNextChange(accountId);
     }
     if (!pullRemote) return null;
-    if (await hasUnresolvedConflicts(accountId)) return null;
+    if (
+      (await hasUnresolvedConflicts(accountId)) ||
+      (await hasFailedChanges(accountId))
+    )
+      return null;
     const remote = api.normalizeData(await api.loadAccount());
     if (await adoptServerDataIfQueueEmpty(accountId, remote)) return remote;
     if (!offlineStorageAvailable()) return remote;

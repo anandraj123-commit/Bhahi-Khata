@@ -183,9 +183,12 @@ export function startReminderWorker(log) {
                         shopId: shop._id,
                         token: { $in: invalid },
                       });
-                  } catch (e) {
+                } catch (e) {
                     log.warn(
-                      { err: e, notification: String(notification._id) },
+                      {
+                        errorName: e?.name || "Error",
+                        notification: String(notification._id),
+                      },
                       "push notification could not be delivered",
                     );
                   }
@@ -194,9 +197,8 @@ export function startReminderWorker(log) {
                 // Keep the unique claim after an ambiguous provider timeout to prevent duplicate messages.
                 log.error(
                   {
-                    err: e,
+                    errorName: e?.name || "Error",
                     shopId: String(shop._id),
-                    customerId: customer.clientId,
                     channel,
                   },
                   "scheduled reminder delivery failed",
@@ -206,7 +208,10 @@ export function startReminderWorker(log) {
           }
         }
       } catch (err) {
-        log.error({ err }, "reminder worker iteration failed");
+        log.error(
+          { errorName: err?.name || "Error" },
+          "reminder worker iteration failed",
+        );
       }
     },
     { timezone, noOverlap: true },
