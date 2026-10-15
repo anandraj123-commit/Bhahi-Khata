@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   BackHandler,
   KeyboardAvoidingView,
   Linking,
@@ -12,6 +13,7 @@ import {
   Share,
   View,
 } from "react-native";
+import NetInfo from "@react-native-community/netinfo";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 import Constants from "expo-constants";
@@ -32,6 +34,22 @@ import {
   validBackup,
 } from "./src/model";
 import * as api from "./src/api";
+import {
+  cacheAuthenticatedAccount,
+  clearOfflineAccount,
+  clearOfflineSession,
+  hasPendingChanges,
+  completeConflict,
+  chooseConflictResolution,
+  offlineStorageAvailable,
+  readCachedAccount,
+  readPendingConflicts,
+  readOfflineSession,
+  refreshConflict,
+  saveLocalChange,
+  type PendingConflict,
+} from "./src/offlineStore";
+import { synchronizeAccount, synchronizePendingOnly } from "./src/offlineSync";
 import {
   Button,
   Card,
@@ -88,6 +106,23 @@ const validDate = (value: string) =>
   !isNaN(Date.parse(value)) &&
   new Date(value).toISOString().slice(0, 10) === value;
 const phoneValid = (value: string) => /^[6-9]\d{9}$/.test(value);
+const accountKey = (value: string) => value.replace(/\D/g, "");
+const isOfflineError = (error: unknown) =>
+  error instanceof TypeError ||
+  (error instanceof Error &&
+    (error.name === "AbortError" ||
+      /network request failed|failed to fetch|network error|internet connection/i.test(
+        error.message,
+      )));
+const showOtpError = (title: string, error: unknown, fallback: string) =>
+  Alert.alert(
+    isOfflineError(error) ? "You’re offline" : title,
+    isOfflineError(error)
+      ? "Connect to the internet to sign in."
+      : error instanceof Error
+        ? error.message
+        : fallback,
+  );
 const titles: Partial<Record<Screen, string>> = {
   login: "Login",
   otp: "Verify Mobile",
@@ -116,6 +151,9 @@ function AppContent() {
   const [data, setData] = useState<Data>(initialData);
   const dataRef = useRef(data);
   const persistedRef = useRef<Data | null>(null);
+  const offlineAccountRef = useRef<string | null>(null);
+  const localRevision = useRef(0);
+  const promptingConflict = useRef<number | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const writeQueue = useRef<Promise<boolean>>(Promise.resolve(true));
@@ -139,21 +177,119 @@ function AppContent() {
     let live = true;
     (async () => {
       try {
+        const connection = await NetInfo.fetch();
+        if (connection.isConnected === false || connection.isInternetReachable === false) {
+          const offlineSession = await readOfflineSession();
+          const cached = offlineSession
+            ? await readCachedAccount(offlineSession.accountId)
+            : null;
+          if (live && offlineSession && cached && validBackup(cached)) {
+            offlineAccountRef.current = offlineSession.accountId;
+            setData(cached);
+            dataRef.current = cached;
+            persistedRef.current = cached;
+            setRoute({ screen: cached.shop.name ? "home" : "setup" });
+          } else if (live) {
+            setRoute({ screen: "login" });
+            Alert.alert("You’re offline", "Connect to the internet to sign in.");
+          }
+          return;
+        }
         const remote = await api.restoreSession();
         if (live && remote) {
-          const parsed = api.normalizeData(remote);
+          let parsed = api.normalizeData(remote);
           if (!validBackup(parsed)) throw new Error("Invalid server data");
+          const id = accountKey(parsed.shop.phone);
+          offlineAccountRef.current = id || null;
+          if (id && offlineStorageAvailable()) {
+            try {
+              const synchronized = await synchronizePendingOnly(id);
+              if (synchronized) parsed = synchronized;
+              else if (await hasPendingChanges(id)) {
+                const cached = await readCachedAccount(id);
+                if (cached && validBackup(cached)) parsed = cached;
+              }
+            } catch (error) {
+              if (error instanceof api.ApiError && error.status === 401) throw error;
+              try {
+                const cached = await readCachedAccount(id);
+                if (cached && validBackup(cached)) parsed = cached;
+              } catch {
+                offlineAccountRef.current = null;
+              }
+            }
+            if (offlineAccountRef.current === id) {
+              try {
+                await cacheAuthenticatedAccount(id, parsed);
+              } catch {
+                offlineAccountRef.current = null;
+              }
+            }
+          }
           setData(parsed);
           dataRef.current = parsed;
           persistedRef.current = parsed;
           setRoute({ screen: parsed.shop.name ? "home" : "setup" });
+        } else if (live) {
+          const offlineSession = await readOfflineSession();
+          const cached = offlineSession
+            ? await readCachedAccount(offlineSession.accountId)
+            : null;
+          if (offlineSession && cached && validBackup(cached)) {
+            offlineAccountRef.current = offlineSession.accountId;
+            setData(cached);
+            dataRef.current = cached;
+            persistedRef.current = cached;
+            setRoute({ screen: cached.shop.name ? "home" : "setup" });
+          } else {
+            const network = await NetInfo.fetch();
+            if (network.isConnected === false || network.isInternetReachable === false) {
+              setRoute({ screen: "login" });
+              Alert.alert("You’re offline", "Connect to the internet to sign in.");
+            }
+          }
         }
       } catch (error) {
-        if (live) setLoadError(true);
-        Alert.alert(
-          "Could not connect to your khata",
-          error instanceof Error ? error.message : "Check your internet connection and try again.",
-        );
+        const canUseCachedSession =
+          isOfflineError(error) ||
+          (error instanceof api.ApiError && error.status >= 500);
+        if (live && canUseCachedSession) {
+          let offlineSession: Awaited<ReturnType<typeof readOfflineSession>> = null;
+          let cached: Data | null = null;
+          try {
+            offlineSession = await readOfflineSession();
+            cached = offlineSession
+              ? await readCachedAccount(offlineSession.accountId)
+              : null;
+          } catch {
+            cached = null;
+          }
+          if (offlineSession && cached && validBackup(cached)) {
+            offlineAccountRef.current = offlineSession.accountId;
+            setData(cached);
+            dataRef.current = cached;
+            persistedRef.current = cached;
+            setRoute({ screen: cached.shop.name ? "home" : "setup" });
+          } else {
+            setRoute({ screen: "login" });
+            if (isOfflineError(error))
+              Alert.alert("You’re offline", "Connect to the internet to sign in.");
+            else
+              Alert.alert(
+                "Could not connect to your khata",
+                "Please try again when the service is available.",
+              );
+          }
+        } else if (live && error instanceof api.ApiError && error.status === 401) {
+          offlineAccountRef.current = null;
+          setRoute({ screen: "login" });
+        } else if (live) {
+          setLoadError(true);
+          Alert.alert(
+            "Could not connect to your khata",
+            error instanceof Error ? error.message : "Check your internet connection and try again.",
+          );
+        }
       } finally {
         if (live) setLoaded(true);
       }
@@ -179,6 +315,63 @@ function AppContent() {
       } catch { /* Push registration requires a configured EAS project and device. */ }
     })();
     return () => { live = false; };
+  }, [data.signedIn]);
+  useEffect(() => {
+    const id = offlineAccountRef.current;
+    if (!data.signedIn || !id || !offlineStorageAvailable()) return;
+    let live = true;
+    let online = false;
+    const runSync = () => {
+      const revision = localRevision.current;
+      void synchronizeAccount(id)
+        .then((remote) => {
+          if (
+            !live ||
+            !remote ||
+            offlineAccountRef.current !== id ||
+            localRevision.current !== revision
+          )
+            return;
+          dataRef.current = remote;
+          persistedRef.current = remote;
+          setData(remote);
+        })
+        .catch((error) => {
+          if (
+            live &&
+            error instanceof api.ApiError &&
+            error.status === 401
+          ) {
+            offlineAccountRef.current = null;
+            dataRef.current = initialData;
+            setData(initialData);
+            setRoute({ screen: "login" });
+            setHistory([]);
+          }
+        })
+        .finally(() => { if (live) void promptNextConflict(id); });
+    };
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      const connected =
+        state.isConnected !== false && state.isInternetReachable !== false;
+      if (connected && !online) runSync();
+      online = connected;
+    });
+    const appState = AppState.addEventListener("change", (state) => {
+      if (state === "active") runSync();
+    });
+    void hasPendingChanges(id).then((pending) => {
+      if (live && pending) runSync();
+    });
+    return () => {
+      live = false;
+      unsubscribe();
+      appState.remove();
+    };
+  }, [data.signedIn]);
+  useEffect(() => {
+    const id = offlineAccountRef.current;
+    if (data.signedIn && id) void promptNextConflict(id);
   }, [data.signedIn]);
   useEffect(() => {
     if (route.screen !== "notifications" || !data.signedIn) return;
@@ -217,9 +410,45 @@ function AppContent() {
       try {
         const persisted = persistedRef.current;
         if (persisted?.signedIn && !next.signedIn) {
-          await api.logout();
+          const network = await NetInfo.fetch();
+          if (network.isConnected !== false && network.isInternetReachable !== false)
+            await api.logout().catch(() => {});
+          else await api.clearTokens();
+          await clearOfflineSession();
+          offlineAccountRef.current = null;
           persistedRef.current = null;
         } else if (persisted?.signedIn) {
+          const accountId = offlineAccountRef.current;
+          if (accountId && offlineStorageAvailable()) {
+            const operationId = await saveLocalChange(accountId, previous, next);
+            if (operationId === null) {
+              const network = await NetInfo.fetch();
+              if (network.isConnected === false || network.isInternetReachable === false)
+                throw new Error("Offline storage is unavailable in this app build.");
+              await api.syncChange(persisted, next);
+              persistedRef.current = next;
+              setData(next);
+              return true;
+            }
+            localRevision.current += 1;
+            const revision = localRevision.current;
+            persistedRef.current = next;
+            setData(next);
+            void synchronizeAccount(accountId, false)
+              .then((remote) => {
+                if (
+                  remote &&
+                  offlineAccountRef.current === accountId &&
+                  localRevision.current === revision
+                ) {
+                  dataRef.current = remote;
+                  persistedRef.current = remote;
+                  setData(remote);
+                }
+              })
+              .catch(() => {});
+            return true;
+          }
           await api.syncChange(persisted, next);
           persistedRef.current = next;
         }
@@ -247,6 +476,78 @@ function AppContent() {
       lock.current = false;
       setBusy(false);
     }
+  }
+  async function promptNextConflict(accountId: string) {
+    if (promptingConflict.current !== null || offlineAccountRef.current !== accountId) return;
+    let conflict: PendingConflict | undefined;
+    try { [conflict] = await readPendingConflicts(accountId); } catch { return; }
+    if (!conflict || promptingConflict.current !== null) return;
+    promptingConflict.current = conflict.queueId;
+    const serverEntry = conflict.server;
+    const localCustomer = dataRef.current.customers.find((item) => item.id === conflict.local.customerId);
+    const serverCustomer = serverEntry ? dataRef.current.customers.find((item) => item.id === serverEntry.customerId) : undefined;
+    const describe = (entry: NonNullable<PendingConflict["server"]>, name?: string) =>
+      `${money(entry.amount)} ${entry.type === "credit" ? "udhari" : "payment"} · ${name || "customer"} · ${entry.date}${entry.note ? ` · ${entry.note}` : ""}`;
+    const localText = conflict.localDeleted ? "Deleted on this phone" : describe(conflict.local, localCustomer?.name);
+    const serverText = serverEntry ? describe(serverEntry, serverCustomer?.name) : "Deleted on server";
+    const localAmount = money(conflict.local.amount);
+    const serverAmount = conflict.server ? money(conflict.server.amount) : "deleted";
+    let impact = "";
+    if (serverEntry && !conflict.localDeleted && serverEntry.customerId === conflict.local.customerId) {
+      const localSigned = conflict.local.amount * (conflict.local.type === "credit" ? 1 : -1);
+      const serverSigned = serverEntry.amount * (serverEntry.type === "credit" ? 1 : -1);
+      const difference = localSigned - serverSigned;
+      if (difference) impact = `\nEstimated ${customer?.name || "customer"} outstanding change if you keep the phone value: ${difference > 0 ? "+" : "−"}${money(Math.abs(difference))}.`;
+    }
+    const message = `Saved on this phone: ${localText}\nSaved on server: ${serverText}${impact}`;
+    const perform = async (choice: "keep_local" | "keep_server") => {
+      try {
+        const selectedConflict = await chooseConflictResolution(conflict.queueId, choice);
+        const result = await api.resolveFinancialConflict(selectedConflict, choice);
+        await completeConflict(accountId, conflict, result.entry, result.serverVersion, result.audit);
+        promptingConflict.current = null;
+        localRevision.current += 1;
+        const cached = await readCachedAccount(accountId);
+        if (cached && offlineAccountRef.current === accountId) {
+          dataRef.current = cached;
+          persistedRef.current = cached;
+          setData(cached);
+        }
+        void synchronizeAccount(accountId).then((remote) => {
+          if (remote && offlineAccountRef.current === accountId) {
+            dataRef.current = remote;
+            persistedRef.current = remote;
+            setData(remote);
+          }
+        }).catch(() => {});
+        setTimeout(() => void promptNextConflict(accountId), 0);
+      } catch (error) {
+        if (error instanceof api.ApiError && error.status === 409) {
+          await refreshConflict(conflict.queueId, error.payload?.current ?? null, error.payload?.serverVersion);
+          promptingConflict.current = null;
+          Alert.alert("Transaction changed again", "The server has a newer value. Review the updated conflict before choosing.");
+          setTimeout(() => void promptNextConflict(accountId), 250);
+          return;
+        }
+        promptingConflict.current = null;
+        Alert.alert("Unable to resolve conflict", "Your phone and server values are still saved. Reconnect and try again.");
+      }
+    };
+    const connection = await NetInfo.fetch();
+    const online = connection.isConnected !== false && connection.isInternetReachable !== false;
+    const buttons = online
+      ? conflict.chosen
+        ? [{ text: conflict.chosen === "keep_local" ? "Retry phone choice" : "Retry server choice", onPress: () => void perform(conflict.chosen!) }]
+        : [
+            { text: conflict.localDeleted ? "Keep phone deletion" : `Keep phone (${localAmount})`, onPress: () => void perform("keep_local") },
+            { text: serverEntry ? `Keep server (${serverAmount})` : "Keep server deletion", onPress: () => void perform("keep_server") },
+          ]
+      : [];
+    Alert.alert(
+      "Transaction Conflict Detected",
+      `${localCustomer?.name ? `${localCustomer.name}\n` : ""}This transaction was modified while your phone was offline.\n\n${message}`,
+      [...buttons, { text: "Resolve Later", style: "cancel" as const, onPress: () => { promptingConflict.current = null; } }],
+    );
   }
   function go(screen: Screen, id?: string, reset = false) {
     setHistory(reset ? [] : [...history, route]);
@@ -680,7 +981,10 @@ function AppContent() {
       if (lock.current) return;
       lock.current = true;
       setBusy(true);
+      const offlineAccountId = offlineAccountRef.current;
       await api.deleteAccount();
+      if (offlineAccountId) await clearOfflineAccount(offlineAccountId);
+      offlineAccountRef.current = null;
       dataRef.current = initialData;
       setData(initialData);
       persistedRef.current = null;
@@ -724,6 +1028,9 @@ function AppContent() {
               setBusy(true);
               try {
                 const restored = await api.restoreBackup({ ...parsed, signedIn: true });
+                  const accountId = offlineAccountRef.current;
+                  if (accountId && offlineStorageAvailable())
+                    await cacheAuthenticatedAccount(accountId, restored).catch(() => {});
                   dataRef.current = restored;
                   setData(restored);
                   persistedRef.current = restored;
@@ -840,6 +1147,9 @@ function AppContent() {
                   "Invalid mobile number",
                   "Enter a valid 10-digit Indian mobile number.",
                 );
+              const network = await NetInfo.fetch();
+              if (network.isConnected === false || network.isInternetReachable === false)
+                return Alert.alert("You’re offline", "Connect to the internet to sign in.");
               setBusy(true);
               try {
                 const result = await api.startOtp(`+91${phone}`);
@@ -848,7 +1158,7 @@ function AppContent() {
                 setSeconds(30);
                 go("otp");
               } catch (error) {
-                Alert.alert("Could not send OTP", error instanceof Error ? error.message : "Please try again.");
+                showOtpError("Could not send OTP", error, "Please try again.");
               } finally { setBusy(false); }
             }}
           />
@@ -876,11 +1186,14 @@ function AppContent() {
           <Pressable
             disabled={seconds > 0}
             onPress={async () => {
+              const network = await NetInfo.fetch();
+              if (network.isConnected === false || network.isInternetReachable === false)
+                return Alert.alert("You’re offline", "Connect to the internet to sign in.");
               setSeconds(30);
               try {
                 const result = await api.startOtp(`+91${phone}`);
                 setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A new verification code was sent by SMS.");
-              } catch (error) { Alert.alert("Could not resend OTP", error instanceof Error ? error.message : "Please try again."); }
+              } catch (error) { showOtpError("Could not resend OTP", error, "Please try again."); }
             }}
           >
             <Text style={s.link}>
@@ -894,15 +1207,30 @@ function AppContent() {
             disabled={busy}
             onPress={async () => {
               if (!/^\d{4,8}$/.test(otp)) return Alert.alert("Invalid code", "Enter the verification code sent to your phone.");
+              const network = await NetInfo.fetch();
+              if (network.isConnected === false || network.isInternetReachable === false)
+                return Alert.alert("You’re offline", "Connect to the internet to sign in.");
               setBusy(true);
               try {
-                const remote = api.normalizeData(await api.verifyOtp(`+91${phone}`, otp));
+                let remote = api.normalizeData(await api.verifyOtp(`+91${phone}`, otp));
+                const id = accountKey(remote.shop.phone || `+91${phone}`);
+                offlineAccountRef.current = offlineStorageAvailable() ? id : null;
+                if (id && offlineStorageAvailable()) {
+                  try {
+                    remote = (await synchronizePendingOnly(id)) || remote;
+                  } catch {
+                    const cached = await readCachedAccount(id);
+                    if (cached && validBackup(cached)) remote = cached;
+                  }
+                  try { await cacheAuthenticatedAccount(id, remote); }
+                  catch { offlineAccountRef.current = null; }
+                }
                 dataRef.current = remote;
                 setData(remote);
                 persistedRef.current = remote;
                 if (remote.shop.name) go("home", undefined, true);
                 else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ ...remote.shop, phone }); }
-              } catch (error) { Alert.alert("Could not verify OTP", error instanceof Error ? error.message : "Check the code and try again."); }
+              } catch (error) { showOtpError("Could not verify OTP", error, "Check the code and try again."); }
               finally { setBusy(false); }
             }}
           />
@@ -1979,6 +2307,15 @@ function AppContent() {
                   After: {money(a.after.amount)} • {a.after.date} •{" "}
                   {a.after.note}
                 </Hint>
+              )}
+              {a.resolution && (
+                <>
+                  <Hint>Customer: {a.resolution.customerName} • Transaction: {a.resolution.transactionId}</Hint>
+                  <Hint>
+                    Phone: {money(a.resolution.offlineAmount)} • Previous server: {money(a.resolution.previousServerAmount)} • Final: {a.resolution.finalAmount === null ? "Deleted" : money(a.resolution.finalAmount)}
+                  </Hint>
+                  <Hint>{a.resolution.decision} • Resolved by: {a.resolution.resolvedBy}</Hint>
+                </>
               )}
             </Card>
           ))}

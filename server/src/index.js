@@ -15,6 +15,7 @@ import {
   Customer,
   Device,
   Entry,
+  FinancialResolution,
   Idempotency,
   Notification,
   Session,
@@ -47,6 +48,7 @@ const secret = env.JWT_SECRET;
 if (!secret || secret.length < 32)
   throw new Error("JWT_SECRET must contain at least 32 characters");
 if (!env.MONGODB_URI) throw new Error("MONGODB_URI is required");
+if (!env.MONGODB_DB_NAME) throw new Error("MONGODB_DB_NAME is required");
 const jwtKey = new TextEncoder().encode(secret);
 app.disable("x-powered-by");
 app.set("trust proxy", env.TRUST_PROXY === "true" ? 1 : false);
@@ -231,6 +233,7 @@ const customerOut = (d) => ({
 });
 const entryOut = (d) => ({
   id: d.clientId,
+  serverVersion: d.serverVersion || 1,
   customerId: d.customerClientId,
   type: d.type,
   amount: d.amountPaise / 100,
@@ -239,6 +242,29 @@ const entryOut = (d) => ({
   method: d.method,
   due: d.due,
 });
+const financialAuditOut = (record) => ({
+  id: `resolution:${record.resolutionId}`,
+  action: "Transaction Conflict Resolved",
+  date: record.serverAt.toISOString(),
+  resolution: {
+    customerName: record.customerName || "Customer",
+    transactionId: record.transactionId,
+    offlineAmount: record.proposed.amount,
+    previousServerAmount: record.previous.amount,
+    finalAmount: record.selected?.amount ?? null,
+    decision: record.action === "keep_local" ? "Phone Version Selected" : "Server Version Selected",
+    resolvedBy: record.actorId ? "Shopkeeper" : "Unknown",
+    status: "resolved",
+  },
+});
+const sameCustomerValues = (left, right) =>
+  ["id", "name", "phone", "address", "opening", "limit", "reminder"].every(
+    (key) => left[key] === right[key],
+  );
+const sameEntryValues = (left, right) =>
+  ["id", "customerId", "type", "amount", "date", "note", "method", "due"].every(
+    (key) => left[key] === right[key],
+  );
 const shopOut = (d) => ({
   name: d.name,
   owner: d.owner,
@@ -249,6 +275,10 @@ const shopOut = (d) => ({
   defaultMethod: d.defaultMethod,
   reminders: d.reminders,
 });
+const sameShopValues = (left, right) =>
+  ["name", "owner", "address", "phone", "whatsapp", "language", "defaultMethod"].every(
+    (key) => left[key] === right[key],
+  ) && JSON.stringify(left.reminders) === JSON.stringify(right.reminders);
 const error = (res, status, message) =>
   res.status(status).json({ error: message });
 async function signAccess(user) {
@@ -463,35 +493,47 @@ api.get("/activity", auth, async (req, res, next) => {
       500,
       Math.max(1, Number.parseInt(req.query.limit, 10) || 100),
     );
-    const filter = { shopId: req.shopId };
-    if (req.query.cursor) {
-      const cursor = await Audit.findOne({
-        shopId: req.shopId,
-        clientId: req.query.cursor,
-      })
-        .select("_id occurredAt")
-        .lean();
-      if (cursor)
-        filter.$or = [
-          { occurredAt: { $lt: cursor.occurredAt } },
-          { occurredAt: cursor.occurredAt, _id: { $lt: cursor._id } },
-        ];
+    const token = String(req.query.cursor || "");
+    let cursor = null;
+    let cursorKind = "audit";
+    let cursorId = token;
+    if (token.startsWith("resolution:")) {
+      cursorKind = "resolution";
+      cursorId = token.slice("resolution:".length);
+    } else if (token.startsWith("audit:")) {
+      cursorId = token.slice("audit:".length);
     }
-    const rows = await Audit.find(filter)
-      .sort({ occurredAt: -1, _id: -1 })
-      .limit(limit + 1)
-      .lean();
-    const more = rows.length > limit;
-    if (more) rows.pop();
+    if (cursorId) {
+      cursor = cursorKind === "resolution"
+        ? await FinancialResolution.findOne({ shopId: req.shopId, resolutionId: cursorId }).select("_id serverAt").lean()
+        : await Audit.findOne({ shopId: req.shopId, clientId: cursorId }).select("_id occurredAt").lean();
+    }
+    const after = (field) => cursor
+      ? { $or: [{ [field]: { $lt: cursor[cursorKind === "resolution" ? "serverAt" : "occurredAt"] } }, { [field]: cursor[cursorKind === "resolution" ? "serverAt" : "occurredAt"], _id: { $lt: cursor._id } }] }
+      : {};
+    const [auditRows, resolutionRows] = await Promise.all([
+      Audit.find({ shopId: req.shopId, ...after("occurredAt") }).sort({ occurredAt: -1, _id: -1 }).limit(limit + 1).lean(),
+      FinancialResolution.find({ shopId: req.shopId, status: "resolved", ...after("serverAt") }).sort({ serverAt: -1, _id: -1 }).limit(limit + 1).lean(),
+    ]);
+    const merged = [
+      ...auditRows.map((row) => ({ kind: "audit", sortAt: row.occurredAt, sortId: String(row._id), cursorId: row.clientId, row })),
+      ...resolutionRows.map((row) => ({ kind: "resolution", sortAt: row.serverAt, sortId: String(row._id), cursorId: row.resolutionId, row })),
+    ].sort((a, b) => b.sortAt - a.sortAt || b.sortId.localeCompare(a.sortId));
+    const more = merged.length > limit;
+    const page = merged.slice(0, limit);
+    const items = page.map((item) => item.kind === "audit"
+      ? {
+          id: item.row.clientId,
+          action: item.row.action,
+          date: item.row.occurredAt.toISOString(),
+          ...(item.row.before ? { before: item.row.before } : {}),
+          ...(item.row.after ? { after: item.row.after } : {}),
+        }
+      : financialAuditOut(item.row));
+    const last = page.at(-1);
     res.json({
-      items: rows.map((x) => ({
-        id: x.clientId,
-        action: x.action,
-        date: x.occurredAt.toISOString(),
-        ...(x.before ? { before: x.before } : {}),
-        ...(x.after ? { after: x.after } : {}),
-      })),
-      nextCursor: more ? rows.at(-1).clientId : null,
+      items,
+      nextCursor: more && last ? `${last.kind}:${last.cursorId}` : null,
     });
   } catch (e) {
     next(e);
@@ -507,20 +549,45 @@ api.get("/shop", auth, async (req, res, next) => {
 });
 api.patch("/shop", auth, writeLimit, async (req, res, next) => {
   try {
-    const parsed = shopSchema.safeParse(req.body);
+    const { baseSettings, ...input } = req.body || {};
+    const hasBaseSettings = Object.hasOwn(req.body || {}, "baseSettings");
+    const parsed = shopSchema.safeParse(input);
     if (!parsed.success) return error(res, 400, "Invalid shop profile");
+    const base = hasBaseSettings ? shopSchema.safeParse(baseSettings) : null;
+    if (hasBaseSettings && !base?.success)
+      return error(res, 400, "Invalid shop settings version");
     if (parsed.data.phone !== req.user.phone)
       return error(
         res,
         403,
         "Shop phone cannot be changed without phone verification",
       );
-    const s = await Shop.findByIdAndUpdate(req.shopId, parsed.data, {
-      new: true,
-      runValidators: true,
-    }).lean();
+    const session = await mongoose.startSession();
+    let s;
+    try {
+      await session.withTransaction(async () => {
+        s = await Shop.findById(req.shopId).session(session);
+        if (!s) throw Object.assign(new Error("Shop not found"), { status: 404 });
+        const current = shopOut(s);
+        if (
+          base?.success &&
+          !sameShopValues(current, base.data) &&
+          !sameShopValues(current, parsed.data)
+        )
+          throw Object.assign(new Error("Shop settings changed on another device"), {
+            status: 409,
+          });
+        if (!sameShopValues(current, parsed.data)) {
+          s.set(parsed.data);
+          await s.save({ session });
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
     res.json(shopOut(s));
   } catch (e) {
+    if (e.status === 404 || e.status === 409) return error(res, e.status, e.message);
     next(e);
   }
 });
@@ -681,24 +748,34 @@ api.post("/customers", auth, writeLimit, async (req, res, next) => {
     let doc;
     try {
       await session.withTransaction(async () => {
-        doc = await Customer.findOneAndUpdate(
-          { shopId: req.shopId, clientId: c.id },
-          {
-            $set: {
-              shopId: req.shopId,
-              clientId: c.id,
-              name: c.name,
-              nameFolded: c.name.toLocaleLowerCase("en"),
-              phone: c.phone,
-              address: c.address,
-              openingPaise: paise(c.opening),
-              limitPaise: paise(c.limit),
-              reminder: c.reminder,
+        doc = await Customer.findOne({
+          shopId: req.shopId,
+          clientId: c.id,
+        }).session(session);
+        if (doc) {
+          if (doc.deletedAt || !sameCustomerValues(customerOut(doc), c))
+            throw Object.assign(new Error("Customer identifier already exists"), {
+              status: 409,
+            });
+        } else {
+          doc = await Customer.findOneAndUpdate(
+            { shopId: req.shopId, clientId: c.id },
+            {
+              $set: {
+                shopId: req.shopId,
+                clientId: c.id,
+                name: c.name,
+                nameFolded: c.name.toLocaleLowerCase("en"),
+                phone: c.phone,
+                address: c.address,
+                openingPaise: paise(c.opening),
+                limitPaise: paise(c.limit),
+                reminder: c.reminder,
+              },
             },
-            $unset: { deletedAt: 1 },
-          },
-          { upsert: true, new: true, runValidators: true, session },
-        );
+            { upsert: true, new: true, runValidators: true, session },
+          );
+        }
         if (audit) await saveAudit({ ...req, session }, audit);
       });
     } finally {
@@ -706,23 +783,43 @@ api.post("/customers", auth, writeLimit, async (req, res, next) => {
     }
     res.status(201).json(customerOut(doc));
   } catch (e) {
+    if (e.status === 409) return error(res, 409, e.message);
     next(e);
   }
 });
 api.patch("/customers/:id", auth, writeLimit, async (req, res, next) => {
   try {
-    const { audit, ...input } = req.body || {};
+    const { audit, baseRecord, ...input } = req.body || {};
+    const hasBaseRecord = Object.hasOwn(req.body || {}, "baseRecord");
     const parsed = customerSchema.safeParse(input);
     if (!parsed.success || parsed.data.id !== req.params.id)
       return error(res, 400, "Invalid customer");
+    const base = hasBaseRecord ? customerSchema.safeParse(baseRecord) : null;
+    if (hasBaseRecord && (!base?.success || base.data.id !== req.params.id))
+      return error(res, 400, "Invalid customer version");
     const c = parsed.data;
     const session = await mongoose.startSession();
     let doc;
     try {
       await session.withTransaction(async () => {
-        doc = await Customer.findOneAndUpdate(
-          { shopId: req.shopId, clientId: c.id, deletedAt: { $exists: false } },
-          {
+        doc = await Customer.findOne({
+          shopId: req.shopId,
+          clientId: c.id,
+          deletedAt: { $exists: false },
+        }).session(session);
+        if (!doc)
+          throw Object.assign(new Error("Customer not found"), { status: 404 });
+        const current = customerOut(doc);
+        if (
+          base?.success &&
+          !sameCustomerValues(current, base.data) &&
+          !sameCustomerValues(current, c)
+        )
+          throw Object.assign(new Error("Customer changed on another device"), {
+            status: 409,
+          });
+        if (!sameCustomerValues(current, c)) {
+          doc.set({
             name: c.name,
             nameFolded: c.name.toLocaleLowerCase("en"),
             phone: c.phone,
@@ -730,11 +827,9 @@ api.patch("/customers/:id", auth, writeLimit, async (req, res, next) => {
             openingPaise: paise(c.opening),
             limitPaise: paise(c.limit),
             reminder: c.reminder,
-          },
-          { new: true, runValidators: true, session },
-        );
-        if (!doc)
-          throw Object.assign(new Error("Customer not found"), { status: 404 });
+          });
+          await doc.save({ session });
+        }
         if (audit) await saveAudit({ ...req, session }, audit);
       });
     } finally {
@@ -742,23 +837,41 @@ api.patch("/customers/:id", auth, writeLimit, async (req, res, next) => {
     }
     res.json(customerOut(doc));
   } catch (e) {
-    if (e.status === 404) return error(res, 404, e.message);
+    if (e.status === 404 || e.status === 409) return error(res, e.status, e.message);
     next(e);
   }
 });
 api.delete("/customers/:id", auth, writeLimit, async (req, res, next) => {
   try {
-    const c = await Customer.findOneAndUpdate(
-      {
-        shopId: req.shopId,
-        clientId: req.params.id,
-        deletedAt: { $exists: false },
-      },
-      { deletedAt: new Date() },
-    );
-    if (!c) return error(res, 404, "Customer not found");
+    const hasBaseRecord = Object.hasOwn(req.body || {}, "baseRecord");
+    const base = hasBaseRecord
+      ? customerSchema.safeParse(req.body.baseRecord)
+      : null;
+    if (hasBaseRecord && (!base?.success || base.data.id !== req.params.id))
+      return error(res, 400, "Invalid customer version");
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        const customer = await Customer.findOne({
+          shopId: req.shopId,
+          clientId: req.params.id,
+        }).session(session);
+        if (!customer)
+          throw Object.assign(new Error("Customer not found"), { status: 404 });
+        if (customer.deletedAt) return;
+        if (base?.success && !sameCustomerValues(customerOut(customer), base.data))
+          throw Object.assign(new Error("Customer changed on another device"), {
+            status: 409,
+          });
+        customer.deletedAt = new Date();
+        await customer.save({ session });
+      });
+    } finally {
+      await session.endSession();
+    }
     res.status(204).end();
   } catch (e) {
+    if (e.status === 404 || e.status === 409) return error(res, e.status, e.message);
     next(e);
   }
 });
@@ -832,6 +945,7 @@ async function saveAudit(req, a) {
     );
 }
 api.post("/ledger", auth, writeLimit, async (req, res, next) => {
+  let requestHash;
   try {
     const { audit, ...input } = req.body || {};
     const parsed = entrySchema.safeParse(input);
@@ -844,40 +958,55 @@ api.post("/ledger", auth, writeLimit, async (req, res, next) => {
     }).lean();
     if (!c) return error(res, 404, "Customer not found");
     const key = req.get("Idempotency-Key");
+    requestHash = digest(JSON.stringify(e));
     if (key) {
       if (key.length > 128) return error(res, 400, "Invalid idempotency key");
       const existing = await Idempotency.findOne({
         shopId: req.shopId,
         key,
       }).lean();
-      if (existing) return res.status(200).json(existing.response);
+      if (existing) {
+        if (existing.requestHash && existing.requestHash !== requestHash)
+          return error(res, 409, "Idempotency key was already used for another transaction");
+        return res.status(200).json(existing.response);
+      }
     }
     const session = await mongoose.startSession();
     let response;
     try {
       await session.withTransaction(async () => {
-        const doc = await Entry.findOneAndUpdate(
-          { shopId: req.shopId, clientId: e.id },
-          {
-            $set: {
-              shopId: req.shopId,
-              clientId: e.id,
-              customerClientId: e.customerId,
-              type: e.type,
-              amountPaise: paise(e.amount),
-              date: e.date,
-              note: e.note,
-              method: e.method,
-              due: e.due,
+        let doc = await Entry.findOne({
+          shopId: req.shopId,
+          clientId: e.id,
+        }).session(session);
+        if (doc) {
+          if (doc.deletedAt || !sameEntryValues(entryOut(doc), e))
+            throw Object.assign(new Error("Transaction identifier already exists"), {
+              status: 409,
+            });
+        } else {
+          doc = await Entry.findOneAndUpdate(
+            { shopId: req.shopId, clientId: e.id },
+            {
+              $set: {
+                shopId: req.shopId,
+                clientId: e.id,
+                customerClientId: e.customerId,
+                type: e.type,
+                amountPaise: paise(e.amount),
+                date: e.date,
+                note: e.note,
+                method: e.method,
+                due: e.due,
+              },
             },
-            $unset: { deletedAt: 1 },
-          },
-          { upsert: true, new: true, runValidators: true, session },
-        );
+            { upsert: true, new: true, runValidators: true, session },
+          );
+        }
         if (audit) await saveAudit({ ...req, session }, audit);
         response = entryOut(doc);
         if (key)
-          await Idempotency.create([{ shopId: req.shopId, key, response }], {
+          await Idempotency.create([{ shopId: req.shopId, key, requestHash, response }], {
             session,
           });
       });
@@ -886,34 +1015,51 @@ api.post("/ledger", auth, writeLimit, async (req, res, next) => {
     }
     res.status(201).json(response);
   } catch (e) {
+    if (e.status === 409) return error(res, 409, e.message);
     if (e.code === 11000 && req.get("Idempotency-Key")) {
       const found = await Idempotency.findOne({
         shopId: req.shopId,
         key: req.get("Idempotency-Key"),
       }).lean();
-      if (found) return res.json(found.response);
+      if (found) {
+        if (found.requestHash && found.requestHash !== requestHash)
+          return error(res, 409, "Idempotency key was already used for another transaction");
+        return res.json(found.response);
+      }
     }
     next(e);
   }
 });
 api.delete("/ledger/:id", auth, writeLimit, async (req, res, next) => {
   try {
+    const hasBaseRecord = Object.hasOwn(req.body || {}, "baseRecord");
+    const base = hasBaseRecord
+      ? entrySchema.safeParse({ ...req.body.baseRecord, id: req.params.id })
+      : null;
+    if (hasBaseRecord && !base?.success)
+      return error(res, 400, "Invalid transaction version");
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
-        const e = await Entry.findOneAndUpdate(
-          {
-            shopId: req.shopId,
-            clientId: req.params.id,
-            deletedAt: { $exists: false },
-          },
-          { deletedAt: new Date() },
-          { session },
-        );
-        if (!e)
+        const e = await Entry.findOne({
+          shopId: req.shopId,
+          clientId: req.params.id,
+        }).session(session);
+        if (!e) {
           throw Object.assign(new Error("Transaction not found"), {
             status: 404,
           });
+        }
+        if (e.deletedAt) return;
+        if (base?.success && (!sameEntryValues(entryOut(e), base.data) || (req.body?.baseVersion && (e.serverVersion || 1) !== req.body.baseVersion)))
+          throw Object.assign(new Error("Transaction changed on another device"), {
+            status: 409,
+            current: entryOut(e),
+            serverVersion: e.serverVersion || 1,
+          });
+        e.deletedAt = new Date();
+        e.serverVersion = (e.serverVersion || 1) + 1;
+        await e.save({ session });
         if (req.body?.audit)
           await saveAudit({ ...req, session }, req.body.audit);
       });
@@ -923,14 +1069,21 @@ api.delete("/ledger/:id", auth, writeLimit, async (req, res, next) => {
     res.status(204).end();
   } catch (e) {
     if (e.status === 404) return error(res, 404, e.message);
+    if (e.status === 409) return res.status(409).json({ error: e.message, type: "transaction_conflict", current: e.current ?? null, serverVersion: e.serverVersion || e.current?.serverVersion || 1 });
     next(e);
   }
 });
 api.patch("/ledger/:id", auth, writeLimit, async (req, res, next) => {
   try {
-    const { audit, ...input } = req.body || {};
+    const { audit, baseRecord, baseVersion, ...input } = req.body || {};
+    const hasBaseRecord = Object.hasOwn(req.body || {}, "baseRecord");
     const parsed = entrySchema.safeParse({ ...input, id: req.params.id });
     if (!parsed.success) return error(res, 400, "Invalid transaction");
+    const base = hasBaseRecord
+      ? entrySchema.safeParse({ ...baseRecord, id: req.params.id })
+      : null;
+    if (hasBaseRecord && !base?.success)
+      return error(res, 400, "Invalid transaction version");
     const e = parsed.data;
     const c = await Customer.findOne({
       shopId: req.shopId,
@@ -942,9 +1095,23 @@ api.patch("/ledger/:id", auth, writeLimit, async (req, res, next) => {
     let response;
     try {
       await session.withTransaction(async () => {
-        const doc = await Entry.findOneAndUpdate(
-          { shopId: req.shopId, clientId: e.id, deletedAt: { $exists: false } },
-          {
+        const doc = await Entry.findOne({ shopId: req.shopId, clientId: e.id }).session(session);
+        if (!doc)
+          throw Object.assign(new Error("Transaction not found"), {
+            status: 404,
+          });
+        const current = entryOut(doc);
+        if (doc.deletedAt)
+          throw Object.assign(new Error("Transaction was deleted on another device"), {
+            status: 409, current: null, serverVersion: doc.serverVersion || 1,
+          });
+        if (base?.success && (!sameEntryValues(current, base.data) || (baseVersion && (doc.serverVersion || 1) !== baseVersion)) && !sameEntryValues(current, e))
+          throw Object.assign(new Error("Transaction changed on another device"), {
+            status: 409,
+            current,
+          });
+        if (!sameEntryValues(current, e)) {
+          doc.set({
             customerClientId: e.customerId,
             type: e.type,
             amountPaise: paise(e.amount),
@@ -952,13 +1119,10 @@ api.patch("/ledger/:id", auth, writeLimit, async (req, res, next) => {
             note: e.note,
             method: e.method,
             due: e.due,
-          },
-          { new: true, runValidators: true, session },
-        );
-        if (!doc)
-          throw Object.assign(new Error("Transaction not found"), {
-            status: 404,
           });
+          doc.serverVersion = (doc.serverVersion || 1) + 1;
+          await doc.save({ session });
+        }
         if (audit) await saveAudit({ ...req, session }, audit);
         response = entryOut(doc);
       });
@@ -967,7 +1131,158 @@ api.patch("/ledger/:id", auth, writeLimit, async (req, res, next) => {
     }
     res.json(response);
   } catch (e) {
-    if (e.status === 404) return error(res, 404, e.message);
+    if (e.status === 404) return error(res, e.status, e.message);
+    if (e.status === 409) return res.status(409).json({ error: e.message, type: "transaction_conflict", current: e.current ?? null, serverVersion: e.serverVersion || e.current?.serverVersion || 1 });
+    next(e);
+  }
+});
+api.post("/ledger/:id/resolve", auth, writeLimit, async (req, res, next) => {
+  const parsed = z.object({
+    resolutionId: idSchema,
+    expectedVersion: z.number().int().min(1),
+    choice: z.enum(["keep_local", "keep_server"]),
+    proposed: entrySchema,
+    localDeleted: z.boolean().default(false),
+    localAt: z.string().datetime().optional(),
+  }).safeParse(req.body || {});
+  if (!parsed.success || parsed.data.proposed.id !== req.params.id)
+    return error(res, 400, "Invalid conflict resolution");
+  const input = parsed.data;
+  const key = `resolution:${input.resolutionId}`;
+  const requestHash = digest(JSON.stringify(input));
+  // The client generates a fresh resolutionId for each local conflict, so it
+  // cannot identify competing resolutions of the same offline mutation. The
+  // proposal and localAt are stable in the durable SQLite conflict record and
+  // distinguish later offline changes, including after Keep Server leaves
+  // the financial serverVersion unchanged.
+  const conflictId = digest(JSON.stringify({
+    transactionId: req.params.id,
+    expectedVersion: input.expectedVersion,
+    proposed: input.proposed,
+    localDeleted: input.localDeleted,
+    localAt: input.localAt || null,
+  }));
+  try {
+    const committed = await FinancialResolution.findOne({ shopId: req.shopId, resolutionId: input.resolutionId }).lean();
+    if (committed) {
+      if (committed.requestHash !== requestHash)
+        return error(res, 409, "Resolution identifier was already used for another choice");
+      return res.json({ entry: committed.selected, serverVersion: committed.resultingVersion, resolutionId: input.resolutionId, serverAt: committed.serverAt.toISOString(), audit: financialAuditOut(committed) });
+    }
+    const prior = await Idempotency.findOne({ shopId: req.shopId, key }).lean();
+    if (prior) {
+      if (prior.requestHash !== requestHash)
+        return error(res, 409, "Resolution identifier was already used for another choice");
+      return res.json(prior.response);
+    }
+    const session = await mongoose.startSession();
+    let response;
+    try {
+      await session.withTransaction(async () => {
+        const repeated = await Idempotency.findOne({ shopId: req.shopId, key }).session(session).lean();
+        if (repeated) {
+          if (repeated.requestHash !== requestHash)
+            throw Object.assign(new Error("Resolution identifier was already used for another choice"), { status: 409 });
+          response = repeated.response;
+          return;
+        }
+        const doc = await Entry.findOne({ shopId: req.shopId, clientId: req.params.id }).session(session);
+        const actualVersion = doc?.serverVersion || 1;
+        const current = doc && !doc.deletedAt ? entryOut(doc) : null;
+        if (!doc || actualVersion !== input.expectedVersion)
+          throw Object.assign(new Error("Transaction changed while the conflict was open"), { status: 409, current });
+        const priorConflict = await FinancialResolution.findOne({
+          shopId: req.shopId,
+          conflictId,
+        }).session(session).lean();
+        if (priorConflict) {
+          if (priorConflict.resolutionId === input.resolutionId && priorConflict.requestHash === requestHash) {
+            response = {
+              entry: priorConflict.selected,
+              serverVersion: priorConflict.resultingVersion,
+              resolutionId: priorConflict.resolutionId,
+              serverAt: priorConflict.serverAt.toISOString(),
+              audit: financialAuditOut(priorConflict),
+            };
+            return;
+          }
+          throw Object.assign(new Error("This financial conflict has already been resolved"), {
+            status: 409,
+            current,
+            serverVersion: actualVersion,
+          });
+        }
+        const previous = entryOut(doc);
+        let selected = previous;
+        if (input.choice === "keep_local") {
+          const proposal = input.proposed;
+          const customer = input.localDeleted ? true : await Customer.findOne({ shopId: req.shopId, clientId: proposal.customerId, deletedAt: { $exists: false } }).session(session).lean();
+          if (!customer) throw Object.assign(new Error("Customer is not available for this transaction"), { status: 409, current, serverVersion: actualVersion });
+          const changed = !sameEntryValues(previous, proposal) || !!doc.deletedAt !== input.localDeleted;
+          if (changed) {
+            doc.set({
+              customerClientId: proposal.customerId,
+              type: proposal.type,
+              amountPaise: paise(proposal.amount),
+              date: proposal.date,
+              note: proposal.note,
+              method: proposal.method,
+              due: proposal.due,
+              deletedAt: input.localDeleted ? new Date() : undefined,
+              serverVersion: actualVersion + 1,
+            });
+            await doc.save({ session });
+          }
+          selected = input.localDeleted ? null : entryOut(doc);
+        } else if (doc.deletedAt) selected = null;
+        const resultingVersion = doc.serverVersion || 1;
+        const serverAt = new Date();
+        const customer = await Customer.findOne({
+          shopId: req.shopId,
+          clientId: selected?.customerId || input.proposed.customerId || previous.customerId,
+        }).session(session).select("name").lean();
+        const [resolutionRecord] = await FinancialResolution.create([{
+          shopId: req.shopId,
+          transactionId: req.params.id,
+          conflictId,
+          customerName: customer?.name || "Customer",
+          resolutionId: input.resolutionId,
+          requestHash,
+          actorId: req.user._id,
+          previous,
+          proposed: input.proposed,
+          selected,
+          previousVersion: actualVersion,
+          resultingVersion,
+          localAt: input.localAt ? new Date(input.localAt) : undefined,
+          action: input.choice,
+          status: "resolved",
+          serverAt,
+        }], { session });
+        response = { entry: selected, serverVersion: resultingVersion, resolutionId: input.resolutionId, serverAt: serverAt.toISOString(), audit: financialAuditOut(resolutionRecord) };
+        await Idempotency.create([{ shopId: req.shopId, key, requestHash, response }], { session });
+      });
+    } finally {
+      await session.endSession();
+    }
+    res.json(response);
+  } catch (e) {
+    if (e.status === 409) return res.status(409).json({ error: e.message, current: e.current ?? null, serverVersion: e.serverVersion || e.current?.serverVersion || 1 });
+    if (e.code === 11000) {
+      const prior = await Idempotency.findOne({ shopId: req.shopId, key }).lean();
+      if (prior?.requestHash === requestHash) return res.json(prior.response);
+      const resolvedConflict = await FinancialResolution.findOne({
+        shopId: req.shopId,
+        conflictId,
+      }).lean();
+      if (resolvedConflict)
+        return res.status(409).json({
+          error: "This financial conflict has already been resolved",
+          current: resolvedConflict.selected,
+          serverVersion: resolvedConflict.resultingVersion,
+        });
+      return error(res, 409, "Resolution identifier was already used");
+    }
     next(e);
   }
 });
@@ -1162,11 +1477,17 @@ app.use((err, req, res, next) => {
 });
 
 await mongoose.connect(env.MONGODB_URI, {
+  dbName: env.MONGODB_DB_NAME,
   autoIndex: false,
   maxPoolSize: Number(env.MONGO_POOL_SIZE) || 20,
   minPoolSize: 2,
   serverSelectionTimeoutMS: 5000,
 });
+if (mongoose.connection.name !== env.MONGODB_DB_NAME) {
+  await mongoose.disconnect();
+  throw new Error("Connected MongoDB database does not match MONGODB_DB_NAME");
+}
+log.info({ database: mongoose.connection.name }, "MongoDB connected");
 if (process.argv.includes("--indexes")) {
   await ensureIndexes();
   log.info("MongoDB indexes ensured");

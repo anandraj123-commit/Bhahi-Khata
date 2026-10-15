@@ -15,6 +15,11 @@
       }
     },
     "icon": "./assets/khata-icon.png",
-    "plugins": ["expo-sharing", "expo-secure-store", "expo-notifications"]
+    "plugins": [
+      "expo-sharing",
+      "expo-secure-store",
+      "expo-notifications",
+      ["expo-sqlite", { "useSQLCipher": true }]
+    ]
   }
 }

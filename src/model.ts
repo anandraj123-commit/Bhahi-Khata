@@ -1,3 +1,5 @@
+import * as Crypto from "expo-crypto";
+
 export type Customer = {
   id: string;
   createdAt?: string;
@@ -10,6 +12,8 @@ export type Customer = {
 };
 export type Entry = {
   id: string;
+  /** Authoritative server revision. Omitted for entries created offline. */
+  serverVersion?: number;
   customerId: string;
   type: "credit" | "payment";
   amount: number;
@@ -31,6 +35,16 @@ export type Audit = {
   date: string;
   before?: Entry;
   after?: Entry;
+  resolution?: {
+    customerName: string;
+    transactionId: string;
+    offlineAmount: number;
+    previousServerAmount: number;
+    finalAmount: number | null;
+    decision: "Phone Version Selected" | "Server Version Selected";
+    resolvedBy: string;
+    status: "resolved";
+  };
 };
 export type Data = {
   shop: Shop;
@@ -51,8 +65,7 @@ export type Data = {
   read: string[];
 };
 export const today = () => new Date().toLocaleDateString("en-CA");
-export const uid = () =>
-  `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+export const uid = () => Crypto.randomUUID();
 export const money = (n: number) =>
   `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 export const initialData: Data = {
@@ -169,7 +182,16 @@ export function validBackup(value: unknown): value is Data {
         (!a.after ||
           (Number.isFinite(a.after.amount) &&
             typeof a.after.date === "string" &&
-            typeof a.after.note === "string")),
+            typeof a.after.note === "string")) &&
+        (!a.resolution ||
+          (typeof a.resolution.customerName === "string" &&
+            typeof a.resolution.transactionId === "string" &&
+            Number.isFinite(a.resolution.offlineAmount) &&
+            Number.isFinite(a.resolution.previousServerAmount) &&
+            (a.resolution.finalAmount === null || Number.isFinite(a.resolution.finalAmount)) &&
+            ["Phone Version Selected", "Server Version Selected"].includes(a.resolution.decision) &&
+            typeof a.resolution.resolvedBy === "string" &&
+            a.resolution.status === "resolved")),
     ) &&
     !!d.reminders &&
     typeof d.reminders.enabled === "boolean" &&

@@ -73,6 +73,7 @@ export const Entry = mongoose.model(
       note: { type: String, default: "", maxlength: 1000 },
       method: { type: String, default: "Cash", maxlength: 50 },
       due: { type: String, default: "" },
+      serverVersion: { type: Number, required: true, default: 1, min: 1 },
       deletedAt: Date,
     },
     base,
@@ -98,6 +99,39 @@ export const Audit = mongoose.model(
 );
 Audit.schema.index({ shopId: 1, occurredAt: -1, _id: -1 });
 Audit.schema.index({ shopId: 1, clientId: 1 }, { unique: true });
+export const FinancialResolution = mongoose.model(
+  "FinancialResolution",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      transactionId: { type: String, required: true },
+      customerName: { type: String, default: "", maxlength: 120 },
+      resolutionId: { type: String, required: true },
+      conflictId: { type: String },
+      requestHash: { type: String, required: true },
+      actorId: { type: Schema.Types.ObjectId, required: true },
+      previous: { type: Schema.Types.Mixed, required: true },
+      proposed: { type: Schema.Types.Mixed, required: true },
+      selected: Schema.Types.Mixed,
+      previousVersion: { type: Number, required: true },
+      resultingVersion: { type: Number, required: true },
+      localAt: Date,
+      action: { type: String, enum: ["keep_local", "keep_server"], required: true },
+      status: { type: String, enum: ["resolved"], required: true },
+      serverAt: { type: Date, required: true },
+    },
+    base,
+  ),
+);
+FinancialResolution.schema.index({ shopId: 1, resolutionId: 1 }, { unique: true });
+FinancialResolution.schema.index(
+  { shopId: 1, conflictId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { conflictId: { $type: "string" } },
+  },
+);
+FinancialResolution.schema.index({ shopId: 1, serverAt: -1, _id: -1 });
 export const Notification = mongoose.model(
   "Notification",
   new Schema(
@@ -145,6 +179,7 @@ export const Idempotency = mongoose.model(
     {
       shopId: { type: Schema.Types.ObjectId, required: true },
       key: { type: String, required: true },
+      requestHash: { type: String },
       response: Schema.Types.Mixed,
       createdAt: { type: Date, default: Date.now, expires: 86400 },
     },
@@ -178,6 +213,7 @@ export async function ensureIndexes() {
     Customer,
     Entry,
     Audit,
+    FinancialResolution,
     Notification,
     Device,
     Session,

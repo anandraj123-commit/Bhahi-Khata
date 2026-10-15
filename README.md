@@ -1,6 +1,6 @@
 # Digital Khata
 
-Digital Khata is a React Native Android app backed by a separate Express and MongoDB service. Customer records, shop settings, ledger entries, activity history, and backup restores are stored in the API account rather than AsyncStorage. The mobile app keeps access credentials in Expo SecureStore.
+Digital Khata is a React Native Android app backed by a separate Express and MongoDB service. The installed mobile app keeps an encrypted SQLite cache and durable synchronization queue for offline customer, shop, and ledger work. Authentication credentials remain in Expo SecureStore.
 
 ## Run locally
 
@@ -48,13 +48,17 @@ Digital Khata is a React Native Android app backed by a separate Express and Mon
    ```
 
    The default API URL is `http://10.0.2.2:4000/api/v1` for an Android emulator. For a physical phone, create a root `.env.local` with `EXPO_PUBLIC_API_URL=http://YOUR_COMPUTER_LAN_IP:4000/api/v1`, then rebuild/restart the development app. Keep this HTTP development setup on a trusted network. Production app builds disable cleartext traffic and must use HTTPS.
-4. Because SecureStore and push notifications are native modules, use a development build for device testing:
+4. SQLCipher, SecureStore, and push notifications require an installed development build; Expo Go cannot provide encrypted offline storage:
 
    ```bash
    npx expo run:android
    ```
 
-   In the local server setup, enter the development OTP shown on the verification screen. A production server never returns that code.
+   In the local server setup, enter the development OTP shown on the verification screen. A production server never returns that code. To restart Metro for the installed development client, use `npx expo start --dev-client`.
+
+## Offline use
+
+Offline sign-in is available only after an online OTP sign-in has downloaded the account data to the encrypted local database. A cached session is eligible for up to 30 days after the last successful server validation and is removed from access on logout or server rejection. Customer, shop-setting, and ledger changes save locally first, then synchronize when the app returns online. Conflicting edits remain queued and are not applied over newer server records. `npx expo start --go` runs Expo Go and cannot provide encrypted offline storage. A development client still loads JavaScript from Metro; to check cold launch with no Metro connection, build and install a bundled Android release with `npm run build:android` (or use the EAS `preview` APK profile).
 
 To stop local MongoDB, run `brew services stop mongodb-community@8.0`.
 
