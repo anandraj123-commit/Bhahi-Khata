@@ -1,0 +1,33 @@
+import express from "express";
+import { apiLimit } from "../middleware/rateLimits.js";
+import healthRoutes from "./healthRoutes.js";
+import authRoutes from "./authRoutes.js";
+import bootstrapRoutes from "./bootstrapRoutes.js";
+import activityRoutes from "./activityRoutes.js";
+import shopRoutes from "./shopRoutes.js";
+import backupRoutes from "./backupRoutes.js";
+import customersRoutes from "./customersRoutes.js";
+import ledgerRoutes from "./ledgerRoutes.js";
+import notificationsRoutes from "./notificationsRoutes.js";
+import devicesRoutes from "./devicesRoutes.js";
+import messagesRoutes from "./messagesRoutes.js";
+import accountRoutes from "./accountRoutes.js";
+import { error } from "../utils/http.js";
+
+const router = express.Router();
+router.use(apiLimit);
+router.use(healthRoutes);
+router.use(authRoutes);
+router.use(bootstrapRoutes);
+router.use(activityRoutes);
+router.use(shopRoutes);
+router.use(backupRoutes);
+router.use(customersRoutes);
+router.use(ledgerRoutes);
+router.use(notificationsRoutes);
+router.use(devicesRoutes);
+router.use(messagesRoutes);
+router.use(accountRoutes);
+router.use((req, res) => error(res, 404, "API route not found"));
+
+export default router;
