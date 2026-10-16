@@ -53,6 +53,10 @@ export const handle_post_ledger = async (req, res, next) => {
 
 export const handle_delete_ledger_id = async (req, res, next) => {
   try {
+    if (req.body?.baseVersion !== undefined && !z.number().int().min(1).safeParse(req.body.baseVersion).success)
+      return error(res, 400, "Invalid transaction version");
+    if (req.body?.baseResolutionVersion !== undefined && !z.number().int().min(1).safeParse(req.body.baseResolutionVersion).success)
+      return error(res, 400, "Invalid transaction resolution version");
     const hasBaseRecord = Object.hasOwn(req.body || {}, "baseRecord");
     const base = hasBaseRecord
       ? entrySchema.safeParse({ ...req.body.baseRecord, id: req.params.id })
@@ -65,6 +69,7 @@ export const handle_delete_ledger_id = async (req, res, next) => {
       id: req.params.id,
       base,
       baseVersion: req.body?.baseVersion,
+      baseResolutionVersion: req.body?.baseResolutionVersion,
       audit: req.body?.audit,
     });
     res.status(204).end();
@@ -76,6 +81,7 @@ export const handle_delete_ledger_id = async (req, res, next) => {
         type: "transaction_conflict",
         current: e.current ?? null,
         serverVersion: e.serverVersion || e.current?.serverVersion || 1,
+        resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1,
       });
     next(e);
   }
@@ -83,7 +89,11 @@ export const handle_delete_ledger_id = async (req, res, next) => {
 
 export const handle_patch_ledger_id = async (req, res, next) => {
   try {
-    const { audit, baseRecord, baseVersion, ...input } = req.body || {};
+    const { audit, baseRecord, baseVersion, baseResolutionVersion, ...input } = req.body || {};
+    if (baseVersion !== undefined && !z.number().int().min(1).safeParse(baseVersion).success)
+      return error(res, 400, "Invalid transaction version");
+    if (baseResolutionVersion !== undefined && !z.number().int().min(1).safeParse(baseResolutionVersion).success)
+      return error(res, 400, "Invalid transaction resolution version");
     const hasBaseRecord = Object.hasOwn(req.body || {}, "baseRecord");
     const parsed = entrySchema.safeParse({ ...input, id: req.params.id });
     if (!parsed.success) return error(res, 400, "Invalid transaction");
@@ -98,6 +108,7 @@ export const handle_patch_ledger_id = async (req, res, next) => {
       entry: parsed.data,
       base,
       baseVersion,
+      baseResolutionVersion,
       audit,
     });
     res.json(response);
@@ -109,6 +120,7 @@ export const handle_patch_ledger_id = async (req, res, next) => {
         type: "transaction_conflict",
         current: e.current ?? null,
         serverVersion: e.serverVersion || e.current?.serverVersion || 1,
+        resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1,
       });
     next(e);
   }
@@ -119,6 +131,7 @@ export const handle_post_ledger_id_resolve = async (req, res, next) => {
     .object({
       resolutionId: idSchema,
       expectedVersion: z.number().int().min(1),
+      expectedResolutionVersion: z.number().int().min(1).default(1),
       choice: z.enum(["keep_local", "keep_server"]),
       proposed: entrySchema,
       localDeleted: z.boolean().default(false),
@@ -130,15 +143,11 @@ export const handle_post_ledger_id_resolve = async (req, res, next) => {
   const input = parsed.data;
   const key = `resolution:${input.resolutionId}`;
   const requestHash = digest(JSON.stringify(input));
-  // Proposal and local time identify one durable offline conflict while
-  // allowing later local changes to the same transaction to be resolved.
   const conflictId = digest(
     JSON.stringify({
       transactionId: req.params.id,
       expectedVersion: input.expectedVersion,
-      proposed: input.proposed,
-      localDeleted: input.localDeleted,
-      localAt: input.localAt || null,
+      expectedResolutionVersion: input.expectedResolutionVersion,
     }),
   );
   try {
@@ -159,6 +168,7 @@ export const handle_post_ledger_id_resolve = async (req, res, next) => {
         error: e.message,
         current: e.current ?? null,
         serverVersion: e.serverVersion || e.current?.serverVersion || 1,
+        resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1,
       });
     next(e);
   }

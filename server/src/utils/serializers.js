@@ -1,5 +1,7 @@
 export const customerOut = (d) => ({
   id: d.clientId,
+  serverVersion: d.serverVersion || 1,
+  resolutionVersion: d.resolutionVersion || 1,
   createdAt: d.createdAt?.toISOString?.(),
   name: d.name,
   phone: d.phone,
@@ -11,6 +13,7 @@ export const customerOut = (d) => ({
 export const entryOut = (d) => ({
   id: d.clientId,
   serverVersion: d.serverVersion || 1,
+  resolutionVersion: d.resolutionVersion || 1,
   customerId: d.customerClientId,
   type: d.type,
   amount: d.amountPaise / 100,
@@ -36,6 +39,8 @@ export const financialAuditOut = (record) => ({
 });
 
 export const shopOut = (d) => ({
+  serverVersion: d.serverVersion || 1,
+  resolutionVersion: d.resolutionVersion || 1,
   name: d.name,
   owner: d.owner,
   address: d.address,

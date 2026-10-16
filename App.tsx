@@ -4,7 +4,6 @@ import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  AppState,
   BackHandler,
   KeyboardAvoidingView,
   Linking,
@@ -14,10 +13,9 @@ import {
   Share,
   View,
 } from "react-native";
-import NetInfo from "@react-native-community/netinfo";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import Constants from "expo-constants";
+import { isExpoGo, loadNotifications } from "./src/notificationRuntime";
 import * as Device from "expo-device";
 import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
@@ -37,22 +35,42 @@ import {
 import * as api from "./src/api";
 import {
   cacheAuthenticatedAccount,
+  cacheSubscriptionSnapshot,
   clearOfflineAccount,
   clearOfflineSession,
   hasPendingChanges,
   completeConflict,
+  completeCustomerConflict,
+  completeSettingsConflict,
   chooseConflictResolution,
+  chooseCustomerConflictResolution,
+  chooseSettingsConflictResolution,
   offlineStorageAvailable,
   readCachedAccount,
+  readSubscriptionSnapshot,
   readPendingConflicts,
+  readPendingCustomerConflicts,
+  readPendingSettingsConflicts,
   readOfflineSession,
   readSyncQueueStatus,
   retryFailedChanges,
   refreshConflict,
+  refreshCustomerConflict,
+  refreshSettingsConflict,
   saveLocalChange,
   type PendingConflict,
+  type PendingCustomerConflict,
+  type PendingSettingsConflict,
 } from "./src/offlineStore";
 import { synchronizeAccount, synchronizePendingOnly } from "./src/offlineSync";
+import {
+  checkConnectivity,
+  currentConnectivity,
+  currentConnectivityDetails,
+  observeConnectivity,
+  type ConnectivityStatus,
+} from "./src/connectivity";
+import type { SubscriptionSnapshot } from "./src/subscription";
 import {
   Button,
   Card,
@@ -92,6 +110,7 @@ type Screen =
   | "reminders"
   | "help"
   | "subscription"
+  | "subscriptionPayments"
   | "account"
   | "audit";
 type Route = { screen: Screen; id?: string };
@@ -118,18 +137,25 @@ const isOfflineError = (error: unknown) =>
       /network request failed|failed to fetch|network error|internet connection/i.test(
         error.message,
       )));
-const showOtpError = (title: string, error: unknown, fallback: string) =>
+const showOtpError = (title: string, error: unknown, fallback: string) => {
+  const unreachable = isOfflineError(error);
+  const offline = currentConnectivity() === "offline";
   Alert.alert(
-    isOfflineError(error) ? "You’re offline" : title,
-    isOfflineError(error)
-      ? "Connect to the internet to sign in."
-      : errorMessage(error, fallback),
+    unreachable && offline ? "You’re offline" : unreachable ? "Server unavailable" : title,
+    unreachable && offline
+      ? "Connect to Wi-Fi or another network to sign in."
+      : unreachable
+        ? "A network is connected, but the Digital-Khata server could not be reached. Check the server address or try again."
+        : errorMessage(error, fallback),
   );
+};
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof api.ApiTransportError
     ? error.kind === "timeout"
       ? "The request timed out. Check your connection and try again."
-      : "Could not connect. Check your internet connection and try again."
+      : currentConnectivity() === "offline"
+        ? "No active network connection. Connect to Wi-Fi or another network and try again."
+        : "Could not reach the Digital-Khata server on the current network. Try again when the server is available."
     : error instanceof api.ApiError
       ? error.message
       : fallback;
@@ -153,16 +179,91 @@ const titles: Partial<Record<Screen, string>> = {
   settings: "Settings",
   reminders: "Reminder Settings",
   help: "Help & Support",
-  subscription: "Choose Your Plan",
+  subscription: "My Subscription",
+  subscriptionPayments: "Payment History",
   account: "Account",
   audit: "Activity History",
 };
+
+async function scheduleSubscriptionNotifications(
+  snapshot: SubscriptionSnapshot,
+  accountId: string,
+  requestPermission: boolean,
+) {
+  const Notifications = await loadNotifications();
+  if (Platform.OS === "android")
+    await Notifications.setNotificationChannelAsync("subscription", {
+      name: "Subscription reminders",
+      importance: Notifications.AndroidImportance.DEFAULT,
+    });
+  let permission = await Notifications.getPermissionsAsync();
+  if (!permission.granted && requestPermission)
+    permission = await Notifications.requestPermissionsAsync();
+  if (!permission.granted) return { granted: false, identifiers: [] as string[] };
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowAlert: true,
+      shouldPlaySound: false,
+      shouldSetBadge: false,
+      shouldShowBanner: true,
+      shouldShowList: true,
+    }),
+  });
+  const existing = await Notifications.getAllScheduledNotificationsAsync();
+  for (const request of existing) {
+    if (request.content.data?.kind === "subscription-expiry" && request.content.data?.accountId === accountId)
+      await Notifications.cancelScheduledNotificationAsync(request.identifier);
+  }
+  const expiry = snapshot.current.expiresAt ? new Date(snapshot.current.expiresAt) : null;
+  if (!expiry || !Number.isFinite(expiry.getTime())) return { granted: true, identifiers: [] as string[] };
+  if (
+    snapshot.current.scheduled &&
+    new Date(snapshot.current.scheduled.startsAt).getTime() <= expiry.getTime() &&
+    (!snapshot.current.scheduled.expiresAt ||
+      new Date(snapshot.current.scheduled.expiresAt).getTime() > expiry.getTime())
+  )
+    return { granted: true, identifiers: [] as string[] };
+  const created: string[] = [];
+  for (const days of [15, 7, 3, 1, 0]) {
+    const triggerDate = new Date(expiry);
+    triggerDate.setDate(triggerDate.getDate() - days);
+    triggerDate.setHours(9, 0, 0, 0);
+    if (triggerDate.getTime() <= Date.now()) continue;
+    const remaining = days === 0 ? "expires today" : `expires in ${days} ${days === 1 ? "day" : "days"}`;
+    const identifier = await Notifications.scheduleNotificationAsync({
+      content: {
+        title: "Digital-Khata subscription reminder",
+        body: `Your ${snapshot.current.plan.name} plan ${remaining}. Review renewal options in My Subscription.`,
+        data: { kind: "subscription-expiry", accountId, screen: "subscription" },
+      },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: triggerDate,
+        ...(Platform.OS === "android" ? { channelId: "subscription" } : {}),
+      },
+    });
+    created.push(identifier);
+  }
+  return { granted: true, identifiers: created };
+}
+
+async function cancelSubscriptionNotifications(accountId: string) {
+  try {
+    const Notifications = await loadNotifications();
+    const existing = await Notifications.getAllScheduledNotificationsAsync();
+    for (const request of existing)
+      if (request.content.data?.kind === "subscription-expiry" && request.content.data?.accountId === accountId)
+        await Notifications.cancelScheduledNotificationAsync(request.identifier);
+  } catch { /* Notification scheduling may not be available in this runtime. */ }
+}
+
 function AppContent() {
   const [data, setData] = useState<Data>(initialData);
   const dataRef = useRef(data);
   const persistedRef = useRef<Data | null>(null);
   const offlineAccountRef = useRef<string | null>(null);
   const localRevision = useRef(0);
+  const subscriptionAccountRef = useRef<string | null>(null);
   const promptingConflict = useRef<number | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -184,11 +285,18 @@ function AppContent() {
     failed: number;
     conflicts: number;
   } | null>(null);
+  const [connectivityStatus, setConnectivityStatus] = useState<ConnectivityStatus>("checking");
   const lock = useRef(false);
   const syncNotice = useRef<string | null>(null);
   const [faq, setFaq] = useState("");
   const [channel, setChannel] = useState("WhatsApp");
   const [plan, setPlan] = useState("Pro");
+  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<SubscriptionSnapshot | null>(null);
+  const subscriptionSnapshotRef = useRef<SubscriptionSnapshot | null>(null);
+  const [subscriptionLoading, setSubscriptionLoading] = useState(false);
+  const [subscriptionPageLoading, setSubscriptionPageLoading] = useState(false);
+  const [subscriptionLoadError, setSubscriptionLoadError] = useState("");
+  const [subscriptionDuration, setSubscriptionDuration] = useState("1");
   async function refreshSyncStatus(accountId = offlineAccountRef.current) {
     if (!accountId || !offlineStorageAvailable()) {
       setSyncStatus(null);
@@ -200,7 +308,77 @@ function AppContent() {
       setSyncStatus(null);
     }
   }
-  function showSyncFailure(problem: unknown) {
+  async function refreshSubscriptionInfo(
+    accountId = offlineAccountRef.current,
+    promptPermission = false,
+  ) {
+    if (!accountId) return;
+    if (route.screen === "subscription" || route.screen === "subscriptionPayments")
+      setSubscriptionLoading(true);
+    try {
+      if ((await checkConnectivity()) !== "online")
+        throw new api.ApiTransportError("network");
+      const snapshot = await api.getSubscriptionSnapshot();
+      snapshot.cachedAt = Date.now();
+      setSubscriptionSnapshot(snapshot);
+      setSubscriptionLoadError("");
+      if (offlineStorageAvailable())
+        await cacheSubscriptionSnapshot(accountId, snapshot).catch(() => false);
+      try {
+        const reminders = await scheduleSubscriptionNotifications(
+          snapshot,
+          accountId,
+          promptPermission,
+        );
+        snapshot.notificationsGranted = reminders.granted;
+        snapshot.localNotificationIds = reminders.identifiers;
+        if (offlineStorageAvailable())
+          await cacheSubscriptionSnapshot(accountId, snapshot).catch(() => false);
+      } catch {
+        snapshot.notificationsGranted = false;
+      }
+    } catch (problem) {
+      let cached: unknown = null;
+      try { cached = await readSubscriptionSnapshot(accountId); } catch { cached = null; }
+      if (cached && typeof cached === "object" && "current" in cached && "plans" in cached) {
+        const snapshot = cached as SubscriptionSnapshot;
+        setSubscriptionSnapshot(snapshot);
+        setSubscriptionLoadError("");
+        try {
+          const reminders = await scheduleSubscriptionNotifications(snapshot, accountId, false);
+          snapshot.notificationsGranted = reminders.granted;
+          snapshot.localNotificationIds = reminders.identifiers;
+        } catch { snapshot.notificationsGranted = false; }
+      } else {
+        setSubscriptionLoadError(errorMessage(problem, "Subscription information is unavailable."));
+      }
+    } finally {
+      if (route.screen === "subscription" || route.screen === "subscriptionPayments")
+        setSubscriptionLoading(false);
+    }
+  }
+  async function loadMoreSubscriptionPayments() {
+    const accountId = offlineAccountRef.current;
+    const cursor = subscriptionSnapshot?.paymentsNextCursor;
+    if (!accountId || !cursor || subscriptionPageLoading) return;
+    setSubscriptionPageLoading(true);
+    try {
+      const page = await api.getSubscriptionPayments(cursor);
+      const next = {
+        ...subscriptionSnapshot!,
+        payments: [
+          ...subscriptionSnapshot!.payments,
+          ...page.items.filter((item) => !subscriptionSnapshot!.payments.some((old) => old.id === item.id)),
+        ],
+        paymentsNextCursor: page.nextCursor,
+      };
+      setSubscriptionSnapshot(next);
+      if (offlineStorageAvailable()) await cacheSubscriptionSnapshot(accountId, next);
+    } catch (problem) {
+      Alert.alert("Unable to load payment history", errorMessage(problem, "Please try again when you are online."));
+    } finally { setSubscriptionPageLoading(false); }
+  }
+  async function showSyncFailure(problem: unknown) {
     const key =
       problem instanceof api.ApiError &&
       [400, 403, 404, 409, 413, 415, 422].includes(problem.status)
@@ -211,17 +389,26 @@ function AppContent() {
               (problem.status === 429 || problem.status >= 500)
             ? "server"
             : "other";
-    if (syncNotice.current === key) return;
-    syncNotice.current = key;
+    const networkStatus = key === "network" ? await checkConnectivity(true) : null;
+    const noticeKey = key === "network"
+      ? networkStatus === "offline" ? "network-offline" : "network-server"
+      : key;
+    if (syncNotice.current === noticeKey) return;
+    syncNotice.current = noticeKey;
     if (key === "permanent")
       Alert.alert(
         "Some changes need attention",
         "Your changes remain saved on this phone and will not retry automatically. Open Settings to review the sync status and retry when appropriate.",
       );
-    else if (key === "network")
+    else if (key === "network" && networkStatus === "offline")
       Alert.alert(
         "You’re offline",
-        "Your saved changes remain on this phone and will sync when the connection returns.",
+        "Your saved changes remain on this phone and will sync when Wi-Fi or another network is available.",
+      );
+    else if (key === "network")
+      Alert.alert(
+        "Server unavailable",
+        "A network is connected, but Digital-Khata could not be reached. Your saved changes remain on this phone and will sync when the server is available.",
       );
     else if (key === "timeout")
       Alert.alert(
@@ -243,8 +430,8 @@ function AppContent() {
     let live = true;
     (async () => {
       try {
-        const connection = await NetInfo.fetch();
-        if (connection.isConnected === false || connection.isInternetReachable === false) {
+        const connectivity = await checkConnectivity();
+        if (connectivity !== "online") {
           const offlineSession = await readOfflineSession();
           const cached = offlineSession
             ? await readCachedAccount(offlineSession.accountId)
@@ -257,7 +444,12 @@ function AppContent() {
             setRoute({ screen: cached.shop.name ? "home" : "setup" });
           } else if (live) {
             setRoute({ screen: "login" });
-            Alert.alert("You’re offline", "Connect to the internet to sign in.");
+            Alert.alert(
+              connectivity === "offline" ? "You’re offline" : "Server unavailable",
+              connectivity === "offline"
+                ? "Connect to Wi-Fi or another network to sign in."
+                : "A network is connected, but the Digital-Khata server could not be reached.",
+            );
           }
           return;
         }
@@ -318,10 +510,15 @@ function AppContent() {
             persistedRef.current = cached;
             setRoute({ screen: cached.shop.name ? "home" : "setup" });
           } else {
-            const network = await NetInfo.fetch();
-            if (network.isConnected === false || network.isInternetReachable === false) {
+            const connectivity = await checkConnectivity();
+            if (connectivity !== "online") {
               setRoute({ screen: "login" });
-              Alert.alert("You’re offline", "Connect to the internet to sign in.");
+              Alert.alert(
+                connectivity === "offline" ? "You’re offline" : "Server unavailable",
+                connectivity === "offline"
+                  ? "Connect to Wi-Fi or another network to sign in."
+                  : "A network is connected, but the Digital-Khata server could not be reached.",
+              );
             }
           }
         }
@@ -348,8 +545,10 @@ function AppContent() {
             setRoute({ screen: cached.shop.name ? "home" : "setup" });
           } else {
             setRoute({ screen: "login" });
-            if (isOfflineError(error))
-              Alert.alert("You’re offline", "Connect to the internet to sign in.");
+            if (isOfflineError(error) && currentConnectivity() === "offline")
+              Alert.alert("You’re offline", "Connect to Wi-Fi or another network to sign in.");
+            else if (isOfflineError(error))
+              Alert.alert("Server unavailable", "A network is connected, but the Digital-Khata server could not be reached.");
             else
               Alert.alert(
                 "Could not connect to your khata",
@@ -376,11 +575,11 @@ function AppContent() {
   }, []);
   useEffect(() => {
     if (!data.signedIn) return;
-    if (Constants.appOwnership === "expo") return;
+    if (isExpoGo) return;
     let live = true;
     (async () => {
       try {
-        const Notifications = await import("expo-notifications");
+        const Notifications = await loadNotifications();
         if (Platform.OS === "android") await Notifications.setNotificationChannelAsync("default", { name: "Digital Khata", importance: Notifications.AndroidImportance.DEFAULT });
         if (!Device.isDevice || !process.env.EXPO_PUBLIC_EAS_PROJECT_ID) return;
         const current = await Notifications.getPermissionsAsync();
@@ -398,6 +597,7 @@ function AppContent() {
     })();
     return () => { live = false; };
   }, [data.signedIn]);
+  useEffect(() => observeConnectivity(setConnectivityStatus), []);
   useEffect(() => {
     const id = offlineAccountRef.current;
     if (!data.signedIn || !id || !offlineStorageAvailable()) return;
@@ -405,6 +605,7 @@ function AppContent() {
     let online = false;
     const runSync = () => {
       const revision = localRevision.current;
+      void refreshSubscriptionInfo(id, false);
       void synchronizeAccount(id)
         .then((remote) => {
           syncNotice.current = null;
@@ -438,22 +639,13 @@ function AppContent() {
         })
         .finally(() => { if (live) void promptNextConflict(id); });
     };
-    const unsubscribe = NetInfo.addEventListener((state) => {
-      const connected =
-        state.isConnected !== false && state.isInternetReachable !== false;
-      if (connected && !online) runSync();
-      online = connected;
-    });
-    const appState = AppState.addEventListener("change", (state) => {
-      if (state === "active") runSync();
-    });
-    void hasPendingChanges(id).then((pending) => {
-      if (live && pending) runSync();
+    const unsubscribe = observeConnectivity((state) => {
+      if (state === "online" && !online) runSync();
+      online = state === "online";
     });
     return () => {
       live = false;
       unsubscribe();
-      appState.remove();
     };
   }, [data.signedIn]);
   useEffect(() => {
@@ -463,6 +655,55 @@ function AppContent() {
   useEffect(() => {
     void refreshSyncStatus();
   }, [data.signedIn, data.shop.phone, route.screen]);
+  useEffect(() => {
+    const id = offlineAccountRef.current;
+    if (!data.signedIn || !id || !["subscription", "subscriptionPayments"].includes(route.screen)) return;
+    void refreshSubscriptionInfo(id, route.screen === "subscription");
+  }, [data.signedIn, data.shop.phone, route.screen]);
+  useEffect(() => {
+    if (data.signedIn) return;
+    subscriptionAccountRef.current = null;
+    setSubscriptionSnapshot(null);
+    setSubscriptionLoadError("");
+  }, [data.signedIn]);
+  useEffect(() => {
+    subscriptionSnapshotRef.current = subscriptionSnapshot;
+  }, [subscriptionSnapshot]);
+  useEffect(() => {
+    const id = offlineAccountRef.current;
+    if (!data.signedIn || !id) return;
+    if (subscriptionAccountRef.current !== id) {
+      subscriptionAccountRef.current = id;
+      setSubscriptionSnapshot(null);
+      void refreshSubscriptionInfo(id, false);
+    }
+  }, [data.signedIn, data.shop.phone]);
+  useEffect(() => {
+    if (!data.signedIn) return;
+    let live = true;
+    let subscription: { remove: () => void } | undefined;
+    (async () => {
+      try {
+        const Notifications = await loadNotifications();
+        const openSubscription = (response: any) => {
+          const target = response?.notification?.request?.content?.data;
+          if (
+            target?.screen === "subscription" &&
+            (target?.accountId === offlineAccountRef.current ||
+              target?.shopId === subscriptionSnapshotRef.current?.current?.shopId)
+          )
+            go("subscription");
+        };
+        subscription = Notifications.addNotificationResponseReceivedListener(openSubscription);
+        const last = await Notifications.getLastNotificationResponseAsync();
+        if (live && last) openSubscription(last);
+      } catch { /* Notifications may be unavailable in the current runtime. */ }
+    })();
+    return () => {
+      live = false;
+      subscription?.remove();
+    };
+  }, [data.signedIn]);
   useEffect(() => {
     if (route.screen !== "notifications" || !data.signedIn) return;
     api
@@ -508,11 +749,12 @@ function AppContent() {
       try {
         const persisted = persistedRef.current;
         if (persisted?.signedIn && !next.signedIn) {
-          const network = await NetInfo.fetch();
-          if (network.isConnected !== false && network.isInternetReachable !== false)
+          const accountId = offlineAccountRef.current;
+          if ((await checkConnectivity(true)) === "online")
             await api.logout().catch(() => {});
           else await api.clearTokens();
           await clearOfflineSession();
+          if (accountId) await cancelSubscriptionNotifications(accountId);
           offlineAccountRef.current = null;
           persistedRef.current = null;
         } else if (persisted?.signedIn) {
@@ -520,9 +762,8 @@ function AppContent() {
           if (accountId && offlineStorageAvailable()) {
             const operationId = await saveLocalChange(accountId, previous, next);
             if (operationId === null) {
-              const network = await NetInfo.fetch();
-              if (network.isConnected === false || network.isInternetReachable === false)
-                throw new Error("Offline storage is unavailable in this app build.");
+              if ((await checkConnectivity(true)) !== "online")
+                throw new Error("OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE");
               await api.syncChange(persisted, next);
               persistedRef.current = next;
               setData(next);
@@ -534,17 +775,21 @@ function AppContent() {
             persistedRef.current = next;
             setData(next);
             void synchronizeAccount(accountId, false)
-              .then((remote) => {
+              .then(async (remote) => {
                 syncNotice.current = null;
                 void refreshSyncStatus(accountId);
+                let synchronized = remote;
+                if (!synchronized) {
+                  try { synchronized = await readCachedAccount(accountId); } catch { synchronized = null; }
+                }
                 if (
-                  remote &&
+                  synchronized &&
                   offlineAccountRef.current === accountId &&
                   localRevision.current === revision
                 ) {
-                  dataRef.current = remote;
-                  persistedRef.current = remote;
-                  setData(remote);
+                  dataRef.current = synchronized;
+                  persistedRef.current = synchronized;
+                  setData(synchronized);
                 }
               })
               .catch((error) => {
@@ -563,7 +808,12 @@ function AppContent() {
           dataRef.current = previous;
           setData(previous);
         }
-        Alert.alert("Unable to save", errorMessage(error, "Please check your connection and try again."));
+        if (error instanceof Error && error.message === "OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE")
+          Alert.alert("Offline saving unavailable", "Offline changes require the installed Digital-Khata app with encrypted storage. Open the app in an installed development or release build; Expo Go cannot use this encrypted database.");
+        else if (error instanceof Error && /Encrypted local storage requires the installed app build/.test(error.message))
+          Alert.alert("Secure storage unavailable", "No changes were saved. Install the supported Digital-Khata build with encrypted local storage and try again.");
+        else
+          Alert.alert("Unable to save", errorMessage(error, "No changes were saved. Please try again."));
         return false;
       }
     });
@@ -584,11 +834,13 @@ function AppContent() {
   async function retryFailedSync() {
     const accountId = offlineAccountRef.current;
     if (!accountId || lock.current) return;
-    const connection = await NetInfo.fetch();
-    if (connection.isConnected === false || connection.isInternetReachable === false) {
+    const connection = await checkConnectivity(true);
+    if (connection !== "online") {
       Alert.alert(
-        "You’re offline",
-        "Connect to the internet before retrying synchronization.",
+        connection === "offline" ? "You’re offline" : "Server unavailable",
+        connection === "offline"
+          ? "Connect to Wi-Fi or another network before retrying synchronization."
+          : "The network is connected, but the Digital-Khata server is unavailable. Your saved changes remain on this phone.",
       );
       return;
     }
@@ -621,6 +873,143 @@ function AppContent() {
   }
   async function promptNextConflict(accountId: string) {
     if (promptingConflict.current !== null || offlineAccountRef.current !== accountId) return;
+    let customerConflict: PendingCustomerConflict | undefined;
+    try { [customerConflict] = await readPendingCustomerConflicts(accountId); } catch { return; }
+    if (customerConflict) {
+      promptingConflict.current = customerConflict.queueId;
+      const performCustomer = async (choice: "keep_local" | "keep_server") => {
+        try {
+          const selected = await chooseCustomerConflictResolution(customerConflict.queueId, choice);
+          const result = await api.resolveCustomerConflict(selected, choice);
+          await completeCustomerConflict(accountId, customerConflict, result.customer, result.serverVersion, result.resolutionVersion, result.audit);
+          promptingConflict.current = null;
+          localRevision.current += 1;
+          const cached = await readCachedAccount(accountId);
+          if (cached && offlineAccountRef.current === accountId) {
+            dataRef.current = cached;
+            persistedRef.current = cached;
+            setData(cached);
+          }
+          void synchronizeAccount(accountId).then((remote) => {
+            if (remote && offlineAccountRef.current === accountId) {
+              dataRef.current = remote;
+              persistedRef.current = remote;
+              setData(remote);
+            }
+          }).catch(() => {});
+          setTimeout(() => void promptNextConflict(accountId), 0);
+        } catch (error) {
+          if (error instanceof api.ApiError && error.payload?.code === "CUSTOMER_LIMIT_REACHED") {
+            promptingConflict.current = null;
+            Alert.alert("Customer limit reached", "The server’s current plan does not allow this customer to be restored. The customer conflict remains saved on this phone. Upgrade the plan or choose Keep server when connected.");
+            return;
+          }
+          if (error instanceof api.ApiError && error.status === 409 && error.payload?.code === "CUSTOMER_CONFLICT_RESOLVED" && error.payload?.audit) {
+            await completeCustomerConflict(accountId, customerConflict, error.payload.current ?? null, error.payload.serverVersion || error.payload.current?.serverVersion || customerConflict.expectedVersion, error.payload.resolutionVersion || error.payload.current?.resolutionVersion || customerConflict.expectedResolutionVersion, error.payload.audit);
+            promptingConflict.current = null;
+            Alert.alert("Customer conflict resolved", "Another device already resolved this customer change. The server version has been saved on this phone.");
+            const cached = await readCachedAccount(accountId);
+            if (cached && offlineAccountRef.current === accountId) {
+              dataRef.current = cached;
+              persistedRef.current = cached;
+              setData(cached);
+            }
+            setTimeout(() => void promptNextConflict(accountId), 0);
+            return;
+          }
+          if (error instanceof api.ApiError && error.status === 409) {
+            await refreshCustomerConflict(customerConflict.queueId, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
+            promptingConflict.current = null;
+            Alert.alert("Customer changed again", "The server has a newer customer record. Review the updated conflict before choosing.");
+            setTimeout(() => void promptNextConflict(accountId), 250);
+            return;
+          }
+          promptingConflict.current = null;
+          Alert.alert("Unable to resolve customer conflict", "Both customer versions remain saved on this phone. Reconnect and try again.");
+        }
+      };
+      const online = (await checkConnectivity()) === "online";
+      const buttons = online
+        ? customerConflict.chosen
+          ? [{ text: customerConflict.chosen === "keep_local" ? "Retry phone choice" : "Retry server choice", onPress: () => void performCustomer(customerConflict.chosen!) }]
+          : [
+              { text: "Keep phone", onPress: () => void performCustomer("keep_local") },
+              { text: "Keep server", onPress: () => void performCustomer("keep_server") },
+            ]
+        : [];
+      Alert.alert(
+        "Customer Conflict Detected",
+        `${customerConflict.local.name}\n\nThis customer was changed on another device while this phone was offline. The phone and server versions are preserved.`,
+        [...buttons, { text: "Resolve Later", style: "cancel" as const, onPress: () => { promptingConflict.current = null; } }],
+      );
+      return;
+    }
+    let settingsConflict: PendingSettingsConflict | undefined;
+    try { [settingsConflict] = await readPendingSettingsConflicts(accountId); } catch { return; }
+    if (settingsConflict) {
+      promptingConflict.current = settingsConflict.queueId;
+      const serverSettings = (value: any) => ({
+        shop: {
+          name: value.name, owner: value.owner, address: value.address,
+          phone: String(value.phone || "").replace(/^\+91/, ""), whatsapp: value.whatsapp,
+          serverVersion: value.serverVersion,
+          resolutionVersion: value.resolutionVersion,
+        },
+        language: value.language,
+        defaultMethod: value.defaultMethod,
+        reminders: value.reminders,
+      });
+      const finish = async (settings: typeof settingsConflict.server, audit: Data["audit"][number]) => {
+        await completeSettingsConflict(accountId, settingsConflict, settings, audit);
+        promptingConflict.current = null;
+        localRevision.current += 1;
+        const cached = await readCachedAccount(accountId);
+        if (cached && offlineAccountRef.current === accountId) {
+          dataRef.current = cached;
+          persistedRef.current = cached;
+          setData(cached);
+        }
+        void synchronizeAccount(accountId).catch(() => {});
+        setTimeout(() => void promptNextConflict(accountId), 0);
+      };
+      const performSettings = async (choice: "keep_local" | "keep_server") => {
+        try {
+          const selected = await chooseSettingsConflictResolution(settingsConflict.queueId, choice);
+          const result = await api.resolveSettingsConflict(selected, choice);
+          await finish(result.settings, result.audit);
+        } catch (error) {
+          if (error instanceof api.ApiError && error.status === 409 && error.payload?.code === "SHOP_CONFLICT_RESOLVED" && error.payload?.audit) {
+            await finish(serverSettings(error.payload.current), error.payload.audit);
+            Alert.alert("Settings conflict resolved", "Another device already resolved these settings. The server version is now saved on this phone.");
+            return;
+          }
+          if (error instanceof api.ApiError && error.status === 409 && error.payload?.current) {
+            await refreshSettingsConflict(settingsConflict.queueId, error.payload.current);
+            promptingConflict.current = null;
+            Alert.alert("Settings changed again", "The server has newer settings. Review the updated conflict before choosing.");
+            setTimeout(() => void promptNextConflict(accountId), 250);
+            return;
+          }
+          promptingConflict.current = null;
+          Alert.alert("Unable to resolve settings conflict", "Both versions remain saved on this phone. Reconnect and try again.");
+        }
+      };
+      const online = (await checkConnectivity()) === "online";
+      const buttons = online
+        ? settingsConflict.chosen
+          ? [{ text: settingsConflict.chosen === "keep_local" ? "Retry phone choice" : "Retry server choice", onPress: () => void performSettings(settingsConflict.chosen!) }]
+          : [
+              { text: "Keep phone", onPress: () => void performSettings("keep_local") },
+              { text: "Keep server", onPress: () => void performSettings("keep_server") },
+            ]
+        : [];
+      Alert.alert(
+        "Shop Settings Conflict",
+        "These settings changed on another device while this phone was offline. Both versions are preserved.",
+        [...buttons, { text: "Resolve Later", style: "cancel" as const, onPress: () => { promptingConflict.current = null; } }],
+      );
+      return;
+    }
     let conflict: PendingConflict | undefined;
     try { [conflict] = await readPendingConflicts(accountId); } catch { return; }
     if (!conflict || promptingConflict.current !== null) return;
@@ -646,7 +1035,7 @@ function AppContent() {
       try {
         const selectedConflict = await chooseConflictResolution(conflict.queueId, choice);
         const result = await api.resolveFinancialConflict(selectedConflict, choice);
-        await completeConflict(accountId, conflict, result.entry, result.serverVersion, result.audit);
+        await completeConflict(accountId, conflict, result.entry, result.serverVersion, result.resolutionVersion, result.audit);
         promptingConflict.current = null;
         localRevision.current += 1;
         const cached = await readCachedAccount(accountId);
@@ -665,7 +1054,7 @@ function AppContent() {
         setTimeout(() => void promptNextConflict(accountId), 0);
       } catch (error) {
         if (error instanceof api.ApiError && error.status === 409) {
-          await refreshConflict(conflict.queueId, error.payload?.current ?? null, error.payload?.serverVersion);
+          await refreshConflict(conflict.queueId, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
           promptingConflict.current = null;
           Alert.alert("Transaction changed again", "The server has a newer value. Review the updated conflict before choosing.");
           setTimeout(() => void promptNextConflict(accountId), 250);
@@ -675,8 +1064,7 @@ function AppContent() {
         Alert.alert("Unable to resolve conflict", "Your phone and server values are still saved. Reconnect and try again.");
       }
     };
-    const connection = await NetInfo.fetch();
-    const online = connection.isConnected !== false && connection.isInternetReachable !== false;
+    const online = (await checkConnectivity()) === "online";
     const buttons = online
       ? conflict.chosen
         ? [{ text: conflict.chosen === "keep_local" ? "Retry phone choice" : "Retry server choice", onPress: () => void perform(conflict.chosen!) }]
@@ -741,7 +1129,13 @@ function AppContent() {
         due: e?.due || "",
       });
     }
-    if (screen === "setup") setForm({ ...data.shop });
+    if (screen === "setup") setForm({
+      name: data.shop.name,
+      owner: data.shop.owner,
+      address: data.shop.address,
+      phone: data.shop.phone,
+      whatsapp: data.shop.whatsapp,
+    });
     if (screen === "share" && id) setForm({ message: statementText(id) });
     if (screen === "statement" && id) {
       const createdAt = data.customers.find((c) => c.id === id)?.createdAt;
@@ -939,6 +1333,7 @@ function AppContent() {
       );
     const c: Customer = {
       id: route.id || uid(),
+      serverVersion: data.customers.find((x) => x.id === route.id)?.serverVersion,
       createdAt:
         data.customers.find((x) => x.id === route.id)?.createdAt ||
         new Date().toISOString(),
@@ -949,6 +1344,22 @@ function AppContent() {
       limit: Math.round(limit * 100) / 100,
       reminder: form.reminder === "true",
     };
+    const entitlement = subscriptionSnapshot?.current?.plan;
+    const localCustomerLimit = entitlement?.customerLimit ?? 50;
+    const hasUnlimitedCustomers = entitlement?.unlimitedCustomers ?? false;
+    if (
+      !route.id &&
+      !hasUnlimitedCustomers &&
+      data.customers.length >= localCustomerLimit
+    )
+      return Alert.alert(
+        "Customer limit reached",
+        `Your ${entitlement?.name || "Free"} plan allows ${localCustomerLimit} customers. Upgrade your plan to add another customer.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "View plans", onPress: () => go("subscription") },
+        ],
+      );
     save(
       {
         ...data,
@@ -1000,6 +1411,7 @@ function AppContent() {
       );
     const e: Entry = {
       id: old?.id || uid(),
+      serverVersion: old?.serverVersion,
       customerId: c.id,
       type,
       amount: Math.round(amount * 100) / 100,
@@ -1126,6 +1538,7 @@ function AppContent() {
       const offlineAccountId = offlineAccountRef.current;
       await api.deleteAccount();
       if (offlineAccountId) await clearOfflineAccount(offlineAccountId);
+      if (offlineAccountId) await cancelSubscriptionNotifications(offlineAccountId);
       offlineAccountRef.current = null;
       dataRef.current = initialData;
       setData(initialData);
@@ -1294,9 +1707,9 @@ function AppContent() {
                   "Invalid mobile number",
                   "Enter a valid 10-digit Indian mobile number.",
                 );
-              const network = await NetInfo.fetch();
-              if (network.isConnected === false || network.isInternetReachable === false)
-                return Alert.alert("You’re offline", "Connect to the internet to sign in.");
+              const network = await checkConnectivity(true);
+              if (network !== "online")
+                return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setBusy(true);
               try {
                 const result = await api.startOtp(`+91${phone}`);
@@ -1333,9 +1746,9 @@ function AppContent() {
           <Pressable
             disabled={seconds > 0}
             onPress={async () => {
-              const network = await NetInfo.fetch();
-              if (network.isConnected === false || network.isInternetReachable === false)
-                return Alert.alert("You’re offline", "Connect to the internet to sign in.");
+              const network = await checkConnectivity(true);
+              if (network !== "online")
+                return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setSeconds(30);
               try {
                 const result = await api.startOtp(`+91${phone}`);
@@ -1354,9 +1767,9 @@ function AppContent() {
             disabled={busy}
             onPress={async () => {
               if (!/^\d{4,8}$/.test(otp)) return Alert.alert("Invalid code", "Enter the verification code sent to your phone.");
-              const network = await NetInfo.fetch();
-              if (network.isConnected === false || network.isInternetReachable === false)
-                return Alert.alert("You’re offline", "Connect to the internet to sign in.");
+              const network = await checkConnectivity(true);
+              if (network !== "online")
+                return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setBusy(true);
               try {
                 let remote = api.normalizeData(await api.verifyOtp(`+91${phone}`, otp));
@@ -1376,7 +1789,7 @@ function AppContent() {
                 setData(remote);
                 persistedRef.current = remote;
                 if (remote.shop.name) go("home", undefined, true);
-                else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ ...remote.shop, phone }); }
+                else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ name: remote.shop.name, owner: remote.shop.owner, address: remote.shop.address, phone, whatsapp: remote.shop.whatsapp }); }
               } catch (error) { showOtpError("Could not verify OTP", error, "Check the code and try again."); }
               finally { setBusy(false); }
             }}
@@ -2168,6 +2581,21 @@ function AppContent() {
     case "settings":
       content = (
         <>
+          <Title>NETWORK</Title>
+          <Hint>
+            {connectivityStatus === "online"
+              ? "Online — Digital-Khata server is reachable."
+              : connectivityStatus === "offline"
+                ? "Offline — no active network connection."
+                : connectivityStatus === "server_unavailable"
+                  ? "Server unavailable — network connected, but Digital-Khata cannot be reached."
+                  : "Checking network and Digital-Khata server…"}
+          </Hint>
+          {connectivityStatus !== "checking" && (
+            <Hint>
+              {`Network: ${currentConnectivityDetails().networkType}; internet: ${currentConnectivityDetails().internetReachable === null ? "unknown" : currentConnectivityDetails().internetReachable ? "available" : "unavailable"}; API: ${currentConnectivityDetails().backendReachable ? "reachable" : currentConnectivityDetails().backendReachable === false ? "unreachable" : "not checked"}.`}
+            </Hint>
+          )}
           <Title>SYNC STATUS</Title>
           {!syncStatus ? (
             <Hint>Sync status is unavailable in this app build.</Hint>
@@ -2364,49 +2792,160 @@ function AppContent() {
       );
       break;
     }
-    case "subscription":
+    case "subscription": {
+      const current = subscriptionSnapshot?.current;
+      const plans = subscriptionSnapshot?.plans || [];
+      const selected = plans.find((item) => item.name === plan || item.code === plan.toLowerCase());
+      const duration = Number(subscriptionDuration);
+      const price = selected?.durations.find((item) => item.months === duration);
+      const asRupees = (minor?: number | null) => money((minor || 0) / 100);
+      const remainingText = current?.expiresAt
+        ? current.remainingMilliseconds !== null && current.remainingMilliseconds < 86400000
+          ? `${Math.max(0, Math.floor(current.remainingMilliseconds / 3600000))} hours ${Math.max(0, Math.floor((current.remainingMilliseconds % 3600000) / 60000))} minutes remaining`
+          : `${current.remainingDays ?? 0} days remaining`
+        : "Never expires";
       content = (
         <>
-          {[
-            { name: "Free", price: "₹0", detail: "50 customers" },
-            {
-              name: "Pro",
-              price: "₹199/mo",
-              detail: "500 customers • Popular",
-            },
-            {
-              name: "Business",
-              price: "₹499/mo",
-              detail: "Unlimited customers",
-            },
-          ].map((p) => (
-            <Pressable key={p.name} onPress={() => setPlan(p.name)}>
-              <Card
-                style={{
-                  borderColor: plan === p.name ? colors.green : colors.border,
-                  borderWidth: plan === p.name ? 2 : 1,
-                }}
-              >
+          {current && (
+            <Card>
+              <Title>Current Subscription</Title>
+              <Row title="Plan" value={current.plan.name} />
+              <Row title="Status" value="Active" />
+              <Row title="Start date" value={current.startsAt ? new Date(current.startsAt).toLocaleDateString("en-IN") : "—"} />
+              <Row title="Expiry" value={current.expiresAt ? new Date(current.expiresAt).toLocaleDateString("en-IN") : "Never"} />
+              <Row title="Time remaining" value={remainingText} />
+              <Row title="Customer limit" value={current.customerUsage.unlimited ? "Unlimited" : String(current.customerUsage.limit ?? 0)} />
+              <Row title="Customers used" value={String(current.customerUsage.used)} />
+              {!current.customerUsage.unlimited && <Row title="Customer capacity left" value={String(current.customerUsage.remaining ?? 0)} />}
+              {current.durationMonths > 0 && <Row title="Duration" value={`${current.durationMonths} months`} />}
+              {current.amountPaidMinor !== null && <Row title="Amount paid" value={asRupees(current.amountPaidMinor)} />}
+              {current.scheduled && (
+                <>
+                  <Title>Next Scheduled Plan</Title>
+                  <Row title="Plan" value={current.scheduled.plan.name} />
+                  <Row title="Starts" value={new Date(current.scheduled.startsAt).toLocaleDateString("en-IN")} />
+                  <Row title="Activation" value={`Starts in ${Math.max(0, Math.ceil((new Date(current.scheduled.startsAt).getTime() - Date.now()) / 86400000))} days`} />
+                  <Row title="Duration" value={`${current.scheduled.durationMonths} months`} />
+                </>
+              )}
+              {current.isFallback && <Hint>Free plan • ₹0 • 50 customers • Expiry: Never</Hint>}
+            </Card>
+          )}
+          {(subscriptionSnapshot?.history || []).length > 0 && (
+            <>
+              <Title>Subscription History</Title>
+              {subscriptionSnapshot!.history.map((item) => {
+                const timeRemaining = item.remainingMilliseconds;
+                const remaining = timeRemaining !== null && timeRemaining < 86400000
+                  ? `${Math.floor(timeRemaining / 3600000)} hours ${Math.floor((timeRemaining % 3600000) / 60000)} minutes remaining`
+                  : `${item.remainingDays ?? 0} days remaining`;
+                const startsIn = item.startsInDays !== null
+                  ? `Starts in ${item.startsInDays} days`
+                  : null;
+                return (
+                  <Card key={item.id}>
+                    <Title>{item.plan?.name || item.plan?.code || "Subscription"}</Title>
+                    <Row title="Status" value={item.status} />
+                    {item.startsAt && <Row title="Starts" value={new Date(item.startsAt).toLocaleDateString("en-IN")} />}
+                    {item.expiresAt && <Row title="Expires" value={new Date(item.expiresAt).toLocaleDateString("en-IN")} />}
+                    {item.status === "active" && item.remainingMilliseconds !== null && <Row title="Time remaining" value={remaining} />}
+                    {startsIn && <Row title="Activation" value={startsIn} />}
+                    <Row title="Duration" value={`${item.durationMonths} months`} />
+                    {item.amountPaidMinor !== null && <Row title="Amount paid" value={asRupees(item.amountPaidMinor)} />}
+                  </Card>
+                );
+              })}
+            </>
+          )}
+          {subscriptionLoading && <ActivityIndicator color={colors.green} />}
+          {!subscriptionSnapshot && !subscriptionLoading && (
+            <Card>
+              <Hint>{subscriptionLoadError || "Subscription information is loading."}</Hint>
+              <Button title="Retry" secondary onPress={() => void refreshSubscriptionInfo()} />
+            </Card>
+          )}
+          <Title>Choose Your Plan</Title>
+          {plans.map((item) => (
+            <Pressable key={item.code} onPress={() => { setPlan(item.name); setSubscriptionDuration("1"); }}>
+              <Card style={{ borderColor: plan === item.name || plan.toLowerCase() === item.code ? colors.green : colors.border, borderWidth: plan === item.name || plan.toLowerCase() === item.code ? 2 : 1 }}>
                 <View style={s.split}>
-                  <Text style={[s.heading, { fontSize: 20 }]}>{p.name}</Text>
-                  <Text style={s.stat}>{p.price}</Text>
+                  <Text style={[s.heading, { fontSize: 20 }]}>{item.name}</Text>
+                  <Text style={s.stat}>{asRupees(item.monthlyPriceMinor)}{item.monthlyPriceMinor ? "/mo" : ""}</Text>
                 </View>
-                <Hint>{p.detail}</Hint>
+                <Hint>{item.unlimitedCustomers ? "Unlimited customers" : `${item.customerLimit} customers`}</Hint>
               </Card>
             </Pressable>
           ))}
+          {selected && selected.code !== "free" && (
+            <Card>
+              <Title>Subscription duration</Title>
+              <Chips items={selected.durations.map((item) => `${item.months} months`)} value={`${duration} months`} onChange={(value) => setSubscriptionDuration(value.split(" ")[0])} />
+              {price && (
+                <>
+                  {price.discountPercent > 0 && <Hint>Save {price.discountPercent}% for {price.months} months</Hint>}
+                  <Row title="Original amount" value={asRupees(price.originalAmountMinor)} />
+                  <Row title={`Discount (${price.discountPercent}%)`} value={`−${asRupees(price.discountAmountMinor)}`} />
+                  <Row title={`Tax (${(price.taxRateBps / 100).toFixed(2)}%)${price.taxInclusive ? " included" : ""}`} value={asRupees(price.taxAmountMinor)} />
+                  <Row title="Final payable" value={asRupees(price.finalAmountMinor)} />
+                </>
+              )}
+            </Card>
+          )}
           <Button
-            title="Upgrade"
-            onPress={() =>
-              Alert.alert(
-                "Plan preview",
-                `${plan} is selected. Billing is not connected and no payment will be taken.`,
-              )
-            }
+            title="Payment checkout unavailable in this build"
+            disabled
+            onPress={() => Alert.alert("Payments unavailable", "Checkout is disabled until Android billing eligibility and a supported native payment integration are confirmed.")}
           />
+          <Button title="Payment History" secondary onPress={() => go("subscriptionPayments")} />
           <Hint>
-            Plan designs from the PDF. Billing and customer limit enforcement are not configured.
+            {subscriptionSnapshot?.cachedAt
+              ? `Last synchronized ${new Date(subscriptionSnapshot.cachedAt).toLocaleString("en-IN")}. ${subscriptionSnapshot.notificationsGranted === false ? "Enable notifications to receive local renewal reminders." : "Renewal reminders are scheduled when permission is available."} Checkout remains disabled until Android billing eligibility and a supported native payment integration are confirmed.`
+              : "Subscription information is server-verified and cached securely for offline viewing. Payment confirmation requires an internet connection. Checkout is disabled until Android billing eligibility and a supported native payment integration are confirmed."}
           </Hint>
+          {subscriptionLoadError ? <Hint>{subscriptionLoadError}</Hint> : null}
+        </>
+      );
+      break;
+    }
+    case "subscriptionPayments":
+      content = (
+        <>
+          <Hint>
+            {subscriptionSnapshot?.cachedAt
+              ? `Cached history • Last synchronized ${new Date(subscriptionSnapshot.cachedAt).toLocaleString("en-IN")}`
+              : "Payment history is unavailable offline until it has been synchronized."}
+          </Hint>
+          {(subscriptionSnapshot?.payments || []).length === 0 && !subscriptionLoading ? (
+            <Empty title="No payments yet" description="Verified subscription payments will appear here." />
+          ) : null}
+          {(subscriptionSnapshot?.payments || []).map((payment: any) => (
+            <Card key={payment.id}>
+              <Title>{String(payment.planCode || "").toUpperCase()} • {payment.durationMonths} months</Title>
+              <Row title="Original amount" value={money((payment.pricing?.originalAmountMinor || 0) / 100)} />
+              <Row title="Discount" value={money((payment.pricing?.discountAmountMinor || 0) / 100)} />
+              <Row title="Tax" value={money((payment.pricing?.taxAmountMinor || 0) / 100)} />
+              <Row title="Amount paid" value={money((payment.amountMinor || 0) / 100)} />
+              <Row title="Date" value={new Date(payment.createdAt).toLocaleString("en-IN")} />
+              <Row title="Status" value={payment.status} />
+              {payment.gatewayPaymentId && <Row title="Payment reference" value={payment.gatewayPaymentId} />}
+              {payment.gatewayOrderId && <Row title="Order reference" value={payment.gatewayOrderId} />}
+              {payment.method && <Row title="Payment method" value={payment.method} />}
+              {payment.currency && <Row title="Currency" value={payment.currency} />}
+              {payment.refunded && <Row title="Refund status" value={`${payment.status} • ${money((payment.refundedAmountMinor || 0) / 100)} refunded`} />}
+              <Hint>Tax invoice availability depends on the merchant's configured invoicing service.</Hint>
+            </Card>
+          ))}
+          {subscriptionSnapshot?.paymentsNextCursor ? (
+            <Button
+              title={subscriptionPageLoading ? "Loading…" : "Load more payments"}
+              secondary
+              disabled={subscriptionPageLoading}
+              onPress={() => void loadMoreSubscriptionPayments()}
+            />
+          ) : null}
+          {subscriptionLoadError ? <Hint>{subscriptionLoadError}</Hint> : null}
+          {subscriptionLoading && <ActivityIndicator color={colors.green} />}
+          <Button title="Refresh" secondary onPress={() => void refreshSubscriptionInfo()} />
         </>
       );
       break;

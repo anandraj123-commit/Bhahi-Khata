@@ -110,7 +110,7 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
   return { status: 201, response };
 }
 
-export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion, audit }) {
+export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion, baseResolutionVersion, audit }) {
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -121,16 +121,18 @@ export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion
       if (!entry) throw serviceError("Transaction not found", 404);
       if (entry.deletedAt) return;
       if (
-        base?.success &&
-        (!sameEntryValues(entryOut(entry), base.data) ||
-          (baseVersion && (entry.serverVersion || 1) !== baseVersion))
+        ((base?.success && !sameEntryValues(entryOut(entry), base.data)) ||
+          (baseVersion && (entry.serverVersion || 1) !== baseVersion) ||
+          (baseResolutionVersion && (entry.resolutionVersion || 1) !== baseResolutionVersion))
       )
         throw serviceError("Transaction changed on another device", 409, {
           current: entryOut(entry),
           serverVersion: entry.serverVersion || 1,
+          resolutionVersion: entry.resolutionVersion || 1,
         });
       entry.deletedAt = new Date();
       entry.serverVersion = (entry.serverVersion || 1) + 1;
+      entry.resolutionVersion = (entry.resolutionVersion || 1) + 1;
       await entry.save({ session });
       if (audit)
         await saveAudit({ shopId, actorId, session }, audit);
@@ -146,6 +148,7 @@ export async function updateLedgerEntry({
   entry: value,
   base,
   baseVersion,
+  baseResolutionVersion,
   audit,
 }) {
   const customer = await Customer.findOne({
@@ -168,14 +171,15 @@ export async function updateLedgerEntry({
         throw serviceError("Transaction was deleted on another device", 409, {
           current: null,
           serverVersion: doc.serverVersion || 1,
+          resolutionVersion: doc.resolutionVersion || 1,
         });
       if (
-        base?.success &&
-        (!sameEntryValues(current, base.data) ||
-          (baseVersion && (doc.serverVersion || 1) !== baseVersion)) &&
+        ((base?.success && !sameEntryValues(current, base.data)) ||
+          (baseVersion && (doc.serverVersion || 1) !== baseVersion) ||
+          (baseResolutionVersion && (doc.resolutionVersion || 1) !== baseResolutionVersion)) &&
         !sameEntryValues(current, value)
       )
-        throw serviceError("Transaction changed on another device", 409, { current });
+        throw serviceError("Transaction changed on another device", 409, { current, resolutionVersion: doc.resolutionVersion || 1 });
       if (!sameEntryValues(current, value)) {
         doc.set({
           customerClientId: value.customerId,
@@ -187,6 +191,7 @@ export async function updateLedgerEntry({
           due: value.due,
         });
         doc.serverVersion = (doc.serverVersion || 1) + 1;
+        doc.resolutionVersion = (doc.resolutionVersion || 1) + 1;
         await doc.save({ session });
       }
       if (audit)
@@ -218,6 +223,7 @@ export async function resolveFinancialConflict({
     return {
       entry: committed.selected,
       serverVersion: committed.resultingVersion,
+      resolutionVersion: committed.resultingResolutionVersion || 1,
       resolutionId: input.resolutionId,
       serverAt: committed.serverAt.toISOString(),
       audit: financialAuditOut(committed),
@@ -246,10 +252,13 @@ export async function resolveFinancialConflict({
         session,
       );
       const actualVersion = doc?.serverVersion || 1;
+      const actualResolutionVersion = doc?.resolutionVersion || 1;
       const current = doc && !doc.deletedAt ? entryOut(doc) : null;
-      if (!doc || actualVersion !== input.expectedVersion)
+      if (!doc || actualVersion !== input.expectedVersion || actualResolutionVersion !== input.expectedResolutionVersion)
         throw serviceError("Transaction changed while the conflict was open", 409, {
           current,
+          serverVersion: actualVersion,
+          resolutionVersion: actualResolutionVersion,
         });
       const priorConflict = await FinancialResolution.findOne({
         shopId,
@@ -265,6 +274,7 @@ export async function resolveFinancialConflict({
           response = {
             entry: priorConflict.selected,
             serverVersion: priorConflict.resultingVersion,
+            resolutionVersion: priorConflict.resultingResolutionVersion || 1,
             resolutionId: priorConflict.resolutionId,
             serverAt: priorConflict.serverAt.toISOString(),
             audit: financialAuditOut(priorConflict),
@@ -274,6 +284,7 @@ export async function resolveFinancialConflict({
         throw serviceError("This financial conflict has already been resolved", 409, {
           current,
           serverVersion: actualVersion,
+          resolutionVersion: actualResolutionVersion,
         });
       }
       const previous = entryOut(doc);
@@ -293,6 +304,7 @@ export async function resolveFinancialConflict({
           throw serviceError("Customer is not available for this transaction", 409, {
             current,
             serverVersion: actualVersion,
+            resolutionVersion: actualResolutionVersion,
           });
         const changed =
           !sameEntryValues(previous, proposal) ||
@@ -308,12 +320,16 @@ export async function resolveFinancialConflict({
             due: proposal.due,
             deletedAt: input.localDeleted ? new Date() : undefined,
             serverVersion: actualVersion + 1,
+            resolutionVersion: actualResolutionVersion + 1,
           });
-          await doc.save({ session });
         }
         selected = input.localDeleted ? null : entryOut(doc);
       } else if (doc.deletedAt) selected = null;
+      doc.resolutionVersion = actualResolutionVersion + 1;
+      await doc.save({ session });
+      if (selected) selected = entryOut(doc);
       const resultingVersion = doc.serverVersion || 1;
+      const resultingResolutionVersion = doc.resolutionVersion || actualResolutionVersion;
       const serverAt = new Date();
       const customer = await Customer.findOne({
         shopId,
@@ -338,6 +354,8 @@ export async function resolveFinancialConflict({
             selected,
             previousVersion: actualVersion,
             resultingVersion,
+            previousResolutionVersion: actualResolutionVersion,
+            resultingResolutionVersion,
             localAt: input.localAt ? new Date(input.localAt) : undefined,
             action: input.choice,
             status: "resolved",
@@ -349,6 +367,7 @@ export async function resolveFinancialConflict({
       response = {
         entry: selected,
         serverVersion: resultingVersion,
+        resolutionVersion: resultingResolutionVersion,
         resolutionId: input.resolutionId,
         serverAt: serverAt.toISOString(),
         audit: financialAuditOut(resolutionRecord),
@@ -370,6 +389,7 @@ export async function resolveFinancialConflict({
         throw serviceError("This financial conflict has already been resolved", 409, {
           current: resolvedConflict.selected,
           serverVersion: resolvedConflict.resultingVersion,
+          resolutionVersion: resolvedConflict.resultingResolutionVersion || 1,
         });
       throw serviceError("Resolution identifier was already used", 409);
     }

@@ -1,9 +1,9 @@
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
-import Constants from "expo-constants";
+import Constants, { ExecutionEnvironment } from "expo-constants";
 import type * as SQLiteTypes from "expo-sqlite";
-import type { Audit, Data } from "./model";
-import { createSyncDelta, type SyncDelta } from "./syncDelta";
+import type { Audit, Customer, Data, Entry } from "./model";
+import { createSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
 
 const DATABASE = "digital-khata-offline.db";
 const KEY_NAME = "khata.sqlite.key.v1";
@@ -27,19 +27,46 @@ export type SyncQueueStatus = {
   conflicts: number;
 };
 export type PendingConflict = {
+  kind?: "entry";
   queueId: number;
   entryId: string;
   local: NonNullable<SyncDelta["entries"][number]["after"]>;
   server: NonNullable<SyncDelta["entries"][number]["after"]> | null;
   expectedVersion: number;
+  expectedResolutionVersion: number;
   resolutionId: string;
   localDeleted: boolean;
   localAt: string;
   chosen?: "keep_local" | "keep_server";
 };
+export type PendingCustomerConflict = {
+  kind: "customer";
+  queueId: number;
+  customerId: string;
+  local: import("./model").Customer;
+  server: import("./model").Customer | null;
+  expectedVersion: number;
+  expectedResolutionVersion: number;
+  resolutionId: string;
+  localDeleted: boolean;
+  localAt: string;
+  chosen?: "keep_local" | "keep_server";
+};
+export type PendingSettingsConflict = {
+  kind: "settings";
+  queueId: number;
+  local: SyncSettings;
+  server: SyncSettings;
+  expectedVersion: number;
+  expectedResolutionVersion: number;
+  resolutionId: string;
+  localAt: string;
+  chosen?: "keep_local" | "keep_server";
+};
 
 export const offlineStorageAvailable = () =>
-  Constants.appOwnership !== "expo" && !nativeDatabaseUnavailable;
+  Constants.executionEnvironment !== ExecutionEnvironment.StoreClient &&
+  !nativeDatabaseUnavailable;
 
 async function openDatabase() {
   if (!offlineStorageAvailable()) return null;
@@ -68,7 +95,7 @@ async function openDatabase() {
       await db.execAsync("PRAGMA journal_mode = WAL;");
       const currentVersion =
         (await db.getFirstAsync<{ user_version: number }>("PRAGMA user_version"))?.user_version || 0;
-      if (currentVersion > 3)
+      if (currentVersion > 5)
         throw new Error("Offline database version is newer than this app");
       await db.execAsync(`
         CREATE TABLE IF NOT EXISTS local_accounts (
@@ -98,6 +125,11 @@ async function openDatabase() {
           record_json TEXT NOT NULL,
           PRIMARY KEY (account_id, audit_id)
         );
+        CREATE TABLE IF NOT EXISTS local_subscription_cache (
+          account_id TEXT PRIMARY KEY NOT NULL,
+          snapshot_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS sync_queue (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           account_id TEXT NOT NULL,
@@ -108,7 +140,12 @@ async function openDatabase() {
           attempts INTEGER NOT NULL DEFAULT 0,
           last_error TEXT,
           state TEXT NOT NULL DEFAULT 'pending',
-          conflict_json TEXT
+          conflict_json TEXT,
+          operation_id TEXT,
+          entity_type TEXT,
+          entity_id TEXT,
+          base_version INTEGER,
+          next_attempt_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS sync_queue_account_order_idx
           ON sync_queue (account_id, id);
@@ -125,6 +162,16 @@ async function openDatabase() {
         if (!columns.some((column) => column.name === "conflict_json")) {
           await db.execAsync("ALTER TABLE sync_queue ADD COLUMN conflict_json TEXT");
         }
+        for (const [name, definition] of [
+          ["operation_id", "TEXT"],
+          ["entity_type", "TEXT"],
+          ["entity_id", "TEXT"],
+          ["base_version", "INTEGER"],
+          ["next_attempt_at", "INTEGER NOT NULL DEFAULT 0"],
+        ] as const) {
+          if (!columns.some((column) => column.name === name))
+            await db.execAsync(`ALTER TABLE sync_queue ADD COLUMN ${name} ${definition}`);
+        }
         if (columns.some((column) => column.name === "previous_json") &&
             columns.some((column) => column.name === "next_json")) {
         const legacy = await db.getAllAsync<{
@@ -138,7 +185,15 @@ async function openDatabase() {
         }
         }
       }
-      if (currentVersion < 3) await db.execAsync("PRAGMA user_version = 3;");
+      if (currentVersion < 5) {
+        const legacyQueue = await db.getAllAsync<{ id: number; operation_id: string | null }>(
+          "SELECT id, operation_id FROM sync_queue WHERE operation_id IS NULL",
+        );
+        for (const row of legacyQueue)
+          await db.runAsync("UPDATE sync_queue SET operation_id = ? WHERE id = ?", Crypto.randomUUID(), row.id);
+        await db.execAsync("CREATE UNIQUE INDEX IF NOT EXISTS sync_queue_operation_id_idx ON sync_queue (operation_id)");
+        await db.execAsync("PRAGMA user_version = 5;");
+      }
       return db;
     })().catch((error) => {
       database = null;
@@ -316,14 +371,28 @@ export async function saveLocalChange(
   await db.withExclusiveTransactionAsync(async (transaction) => {
     const change = createSyncDelta(previous, next);
     await writeChange(transaction, accountId, next, change);
+    const customerChange = change.customers[0];
+    const entryChange = change.entries[0];
+    const operation = customerChange || entryChange;
+    const record = operation?.after || operation?.before;
+    const entityType = change.settings ? "settings" : customerChange ? "customer" : entryChange ? "entry" : "account";
+    const baseVersion = change.settings
+      ? change.settings.before.shop.serverVersion || null
+      : (operation?.before as { serverVersion?: number } | undefined)?.serverVersion || null;
     const inserted = await transaction.runAsync(
-      `INSERT INTO sync_queue (account_id, previous_json, next_json, change_json, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO sync_queue
+        (account_id, previous_json, next_json, change_json, created_at, operation_id,
+         entity_type, entity_id, base_version, next_attempt_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       accountId,
       "{}",
       "{}",
       JSON.stringify(change),
       Date.now(),
+      Crypto.randomUUID(),
+      entityType,
+      record?.id || (change.settings ? accountId : null),
+      baseVersion,
     );
     queueId = inserted.lastInsertRowId;
   });
@@ -360,6 +429,32 @@ export async function readCachedAccount(accountId: string): Promise<Data | null>
     audit: audit.map((row) => JSON.parse(row.record_json)),
     ...preferences,
   } as Data;
+}
+
+export async function cacheSubscriptionSnapshot(accountId: string, snapshot: unknown) {
+  const db = await openDatabase();
+  if (!db) return false;
+  await db.runAsync(
+    `INSERT INTO local_subscription_cache (account_id, snapshot_json, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(account_id) DO UPDATE SET snapshot_json=excluded.snapshot_json,
+       updated_at=excluded.updated_at`,
+    accountId,
+    JSON.stringify(snapshot),
+    Date.now(),
+  );
+  return true;
+}
+
+export async function readSubscriptionSnapshot(accountId: string): Promise<unknown | null> {
+  const db = await openDatabase();
+  if (!db) return null;
+  const row = await db.getFirstAsync<{ snapshot_json: string }>(
+    "SELECT snapshot_json FROM local_subscription_cache WHERE account_id = ?",
+    accountId,
+  );
+  if (!row) return null;
+  try { return JSON.parse(row.snapshot_json); } catch { return null; }
 }
 
 export async function readOfflineSession(): Promise<OfflineSession | null> {
@@ -408,8 +503,14 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
   for (const row of blockedRows) {
     if (row.state === "conflict" && row.conflict_json) {
       try {
-        const conflict = JSON.parse(row.conflict_json) as PendingConflict;
-        blockedEntries.add(conflict.entryId);
+        const conflict = JSON.parse(row.conflict_json) as unknown as { kind?: string; entryId?: string; customerId?: string; localDeleted?: boolean };
+        if (conflict.kind === "settings") {
+          blockedSettings = true;
+        } else if (conflict.kind === "customer") {
+          const customerConflict = conflict as unknown as PendingCustomerConflict;
+          blockedCustomerMutations.add(customerConflict.customerId);
+          if (customerConflict.localDeleted) blockedCustomerLedger.add(customerConflict.customerId);
+        } else if (conflict.entryId) blockedEntries.add(conflict.entryId);
       } catch {
         // Keep the damaged conflict durable and do not infer a resolution.
       }
@@ -436,12 +537,28 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
       // Keep corrupt queue records; valid unrelated operations can still sync.
     }
   }
-  const pending = await db.getAllAsync<{ id: number; change_json: string }>(
-    "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND state = 'pending' ORDER BY id",
+  const pending = await db.getAllAsync<{ id: number; change_json: string; next_attempt_at: number }>(
+    "SELECT id, change_json, next_attempt_at FROM sync_queue WHERE account_id = ? AND state = 'pending' ORDER BY id",
     accountId,
   );
-  for (const item of pending) {
+  for (let index = 0; index < pending.length; index += 1) {
+    const item = pending[index];
     const change = JSON.parse(item.change_json) as SyncDelta;
+    if (item.next_attempt_at > Date.now()) {
+      blockedSettings ||= !!change.settings;
+      for (const customerChange of change.customers) {
+        const customer = customerChange.after || customerChange.before;
+        if (customer) {
+          blockedCustomerMutations.add(customer.id);
+          if (customerChange.operation === "create") blockedCustomerLedger.add(customer.id);
+        }
+      }
+      for (const entryChange of change.entries) {
+        const entry = entryChange.after || entryChange.before;
+        if (entry) blockedEntries.add(entry.id);
+      }
+      continue;
+    }
     const touchesBlockedSetting = !!change.settings && blockedSettings;
     const touchesBlockedCustomer = change.customers.some((item) =>
       blockedCustomerMutations.has((item.after || item.before)!.id),
@@ -452,6 +569,22 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
     });
     if (touchesBlockedSetting || touchesBlockedCustomer || touchesBlockedEntry)
       continue;
+    const customerDeletion = change.customers.find((customer) => customer.operation === "delete");
+    const deletedCustomer = customerDeletion?.before?.id;
+    if (deletedCustomer) {
+      const laterRows = await db.getAllAsync<{ id: number; change_json: string }>(
+        "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND state IN ('pending', 'failed', 'conflict') ORDER BY id",
+        accountId,
+      );
+      const hasLedgerDependency = laterRows.some((later) => {
+        if (later.id === item.id) return false;
+        try {
+          const laterChange = JSON.parse(later.change_json) as SyncDelta;
+          return laterChange.entries.some((entry) => (entry.after || entry.before)?.customerId === deletedCustomer);
+        } catch { return true; }
+      });
+      if (hasLedgerDependency) continue;
+    }
     return { id: item.id, change };
   }
   return null;
@@ -462,6 +595,7 @@ export async function markConflict(
   change: SyncDelta,
   server: PendingConflict["server"],
   serverVersion?: number,
+  serverResolutionVersion?: number,
 ) {
   const db = await openDatabase();
   if (!db) return;
@@ -470,11 +604,13 @@ export async function markConflict(
   const local = operation.after || operation.before!;
   const localAudit = change.audit.find((item) => item.after?.id === local.id || item.before?.id === local.id);
   const conflict: PendingConflict = {
+    kind: "entry",
     queueId: id,
     entryId: local.id,
     local,
     server,
     expectedVersion: server?.serverVersion || serverVersion || local.serverVersion || 1,
+    expectedResolutionVersion: server?.resolutionVersion || serverResolutionVersion || local.resolutionVersion || 1,
     resolutionId: Crypto.randomUUID(),
     localDeleted: operation.operation === "delete",
     localAt: localAudit?.date && Number.isFinite(Date.parse(localAudit.date))
@@ -487,6 +623,39 @@ export async function markConflict(
   );
 }
 
+export async function markCustomerConflict(
+  id: number,
+  change: SyncDelta,
+  server: import("./model").Customer | null,
+  serverVersion?: number,
+  serverResolutionVersion?: number,
+) {
+  const db = await openDatabase();
+  if (!db) return;
+  const operation = change.customers.find((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete");
+  if (!operation) return;
+  const local = operation.after || operation.before!;
+  const audit = change.audit.find((item) => item.action.toLowerCase().includes("customer"));
+  const conflict: PendingCustomerConflict = {
+    kind: "customer",
+    queueId: id,
+    customerId: local.id,
+    local,
+    server,
+    expectedVersion: server?.serverVersion || serverVersion || local.serverVersion || 1,
+    expectedResolutionVersion: server?.resolutionVersion || serverResolutionVersion || local.resolutionVersion || 1,
+    resolutionId: Crypto.randomUUID(),
+    localDeleted: operation.operation === "delete",
+    localAt: audit?.date && Number.isFinite(Date.parse(audit.date))
+      ? new Date(audit.date).toISOString()
+      : new Date().toISOString(),
+  };
+  await db.runAsync(
+    "UPDATE sync_queue SET state = 'conflict', conflict_json = ?, attempts = attempts + 1, last_error = ? WHERE id = ? AND state = 'pending'",
+    JSON.stringify(conflict), "Customer changed on the server", id,
+  );
+}
+
 export async function readPendingConflicts(accountId: string): Promise<PendingConflict[]> {
   const db = await openDatabase();
   if (!db) return [];
@@ -494,10 +663,268 @@ export async function readPendingConflicts(accountId: string): Promise<PendingCo
     "SELECT conflict_json FROM sync_queue WHERE account_id = ? AND state = 'conflict' AND conflict_json IS NOT NULL ORDER BY id",
     accountId,
   );
-  return rows.flatMap((row) => { try { return [JSON.parse(row.conflict_json) as PendingConflict]; } catch { return []; } });
+  return rows.flatMap((row) => { try { const value = JSON.parse(row.conflict_json) as unknown as { kind?: string }; return value.kind === "customer" || value.kind === "settings" ? [] : [value as PendingConflict]; } catch { return []; } });
 }
 
-export async function refreshConflict(id: number, server: PendingConflict["server"], serverVersion?: number) {
+export async function readPendingCustomerConflicts(accountId: string): Promise<PendingCustomerConflict[]> {
+  const db = await openDatabase();
+  if (!db) return [];
+  const rows = await db.getAllAsync<{ conflict_json: string }>(
+    "SELECT conflict_json FROM sync_queue WHERE account_id = ? AND state = 'conflict' AND conflict_json IS NOT NULL ORDER BY id",
+    accountId,
+  );
+  return rows.flatMap((row) => {
+    try {
+      const value = JSON.parse(row.conflict_json) as PendingCustomerConflict;
+      return value.kind === "customer" ? [value] : [];
+    } catch { return []; }
+  });
+}
+
+function settingsFromServer(server: Record<string, unknown>): SyncSettings {
+  const shop = server;
+  return {
+    shop: {
+      name: String(shop.name || ""),
+      owner: String(shop.owner || ""),
+      address: String(shop.address || ""),
+      phone: String(shop.phone || "").replace(/^\+91/, ""),
+      whatsapp: String(shop.whatsapp || ""),
+      serverVersion: Number(shop.serverVersion) || 1,
+      resolutionVersion: Number(shop.resolutionVersion) || 1,
+    },
+    language: String(shop.language || "English"),
+    defaultMethod: String(shop.defaultMethod || "Cash"),
+    reminders: shop.reminders as SyncSettings["reminders"],
+  };
+}
+
+export async function markSettingsConflict(id: number, change: SyncDelta, server: Record<string, unknown>) {
+  const db = await openDatabase();
+  if (!db || !change.settings) return;
+  const conflict: PendingSettingsConflict = {
+    kind: "settings",
+    queueId: id,
+    local: change.settings.after,
+    server: settingsFromServer(server),
+    expectedVersion: Number(server.serverVersion) || 1,
+    expectedResolutionVersion: Number(server.resolutionVersion) || 1,
+    resolutionId: Crypto.randomUUID(),
+    localAt: new Date().toISOString(),
+  };
+  await db.runAsync(
+    "UPDATE sync_queue SET state = 'conflict', conflict_json = ?, attempts = attempts + 1, last_error = ? WHERE id = ? AND state = 'pending'",
+    JSON.stringify(conflict), "Shop settings changed on another device", id,
+  );
+}
+
+export async function readPendingSettingsConflicts(accountId: string): Promise<PendingSettingsConflict[]> {
+  const db = await openDatabase();
+  if (!db) return [];
+  const rows = await db.getAllAsync<{ conflict_json: string }>(
+    "SELECT conflict_json FROM sync_queue WHERE account_id = ? AND state = 'conflict' AND conflict_json IS NOT NULL ORDER BY id",
+    accountId,
+  );
+  return rows.flatMap((row) => {
+    try {
+      const value = JSON.parse(row.conflict_json) as PendingSettingsConflict;
+      return value.kind === "settings" ? [value] : [];
+    } catch { return []; }
+  });
+}
+
+export async function refreshSettingsConflict(id: number, server: Record<string, unknown>) {
+  const db = await openDatabase();
+  if (!db) return;
+  const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
+  if (!row) return;
+  const conflict = JSON.parse(row.conflict_json) as PendingSettingsConflict;
+  conflict.server = settingsFromServer(server);
+  conflict.expectedVersion = Number(server.serverVersion) || 1;
+  conflict.expectedResolutionVersion = Number(server.resolutionVersion) || 1;
+  conflict.chosen = undefined;
+  conflict.resolutionId = Crypto.randomUUID();
+  await db.runAsync("UPDATE sync_queue SET conflict_json = ? WHERE id = ?", JSON.stringify(conflict), id);
+}
+
+export async function chooseSettingsConflictResolution(id: number, choice: "keep_local" | "keep_server") {
+  const db = await openDatabase();
+  if (!db) throw new Error("Encrypted offline storage is unavailable");
+  const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
+  if (!row) throw new Error("The pending settings conflict is unavailable");
+  const conflict = JSON.parse(row.conflict_json) as PendingSettingsConflict;
+  conflict.chosen = choice;
+  await db.runAsync("UPDATE sync_queue SET conflict_json = ? WHERE id = ?", JSON.stringify(conflict), id);
+  return conflict;
+}
+
+export async function completeSettingsConflict(accountId: string, conflict: PendingSettingsConflict, authoritative: SyncSettings, audit: Audit) {
+  const db = await openDatabase();
+  if (!db) throw new Error("Encrypted offline storage is unavailable");
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    const conflicted = await transaction.getFirstAsync<{ change_json: string }>(
+      "SELECT change_json FROM sync_queue WHERE account_id = ? AND id = ? AND state = 'conflict'",
+      accountId, conflict.queueId,
+    );
+    if (!conflicted) return;
+    const later = await transaction.getAllAsync<{ id: number; change_json: string }>(
+      "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND id > ? AND state = 'pending' ORDER BY id",
+      accountId, conflict.queueId,
+    );
+    let rebase = authoritative;
+    let dependent = false;
+    for (const row of later) {
+      const change = JSON.parse(row.change_json) as SyncDelta;
+      if (!change.settings) continue;
+      dependent = true;
+      change.settings.before = rebase;
+      change.settings.after.shop.serverVersion = rebase.shop.serverVersion;
+      change.settings.after.shop.resolutionVersion = rebase.shop.resolutionVersion;
+      await transaction.runAsync(
+        "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
+        JSON.stringify(change), rebase.shop.serverVersion || 1, row.id,
+      );
+      rebase = change.settings.after;
+    }
+    const account = await transaction.getFirstAsync<{ shop_json: string; preferences_json: string }>(
+      "SELECT shop_json, preferences_json FROM local_accounts WHERE account_id = ?",
+      accountId,
+    );
+    if (account) {
+      const oldShop = JSON.parse(account.shop_json);
+      const oldPreferences = JSON.parse(account.preferences_json);
+      const shop = dependent ? { ...oldShop, serverVersion: authoritative.shop.serverVersion, resolutionVersion: authoritative.shop.resolutionVersion } : authoritative.shop;
+      const preferences = dependent ? oldPreferences : {
+        ...oldPreferences,
+        language: authoritative.language,
+        defaultMethod: authoritative.defaultMethod,
+        reminders: authoritative.reminders,
+      };
+      await transaction.runAsync(
+        "UPDATE local_accounts SET shop_json = ?, preferences_json = ?, updated_at = ? WHERE account_id = ?",
+        JSON.stringify(shop), JSON.stringify(preferences), Date.now(), accountId,
+      );
+    }
+    await transaction.runAsync("INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)", accountId, audit.id, JSON.stringify(audit));
+    const remaining = JSON.parse(conflicted.change_json) as SyncDelta;
+    delete remaining.settings;
+    const hasRemaining = remaining.customers.length > 0 || remaining.entries.length > 0 || remaining.audit.length > 0 || remaining.read.length > 0;
+    if (hasRemaining)
+      await transaction.runAsync(
+        "UPDATE sync_queue SET change_json = ?, state = 'pending', conflict_json = NULL, last_error = NULL WHERE account_id = ? AND id = ?",
+        JSON.stringify(remaining), accountId, conflict.queueId,
+      );
+    else await transaction.runAsync("DELETE FROM sync_queue WHERE account_id = ? AND id = ?", accountId, conflict.queueId);
+  });
+}
+
+export async function refreshCustomerConflict(id: number, server: import("./model").Customer | null, serverVersion?: number, serverResolutionVersion?: number) {
+  const db = await openDatabase();
+  if (!db) return;
+  const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
+  if (!row) return;
+  const conflict = JSON.parse(row.conflict_json) as PendingCustomerConflict;
+  conflict.server = server;
+  conflict.chosen = undefined;
+  conflict.expectedVersion = server?.serverVersion || serverVersion || conflict.expectedVersion;
+  conflict.expectedResolutionVersion = server?.resolutionVersion || serverResolutionVersion || conflict.expectedResolutionVersion;
+  await db.runAsync("UPDATE sync_queue SET conflict_json = ? WHERE id = ?", JSON.stringify(conflict), id);
+}
+
+export async function chooseCustomerConflictResolution(id: number, choice: "keep_local" | "keep_server") {
+  const db = await openDatabase();
+  if (!db) throw new Error("Encrypted offline storage is unavailable");
+  const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
+  if (!row) throw new Error("The pending customer conflict is unavailable");
+  const conflict = JSON.parse(row.conflict_json) as PendingCustomerConflict;
+  conflict.chosen = choice;
+  await db.runAsync("UPDATE sync_queue SET conflict_json = ? WHERE id = ?", JSON.stringify(conflict), id);
+  return conflict;
+}
+
+export async function completeCustomerConflict(
+  accountId: string,
+  conflict: PendingCustomerConflict,
+  authoritative: import("./model").Customer | null,
+  serverVersion: number,
+  serverResolutionVersion: number,
+  audit: Audit,
+) {
+  const db = await openDatabase();
+  if (!db) throw new Error("Encrypted offline storage is unavailable");
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    const conflicted = await transaction.getFirstAsync<{ change_json: string }>(
+      "SELECT change_json FROM sync_queue WHERE account_id = ? AND id = ? AND state = 'conflict'",
+      accountId, conflict.queueId,
+    );
+    if (!conflicted) return;
+    const later = await transaction.getAllAsync<{ id: number; change_json: string }>(
+      "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND id > ? AND state = 'pending' ORDER BY id",
+      accountId, conflict.queueId,
+    );
+    let hasDependent = false;
+    let rebase = authoritative;
+    for (const row of later) {
+      const change = JSON.parse(row.change_json) as SyncDelta;
+      const item = change.customers.find((candidate) => (candidate.after || candidate.before)?.id === conflict.customerId);
+      if (!item) continue;
+      hasDependent = true;
+      if (rebase) {
+        item.before = rebase;
+        if (item.after) item.after.serverVersion = rebase.serverVersion || 1;
+        if (item.after) item.after.resolutionVersion = rebase.resolutionVersion || 1;
+        await transaction.runAsync(
+          "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
+          JSON.stringify(change), rebase.serverVersion || 1, row.id,
+        );
+        rebase = item.operation === "delete" ? null : item.after || rebase;
+      } else if (item.operation === "delete") {
+        change.customers = change.customers.filter((candidate) => candidate !== item);
+        await transaction.runAsync("UPDATE sync_queue SET change_json = ? WHERE id = ?", JSON.stringify(change), row.id);
+      } else {
+        const pendingConflict: PendingCustomerConflict = {
+          kind: "customer", queueId: row.id, customerId: conflict.customerId,
+          local: item.after!, server: null, expectedVersion: serverVersion,
+          expectedResolutionVersion: serverResolutionVersion,
+          resolutionId: Crypto.randomUUID(), localDeleted: false, localAt: new Date().toISOString(),
+        };
+        await transaction.runAsync(
+          "UPDATE sync_queue SET state = 'conflict', conflict_json = ?, last_error = ? WHERE id = ?",
+          JSON.stringify(pendingConflict), "Customer was deleted on the server", row.id,
+        );
+      }
+    }
+    if (authoritative) {
+      const cached = await transaction.getFirstAsync<{ record_json: string }>(
+        "SELECT record_json FROM local_customers WHERE account_id = ? AND customer_id = ?",
+        accountId, conflict.customerId,
+      );
+      const localRecord = cached && hasDependent
+        ? { ...JSON.parse(cached.record_json), serverVersion: authoritative.serverVersion || 1, resolutionVersion: authoritative.resolutionVersion || 1 }
+        : authoritative;
+      await transaction.runAsync(
+        `INSERT INTO local_customers (account_id, customer_id, record_json) VALUES (?, ?, ?)
+         ON CONFLICT(account_id, customer_id) DO UPDATE SET record_json=excluded.record_json`,
+        accountId, authoritative.id, JSON.stringify(localRecord),
+      );
+    } else if (!hasDependent) {
+      await transaction.runAsync("DELETE FROM local_customers WHERE account_id = ? AND customer_id = ?", accountId, conflict.customerId);
+    }
+    await transaction.runAsync("INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)", accountId, audit.id, JSON.stringify(audit));
+    const original = JSON.parse(conflicted.change_json) as SyncDelta;
+    original.customers = original.customers.filter((item) => (item.after || item.before)?.id !== conflict.customerId);
+    original.audit = original.audit.filter((item) => !item.action.toLowerCase().includes("customer"));
+    const remains = !!original.settings || original.customers.length > 0 || original.entries.length > 0 || original.audit.length > 0 || original.read.length > 0;
+    if (remains)
+      await transaction.runAsync(
+        "UPDATE sync_queue SET change_json = ?, state = 'pending', conflict_json = NULL, last_error = NULL WHERE account_id = ? AND id = ?",
+        JSON.stringify(original), accountId, conflict.queueId,
+      );
+    else await transaction.runAsync("DELETE FROM sync_queue WHERE account_id = ? AND id = ?", accountId, conflict.queueId);
+  });
+}
+
+export async function refreshConflict(id: number, server: PendingConflict["server"], serverVersion?: number, serverResolutionVersion?: number) {
   const db = await openDatabase();
   if (!db) return;
   const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
@@ -506,6 +933,7 @@ export async function refreshConflict(id: number, server: PendingConflict["serve
   conflict.server = server;
   conflict.chosen = undefined;
   conflict.expectedVersion = server?.serverVersion || serverVersion || conflict.expectedVersion;
+  conflict.expectedResolutionVersion = server?.resolutionVersion || serverResolutionVersion || conflict.expectedResolutionVersion;
   await db.runAsync("UPDATE sync_queue SET conflict_json = ? WHERE id = ?", JSON.stringify(conflict), id);
 }
 
@@ -520,7 +948,7 @@ export async function chooseConflictResolution(id: number, choice: "keep_local" 
   return conflict;
 }
 
-export async function completeConflict(accountId: string, conflict: PendingConflict, authoritative: PendingConflict["server"], serverVersion: number, audit: Audit) {
+export async function completeConflict(accountId: string, conflict: PendingConflict, authoritative: PendingConflict["server"], serverVersion: number, serverResolutionVersion: number, audit: Audit) {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
   await db.withExclusiveTransactionAsync(async (transaction) => {
@@ -542,20 +970,30 @@ export async function completeConflict(accountId: string, conflict: PendingConfl
       dependent = true;
       if (item.operation === "update" && item.after && base) {
         item.before = base;
-        change.entries[change.entries.indexOf(item)] = item;
-        await transaction.runAsync("UPDATE sync_queue SET change_json = ? WHERE id = ?", JSON.stringify(change), row.id);
+        item.after.serverVersion = base.serverVersion || serverVersion;
+        item.after.resolutionVersion = base.resolutionVersion || conflict.expectedResolutionVersion;
+        await transaction.runAsync(
+          "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
+          JSON.stringify(change), base.serverVersion || serverVersion, row.id,
+        );
         base = item.after;
       } else if (item.operation === "delete") {
-        if (base) item.before = base;
-        await transaction.runAsync("UPDATE sync_queue SET change_json = ? WHERE id = ?", JSON.stringify(change), row.id);
+        if (base) {
+          item.before = base;
+          await transaction.runAsync(
+            "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
+            JSON.stringify(change), base.serverVersion || serverVersion, row.id,
+          );
+        }
         base = null;
-      } else if (item.operation === "update" && !base) {
+      } else if (item.after && !base) {
         const nextConflict: PendingConflict = {
           queueId: row.id,
           entryId: conflict.entryId,
           local: item.after!,
           server: null,
           expectedVersion: serverVersion,
+          expectedResolutionVersion: serverResolutionVersion,
           resolutionId: Crypto.randomUUID(),
           localDeleted: false,
           localAt: new Date().toISOString(),
@@ -567,12 +1005,20 @@ export async function completeConflict(accountId: string, conflict: PendingConfl
         dependent = true;
       }
     }
-    if (!dependent) {
-      if (authoritative) await transaction.runAsync(
-        "UPDATE local_ledger SET customer_id = ?, record_json = ? WHERE account_id = ? AND entry_id = ?",
-        authoritative.customerId, JSON.stringify(authoritative), accountId, conflict.entryId,
+    if (authoritative) {
+      const cached = await transaction.getFirstAsync<{ record_json: string }>(
+        "SELECT record_json FROM local_ledger WHERE account_id = ? AND entry_id = ?",
+        accountId, conflict.entryId,
       );
-      else await transaction.runAsync("DELETE FROM local_ledger WHERE account_id = ? AND entry_id = ?", accountId, conflict.entryId);
+      const localRecord = cached && dependent
+        ? { ...JSON.parse(cached.record_json), serverVersion: authoritative.serverVersion || serverVersion, resolutionVersion: authoritative.resolutionVersion || conflict.expectedResolutionVersion }
+        : authoritative;
+      await transaction.runAsync(
+        "UPDATE local_ledger SET customer_id = ?, record_json = ? WHERE account_id = ? AND entry_id = ?",
+        localRecord.customerId, JSON.stringify(localRecord), accountId, conflict.entryId,
+      );
+    } else if (!dependent) {
+      await transaction.runAsync("DELETE FROM local_ledger WHERE account_id = ? AND entry_id = ?", accountId, conflict.entryId);
     }
     await transaction.runAsync(
       "INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)",
@@ -623,14 +1069,125 @@ export async function hasFailedChanges(accountId: string) {
   return (row?.count || 0) > 0;
 }
 
-export async function acknowledgeChange(id: number) {
+export async function nextPendingRetryAt(accountId: string): Promise<number | null> {
   const db = await openDatabase();
-  if (db) await db.runAsync("DELETE FROM sync_queue WHERE id = ?", id);
+  if (!db) return null;
+  const row = await db.getFirstAsync<{ retry_at: number | null }>(
+    "SELECT MIN(next_attempt_at) AS retry_at FROM sync_queue WHERE account_id = ? AND state = 'pending' AND next_attempt_at > ?",
+    accountId,
+    Date.now(),
+  );
+  return row?.retry_at ?? null;
+}
+
+export async function acknowledgeChange(
+  id: number,
+  acknowledged?: { customers?: Customer[]; entries?: Entry[]; settings?: SyncSettings },
+) {
+  const db = await openDatabase();
+  if (!db) return;
+  await db.withExclusiveTransactionAsync(async (transaction) => {
+    const row = await transaction.getFirstAsync<{ account_id: string; change_json: string; state: string }>(
+      "SELECT account_id, change_json, state FROM sync_queue WHERE id = ?",
+      id,
+    );
+    if (!row || row.state !== "pending") return;
+    if (acknowledged?.settings) {
+      const authoritative = acknowledged.settings;
+      const later = await transaction.getAllAsync<{ id: number; change_json: string }>(
+        "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND id > ? AND state = 'pending' ORDER BY id",
+        row.account_id, id,
+      );
+      let hasDependent = false;
+      for (const nextRow of later) {
+        const next = JSON.parse(nextRow.change_json) as SyncDelta;
+        if (!next.settings) continue;
+        next.settings.before = authoritative;
+        next.settings.after.shop.serverVersion = authoritative.shop.serverVersion;
+        next.settings.after.shop.resolutionVersion = authoritative.shop.resolutionVersion;
+        await transaction.runAsync(
+          "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
+          JSON.stringify(next), authoritative.shop.serverVersion || 1, nextRow.id,
+        );
+        hasDependent = true;
+        break;
+      }
+      const account = await transaction.getFirstAsync<{ shop_json: string; preferences_json: string }>(
+        "SELECT shop_json, preferences_json FROM local_accounts WHERE account_id = ?",
+        row.account_id,
+      );
+      if (account) {
+        const oldShop = JSON.parse(account.shop_json);
+        const oldPreferences = JSON.parse(account.preferences_json);
+        await transaction.runAsync(
+          "UPDATE local_accounts SET shop_json = ?, preferences_json = ?, updated_at = ? WHERE account_id = ?",
+          JSON.stringify(hasDependent ? { ...oldShop, serverVersion: authoritative.shop.serverVersion, resolutionVersion: authoritative.shop.resolutionVersion } : authoritative.shop),
+          JSON.stringify(hasDependent ? oldPreferences : {
+            ...oldPreferences,
+            language: authoritative.language,
+            defaultMethod: authoritative.defaultMethod,
+            reminders: authoritative.reminders,
+          }),
+          Date.now(), row.account_id,
+        );
+      }
+    }
+    for (const [kind, records] of [
+      ["customer", acknowledged?.customers || []],
+      ["entry", acknowledged?.entries || []],
+    ] as const) {
+      for (const authoritative of records) {
+        const entityId = authoritative.id;
+        const nextRows = await transaction.getAllAsync<{ id: number; change_json: string }>(
+          "SELECT id, change_json FROM sync_queue WHERE account_id = ? AND id > ? AND state = 'pending' ORDER BY id",
+          row.account_id, id,
+        );
+        let rebasedNext = false;
+        for (const nextRow of nextRows) {
+          const next = JSON.parse(nextRow.change_json) as SyncDelta;
+          const list = kind === "customer" ? next.customers : next.entries;
+          const item = list.find((candidate) => (candidate.after || candidate.before)?.id === entityId);
+          if (!item) continue;
+        item.before = authoritative as never;
+        if (item.after) item.after.serverVersion = authoritative.serverVersion;
+        if (item.after) item.after.resolutionVersion = authoritative.resolutionVersion;
+          await transaction.runAsync(
+            "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
+            JSON.stringify(next), authoritative.serverVersion || 1, nextRow.id,
+          );
+          rebasedNext = true;
+          break;
+        }
+        const table = kind === "customer" ? "local_customers" : "local_ledger";
+        const idColumn = kind === "customer" ? "customer_id" : "entry_id";
+        const cached = await transaction.getFirstAsync<{ record_json: string }>(
+          `SELECT record_json FROM ${table} WHERE account_id = ? AND ${idColumn} = ?`,
+          row.account_id, entityId,
+        );
+        if (cached) {
+          const current = JSON.parse(cached.record_json) as Customer | Entry;
+          const nextRecord = rebasedNext
+            ? { ...current, serverVersion: authoritative.serverVersion, resolutionVersion: authoritative.resolutionVersion }
+            : authoritative;
+          await transaction.runAsync(
+            `UPDATE ${table} SET record_json = ? WHERE account_id = ? AND ${idColumn} = ?`,
+            JSON.stringify(nextRecord), row.account_id, entityId,
+          );
+        }
+      }
+    }
+    await transaction.runAsync("DELETE FROM sync_queue WHERE account_id = ? AND id = ?", row.account_id, id);
+  });
 }
 
 export async function noteSyncFailure(id: number, error: unknown) {
   const db = await openDatabase();
   if (db) {
+    const prior = await db.getFirstAsync<{ attempts: number }>(
+      "SELECT attempts FROM sync_queue WHERE id = ?",
+      id,
+    );
+    const retryDelay = Math.min(6 * 60 * 60 * 1000, 5000 * 2 ** Math.min(prior?.attempts || 0, 12));
     const message =
       error instanceof Error && error.name === "ApiError"
         ? error.message.slice(0, 300)
@@ -638,8 +1195,9 @@ export async function noteSyncFailure(id: number, error: unknown) {
           ? error.message
           : "Synchronization failed";
     await db.runAsync(
-      "UPDATE sync_queue SET attempts = attempts + 1, last_error = ? WHERE id = ?",
+      "UPDATE sync_queue SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ?",
       message,
+      Date.now() + retryDelay,
       id,
     );
   }
@@ -675,7 +1233,7 @@ export async function retryFailedChanges(accountId: string) {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
   const result = await db.runAsync(
-    "UPDATE sync_queue SET state = 'pending', last_error = NULL WHERE account_id = ? AND state = 'failed'",
+      "UPDATE sync_queue SET state = 'pending', last_error = NULL, next_attempt_at = 0 WHERE account_id = ? AND state = 'failed'",
     accountId,
   );
   return result.changes;
@@ -685,7 +1243,7 @@ export async function clearOfflineAccount(accountId: string) {
   const db = await openDatabase();
   if (db)
     await db.withExclusiveTransactionAsync(async (transaction) => {
-      for (const table of ["local_accounts", "local_customers", "local_ledger", "local_audit", "sync_queue"])
+      for (const table of ["local_accounts", "local_customers", "local_ledger", "local_audit", "local_subscription_cache", "sync_queue"])
         await transaction.runAsync(`DELETE FROM ${table} WHERE account_id = ?`, accountId);
     });
   await SecureStore.deleteItemAsync(OFFLINE_SESSION);

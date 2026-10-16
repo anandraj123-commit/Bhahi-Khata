@@ -1,5 +1,5 @@
-import NetInfo from "@react-native-community/netinfo";
 import * as api from "./api";
+import { checkConnectivity } from "./connectivity";
 import {
   acknowledgeChange,
   adoptServerDataIfQueueEmpty,
@@ -7,34 +7,71 @@ import {
   hasFailedChanges,
   hasUnresolvedConflicts,
   markConflict,
+  markCustomerConflict,
+  markSettingsConflict,
   markSyncFailurePermanent,
+  nextPendingRetryAt,
   noteSyncFailure,
   offlineStorageAvailable,
   readNextChange,
+  readOfflineSession,
 } from "./offlineStore";
 import type { Data } from "./model";
 
 type ActiveSync = { promise: Promise<Data | null>; rerun: boolean; pullRemote: boolean };
 const active = new Map<string, ActiveSync>();
+const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 async function runOnce(accountId: string, pullRemote: boolean) {
-  const network = await NetInfo.fetch();
-  if (network.isConnected === false || network.isInternetReachable === false)
-    return null;
+  const offlineSession = await readOfflineSession();
+  if (!offlineSession || offlineSession.accountId !== accountId) return null;
+  if ((await checkConnectivity()) !== "online") return null;
   while (true) {
     let pending = await readNextChange(accountId);
     while (pending) {
       try {
-        await api.syncQueuedChange(pending.change);
-        await acknowledgeChange(pending.id);
+        const acknowledged = await api.syncQueuedChange(pending.change);
+        await acknowledgeChange(pending.id, acknowledged);
       } catch (error) {
+        if (
+          error instanceof api.ApiError &&
+          error.status === 409 &&
+          error.payload?.type === "shop_settings_conflict" &&
+          pending.change.settings
+        ) {
+          await markSettingsConflict(pending.id, pending.change, error.payload.current || {});
+          pending = await readNextChange(accountId);
+          continue;
+        }
+        if (
+          error instanceof api.ApiError &&
+          error.status === 409 &&
+          error.payload?.type === "customer_conflict" &&
+          pending.change.customers.some((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete")
+        ) {
+          await markCustomerConflict(pending.id, pending.change, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
+          pending = await readNextChange(accountId);
+          continue;
+        }
         if (
           error instanceof api.ApiError &&
           error.status === 409 &&
           error.payload?.type === "transaction_conflict" &&
           pending.change.entries.some((item) => item.operation === "update" || item.operation === "delete")
         ) {
-          await markConflict(pending.id, pending.change, error.payload?.current ?? null, error.payload?.serverVersion);
+          await markConflict(pending.id, pending.change, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
+          pending = await readNextChange(accountId);
+          continue;
+        }
+        if (
+          error instanceof api.ApiError &&
+          error.payload?.code === "CUSTOMER_LIMIT_REACHED"
+        ) {
+          // Keep the local customer and its failed queue record for review, but
+          // don't let a subscription capacity decision block unrelated ledger
+          // mutations later in the durable queue.
+          await noteSyncFailure(pending.id, error);
+          await markSyncFailurePermanent(pending.id);
           pending = await readNextChange(accountId);
           continue;
         }
@@ -50,6 +87,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
       pending = await readNextChange(accountId);
     }
     if (!pullRemote) return null;
+    if (await hasPendingChanges(accountId)) return null;
     if (
       (await hasUnresolvedConflicts(accountId)) ||
       (await hasFailedChanges(accountId))
@@ -92,6 +130,18 @@ export function synchronizeAccount(
   active.set(accountId, state);
   return state.promise.finally(() => {
     if (active.get(accountId) === state) active.delete(accountId);
+    void nextPendingRetryAt(accountId).then((retryAt) => {
+      if (retryTimers.has(accountId)) {
+        clearTimeout(retryTimers.get(accountId)!);
+        retryTimers.delete(accountId);
+      }
+      if (retryAt === null) return;
+      const delay = Math.max(1000, retryAt - Date.now());
+      retryTimers.set(accountId, setTimeout(() => {
+        retryTimers.delete(accountId);
+        void synchronizeAccount(accountId).catch(() => {});
+      }, delay));
+    }).catch(() => {});
   });
 }
 

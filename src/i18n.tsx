@@ -39,6 +39,8 @@ const hindi: Record<string, string> = {
   "Reminder Settings": "रिमाइंडर सेटिंग",
   "Help & Support": "मदद और सहायता",
   "Choose Your Plan": "अपना प्लान चुनें",
+  "My Subscription": "मेरी सदस्यता",
+  "Payment History": "भुगतान इतिहास",
   Account: "खाता प्रबंधन",
   "Activity History": "बदलाव का इतिहास",
   "Enter your mobile number": "अपना मोबाइल नंबर दर्ज करें",

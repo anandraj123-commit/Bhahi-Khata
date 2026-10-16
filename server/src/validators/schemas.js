@@ -36,6 +36,15 @@ export const customerSchema = z
     reminder: z.boolean(),
   })
   .strict();
+export const customerConflictSchema = z.object({
+  resolutionId: idSchema,
+  expectedVersion: z.number().int().min(1),
+  expectedResolutionVersion: z.number().int().min(1).default(1),
+  choice: z.enum(["keep_local", "keep_server"]),
+  proposed: customerSchema,
+  localDeleted: z.boolean().default(false),
+  localAt: z.string().datetime().optional(),
+});
 export const entrySchema = z
   .object({
     id: idSchema,
@@ -108,3 +117,11 @@ export const shopSchema = z
       .optional(),
   })
   .strict();
+export const shopConflictSchema = z.object({
+  resolutionId: idSchema,
+  expectedVersion: z.number().int().min(1),
+  expectedResolutionVersion: z.number().int().min(1).default(1),
+  choice: z.enum(["keep_local", "keep_server"]),
+  proposed: shopSchema,
+  localAt: z.string().datetime().optional(),
+});

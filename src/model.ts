@@ -2,6 +2,9 @@ import * as Crypto from "expo-crypto";
 
 export type Customer = {
   id: string;
+  /** Authoritative server revision; absent for local-only records. */
+  serverVersion?: number;
+  resolutionVersion?: number;
   createdAt?: string;
   name: string;
   phone: string;
@@ -14,6 +17,7 @@ export type Entry = {
   id: string;
   /** Authoritative server revision. Omitted for entries created offline. */
   serverVersion?: number;
+  resolutionVersion?: number;
   customerId: string;
   type: "credit" | "payment";
   amount: number;
@@ -23,6 +27,8 @@ export type Entry = {
   due: string;
 };
 export type Shop = {
+  serverVersion?: number;
+  resolutionVersion?: number;
   name: string;
   owner: string;
   address: string;
