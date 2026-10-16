@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { Audit, Customer, Entry, Idempotency, Notification, Shop } from "../models.js";
+import { Audit, Customer, Entry, Idempotency, Notification, Shop, SubscriptionUsage } from "../models.js";
 import { paise } from "../utils/money.js";
 
 export async function restoreBackup({ shopId, user, data }) {
@@ -51,6 +51,11 @@ export async function restoreBackup({ shopId, user, data }) {
           })),
           { session, ordered: true },
         );
+      await SubscriptionUsage.updateOne(
+        { shopId },
+        { $set: { activeCustomers: data.customers.length }, $setOnInsert: { shopId } },
+        { session, upsert: true },
+      );
       if (data.entries.length)
         await Entry.insertMany(
           data.entries.map((entry) => ({

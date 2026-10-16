@@ -112,13 +112,13 @@ export async function verifyOtp(phone, code) {
   }
   throw new Error("OTP service is not configured");
 }
-export async function sendPush(tokens, title, body) {
+export async function sendPush(tokens, title, body, data = {}) {
   if (!tokens.length) return;
   const receipts = [];
   for (let offset = 0; offset < tokens.length; offset += 100) {
     const messages = tokens
       .slice(offset, offset + 100)
-      .map((to) => ({ to, title, body, sound: "default", priority: "high" }));
+      .map((to) => ({ to, title, body, data, sound: "default", priority: "high" }));
     const response = await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
       headers: {

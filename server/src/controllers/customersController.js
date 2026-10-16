@@ -47,7 +47,7 @@ export const handle_post_customers = async (req, res, next) => {
     });
     res.status(201).json(customerOut(doc));
   } catch (e) {
-    if (e.status === 409) return error(res, 409, e.message);
+    if (e.status === 409) return res.status(409).json({ error: e.message, ...(e.code ? { code: e.code } : {}) });
     next(e);
   }
 };

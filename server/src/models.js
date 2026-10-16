@@ -206,6 +206,204 @@ ReminderDelivery.schema.index(
   { unique: true },
 );
 
+// Subscription prices and entitlements are server-owned. Money is stored in
+// minor currency units (paise for INR) so payment amounts never use floats.
+export const SubscriptionPlan = mongoose.model(
+  "SubscriptionPlan",
+  new Schema(
+    {
+      code: { type: String, required: true, unique: true },
+      name: { type: String, required: true },
+      description: { type: String, default: "" },
+      monthlyPriceMinor: { type: Number, required: true, min: 0, validate: Number.isSafeInteger },
+      currency: { type: String, required: true, default: "INR" },
+      customerLimit: { type: Number, min: 0, default: null, validate: { validator: (value) => value == null || Number.isSafeInteger(value) } },
+      unlimitedCustomers: { type: Boolean, default: false },
+      entitlements: { type: Schema.Types.Mixed, default: {} },
+      enabled: { type: Boolean, default: true },
+      displayOrder: { type: Number, default: 0 },
+      durations: {
+        type: [
+          new Schema(
+            {
+              months: { type: Number, required: true, validate: Number.isSafeInteger },
+              discountPercent: { type: Number, required: true, min: 0, max: 100, validate: Number.isInteger },
+            },
+            { _id: false },
+          ),
+        ],
+        default: [],
+      },
+      configurationVersion: { type: Number, default: 1 },
+    },
+    base,
+  ),
+);
+SubscriptionPlan.schema.index({ enabled: 1, displayOrder: 1 });
+
+export const ShopSubscription = mongoose.model(
+  "ShopSubscription",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      planId: { type: Schema.Types.ObjectId, required: true },
+      planCode: { type: String, required: true },
+      planSnapshot: { type: Schema.Types.Mixed, required: true },
+      status: { type: String, enum: ["active", "scheduled", "expired", "cancelled"], required: true },
+      startsAt: { type: Date, required: true },
+      expiresAt: Date,
+      durationMonths: { type: Number, default: 0 },
+      amountPaidMinor: { type: Number, min: 0 },
+      sourcePaymentId: { type: Schema.Types.ObjectId },
+      scheduledStartAt: Date,
+      renewalOf: { type: Schema.Types.ObjectId },
+      activatedAt: Date,
+    },
+    base,
+  ),
+);
+ShopSubscription.schema.index({ shopId: 1, startsAt: -1, _id: -1 });
+ShopSubscription.schema.index({ shopId: 1, status: 1, startsAt: 1, expiresAt: 1 });
+ShopSubscription.schema.index({ sourcePaymentId: 1 }, { unique: true, sparse: true });
+
+export const PaymentOrder = mongoose.model(
+  "PaymentOrder",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      userId: { type: Schema.Types.ObjectId, required: true },
+      appMode: { type: String, required: true },
+      planId: { type: Schema.Types.ObjectId, required: true },
+      planCode: { type: String, required: true },
+      durationMonths: { type: Number, required: true },
+      amountMinor: { type: Number, required: true, min: 0 },
+      currency: { type: String, required: true },
+      pricingSnapshot: { type: Schema.Types.Mixed, required: true },
+      gatewayOrderId: String,
+      idempotencyKey: { type: String, required: true },
+      requestHash: { type: String, required: true },
+      status: { type: String, enum: ["created", "pending", "paid", "failed", "refunded", "partially_refunded"], default: "created" },
+      scheduledStartAt: Date,
+      checkoutActive: { type: Boolean, default: false },
+      checkoutExpiresAt: Date,
+      verifiedAt: Date,
+    },
+    base,
+  ),
+);
+PaymentOrder.schema.index({ shopId: 1, idempotencyKey: 1 }, { unique: true });
+PaymentOrder.schema.index(
+  { shopId: 1, checkoutActive: 1 },
+  { unique: true, partialFilterExpression: { checkoutActive: true } },
+);
+PaymentOrder.schema.index({ shopId: 1, createdAt: -1, _id: -1 });
+PaymentOrder.schema.index({ gatewayOrderId: 1 }, { unique: true, sparse: true });
+
+export const PaymentTransaction = mongoose.model(
+  "PaymentTransaction",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      orderId: { type: Schema.Types.ObjectId, required: true },
+      provider: { type: String, enum: ["razorpay"], required: true },
+      gatewayPaymentId: { type: String, required: true },
+      gatewayOrderId: { type: String, required: true },
+      amountMinor: { type: Number, required: true },
+      currency: { type: String, required: true },
+      method: String,
+      status: { type: String, enum: ["captured", "failed", "refunded", "partially_refunded", "pending"], required: true },
+      verificationStatus: { type: String, enum: ["verified", "unverified"], required: true },
+      refundedAmountMinor: { type: Number, min: 0, default: 0 },
+      refundReferences: { type: [String], default: [] },
+      gatewayCreatedAt: Date,
+      verifiedAt: Date,
+    },
+    base,
+  ),
+);
+PaymentTransaction.schema.index({ gatewayPaymentId: 1 }, { unique: true });
+PaymentTransaction.schema.index({ shopId: 1, createdAt: -1, _id: -1 });
+
+export const SubscriptionAuditLog = mongoose.model(
+  "SubscriptionAuditLog",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      previousPlan: Schema.Types.Mixed,
+      newPlan: Schema.Types.Mixed,
+      eventType: { type: String, required: true },
+      referenceId: String,
+      actorType: { type: String, enum: ["shopkeeper", "system", "gateway"], required: true },
+      actorId: Schema.Types.ObjectId,
+      occurredAt: { type: Date, required: true },
+      metadata: Schema.Types.Mixed,
+    },
+    { ...base, immutable: true },
+  ),
+);
+SubscriptionAuditLog.schema.index({ shopId: 1, occurredAt: -1, _id: -1 });
+SubscriptionAuditLog.schema.index({ referenceId: 1, eventType: 1 }, { unique: true, sparse: true });
+
+export const SubscriptionNotificationLog = mongoose.model(
+  "SubscriptionNotificationLog",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      userId: Schema.Types.ObjectId,
+      subscriptionId: Schema.Types.ObjectId,
+      notificationType: { type: String, required: true },
+      scheduledAt: Date,
+      status: { type: String, enum: ["scheduled", "sent", "failed", "delivered"], default: "scheduled" },
+      deduplicationKey: { type: String, required: true },
+      sentAt: Date,
+    },
+    base,
+  ),
+);
+SubscriptionNotificationLog.schema.index({ shopId: 1, deduplicationKey: 1 }, { unique: true });
+
+export const SubscriptionNotificationPreference = mongoose.model(
+  "SubscriptionNotificationPreference",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true },
+      userId: Schema.Types.ObjectId,
+      deviceId: String,
+      expiryReminders: { type: Boolean, default: true },
+      paymentUpdates: { type: Boolean, default: true },
+    },
+    base,
+  ),
+);
+SubscriptionNotificationPreference.schema.index(
+  { shopId: 1, deviceId: 1 },
+  { unique: true, partialFilterExpression: { deviceId: { $type: "string" } } },
+);
+
+export const PaymentWebhookEvent = mongoose.model(
+  "PaymentWebhookEvent",
+  new Schema(
+    {
+      eventId: { type: String, required: true, unique: true },
+      eventType: { type: String, required: true },
+      processedAt: Date,
+      status: { type: String, enum: ["received", "processed", "failed"], default: "received" },
+    },
+    base,
+  ),
+);
+
+export const SubscriptionUsage = mongoose.model(
+  "SubscriptionUsage",
+  new Schema(
+    {
+      shopId: { type: Schema.Types.ObjectId, required: true, unique: true },
+      activeCustomers: { type: Number, required: true, min: 0, default: 0 },
+    },
+    base,
+  ),
+);
+
 export async function ensureIndexes() {
   for (const model of [
     User,
@@ -219,6 +417,15 @@ export async function ensureIndexes() {
     Session,
     Idempotency,
     ReminderDelivery,
+    SubscriptionPlan,
+    ShopSubscription,
+    PaymentOrder,
+    PaymentTransaction,
+    SubscriptionAuditLog,
+    SubscriptionNotificationLog,
+    SubscriptionNotificationPreference,
+    PaymentWebhookEvent,
+    SubscriptionUsage,
   ])
     await model.createIndexes();
 }

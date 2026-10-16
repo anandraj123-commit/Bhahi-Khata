@@ -1,18 +1,24 @@
 import "dotenv/config";
 import mongoose from "mongoose";
-import { env } from "./config/env.js";
+import { env, subscriptionConfig } from "./config/env.js";
 import { log, safeErrorContext } from "./config/logger.js";
-import { connectDatabase } from "./config/database.js";
+import { connectDatabase, databaseErrorContext } from "./config/database.js";
 import { createApp } from "./app.js";
 import { ensureIndexes } from "./models.js";
 import { startReminderWorker } from "./reminders.js";
+import { ensureSubscriptionPlans } from "./services/subscriptionService.js";
+import { startSubscriptionReminderWorker } from "./subscriptionReminders.js";
 
 try {
   await connectDatabase();
 } catch (error) {
-  log.fatal(safeErrorContext(error), "MongoDB connection failed; API was not started");
+  log.fatal(
+    { phase: "mongodb-connection", database: env.MONGODB_DB_NAME, ...databaseErrorContext(error) },
+    "MongoDB connection failed; API was not started",
+  );
   process.exit(1);
 }
+
 if (process.argv.includes("--indexes")) {
   try {
     await ensureIndexes();
@@ -25,6 +31,37 @@ if (process.argv.includes("--indexes")) {
     process.exit(1);
   }
 }
+
+if (process.argv.includes("--check-db")) {
+  log.info({ database: mongoose.connection.name }, "MongoDB connection check succeeded");
+  await mongoose.disconnect();
+  process.exit(0);
+}
+
+try {
+  await ensureSubscriptionPlans();
+} catch (error) {
+  log.fatal(
+    { phase: "subscription-plan-initialization", database: env.MONGODB_DB_NAME, ...safeErrorContext(error) },
+    "Subscription plan initialization failed; API was not started",
+  );
+  await mongoose.disconnect().catch(() => {});
+  process.exit(1);
+}
+
+if (subscriptionConfig.checkoutEnabled) {
+  try {
+    await ensureIndexes();
+  } catch (error) {
+    log.fatal(
+      { phase: "index-initialization", database: env.MONGODB_DB_NAME, ...safeErrorContext(error) },
+      "MongoDB index initialization failed; API was not started",
+    );
+    await mongoose.disconnect().catch(() => {});
+    process.exit(1);
+  }
+}
+
 if (env.NODE_ENV !== "production" && env.DEV_OTP_ENABLED !== "true")
   log.warn("Development OTP disabled; configure Twilio Verify");
 const app = createApp();
@@ -40,6 +77,7 @@ server.on("error", (error) => {
     .finally(() => process.exit(1));
 });
 startReminderWorker(log);
+startSubscriptionReminderWorker(log);
 async function shutdown(signal) {
   log.info({ signal }, "shutting down");
   server.close(async () => {

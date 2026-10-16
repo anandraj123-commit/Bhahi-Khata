@@ -4,6 +4,11 @@ import { paise } from "../utils/money.js";
 import { customerOut } from "../utils/serializers.js";
 import { sameCustomerValues } from "../utils/records.js";
 import { saveAudit } from "./auditService.js";
+import {
+  ensureCustomerUsage,
+  releaseCustomerCapacity,
+  reserveCustomerCapacity,
+} from "./subscriptionService.js";
 
 export async function listCustomers({ shopId, query, cursorId, limit }) {
   const filter = { shopId, deletedAt: { $exists: false } };
@@ -34,6 +39,7 @@ export async function listCustomers({ shopId, query, cursorId, limit }) {
 }
 
 export async function createCustomer({ shopId, actorId, customer, audit }) {
+  await ensureCustomerUsage(shopId);
   const session = await mongoose.startSession();
   let doc;
   try {
@@ -48,6 +54,7 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
             status: 409,
           });
       } else {
+        await reserveCustomerCapacity({ shopId, session });
         doc = await Customer.findOneAndUpdate(
             { shopId, clientId: customer.id },
           {
@@ -118,6 +125,7 @@ export async function updateCustomer({ shopId, actorId, customer, base, audit })
 }
 
 export async function deleteCustomer({ shopId, id, base }) {
+  await ensureCustomerUsage(shopId);
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
@@ -133,6 +141,7 @@ export async function deleteCustomer({ shopId, id, base }) {
         });
       customer.deletedAt = new Date();
       await customer.save({ session });
+      await releaseCustomerCapacity({ shopId, session });
     });
   } finally {
     await session.endSession();

@@ -12,6 +12,8 @@ import notificationsRoutes from "./notificationsRoutes.js";
 import devicesRoutes from "./devicesRoutes.js";
 import messagesRoutes from "./messagesRoutes.js";
 import accountRoutes from "./accountRoutes.js";
+import subscriptionRoutes from "./subscriptionRoutes.js";
+import paymentRoutes from "./paymentRoutes.js";
 import { error } from "../utils/http.js";
 
 const router = express.Router();
@@ -28,6 +30,8 @@ router.use(notificationsRoutes);
 router.use(devicesRoutes);
 router.use(messagesRoutes);
 router.use(accountRoutes);
+router.use(subscriptionRoutes);
+router.use(paymentRoutes);
 router.use((req, res) => error(res, 404, "API route not found"));
 
 export default router;
