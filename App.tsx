@@ -7,6 +7,7 @@ import {
   BackHandler,
   KeyboardAvoidingView,
   Linking,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -65,6 +66,7 @@ import {
 import { synchronizeAccount, synchronizePendingOnly } from "./src/offlineSync";
 import {
   checkConnectivity,
+  connectivityBuildInfo,
   currentConnectivity,
   currentConnectivityDetails,
   observeConnectivity,
@@ -277,6 +279,7 @@ function AppContent() {
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
   const [otpHint, setOtpHint] = useState("");
+  const [otpVerified, setOtpVerified] = useState(false);
   const [notices, setNotices] = useState<{id:string;title:string;body:string;read:boolean;date:string}[]>([]);
   const [seconds, setSeconds] = useState(30);
   const [busy, setBusy] = useState(false);
@@ -286,6 +289,20 @@ function AppContent() {
     conflicts: number;
   } | null>(null);
   const [connectivityStatus, setConnectivityStatus] = useState<ConnectivityStatus>("checking");
+  const [networkDiagnosticsVisible, setNetworkDiagnosticsVisible] = useState(false);
+  const [networkDiagnosticsRetrying, setNetworkDiagnosticsRetrying] = useState(false);
+  const [, setNetworkDiagnosticsRevision] = useState(0);
+  const networkDiagnostics = currentConnectivityDetails();
+  const networkBuildInfo = connectivityBuildInfo();
+  const retryNetworkDiagnostics = async () => {
+    setNetworkDiagnosticsRetrying(true);
+    try {
+      await checkConnectivity(true);
+    } finally {
+      setNetworkDiagnosticsRevision((revision) => revision + 1);
+      setNetworkDiagnosticsRetrying(false);
+    }
+  };
   const lock = useRef(false);
   const syncNotice = useRef<string | null>(null);
   const [faq, setFaq] = useState("");
@@ -441,7 +458,7 @@ function AppContent() {
             setData(cached);
             dataRef.current = cached;
             persistedRef.current = cached;
-            setRoute({ screen: cached.shop.name ? "home" : "setup" });
+            setRoute({ screen: (cached.shopComplete ?? Boolean(cached.shop.name.trim() && cached.shop.owner.trim())) ? "home" : "setup" });
           } else if (live) {
             setRoute({ screen: "login" });
             Alert.alert(
@@ -457,7 +474,7 @@ function AppContent() {
         if (live && remote) {
           let parsed = api.normalizeData(remote);
           if (!validBackup(parsed)) throw new Error("Invalid server data");
-          const id = accountKey(parsed.shop.phone);
+          const id = parsed.shopExists ? accountKey(parsed.shop.phone) : "";
           offlineAccountRef.current = id || null;
           if (id && offlineStorageAvailable()) {
             try {
@@ -497,7 +514,7 @@ function AppContent() {
           setData(parsed);
           dataRef.current = parsed;
           persistedRef.current = parsed;
-          setRoute({ screen: parsed.shop.name ? "home" : "setup" });
+          setRoute({ screen: parsed.shopComplete ? "home" : "setup" });
         } else if (live) {
           const offlineSession = await readOfflineSession();
           const cached = offlineSession
@@ -508,7 +525,7 @@ function AppContent() {
             setData(cached);
             dataRef.current = cached;
             persistedRef.current = cached;
-            setRoute({ screen: cached.shop.name ? "home" : "setup" });
+            setRoute({ screen: (cached.shopComplete ?? Boolean(cached.shop.name.trim() && cached.shop.owner.trim())) ? "home" : "setup" });
           } else {
             const connectivity = await checkConnectivity();
             if (connectivity !== "online") {
@@ -542,7 +559,7 @@ function AppContent() {
             setData(cached);
             dataRef.current = cached;
             persistedRef.current = cached;
-            setRoute({ screen: cached.shop.name ? "home" : "setup" });
+            setRoute({ screen: (cached.shopComplete ?? Boolean(cached.shop.name.trim() && cached.shop.owner.trim())) ? "home" : "setup" });
           } else {
             setRoute({ screen: "login" });
             if (isOfflineError(error) && currentConnectivity() === "offline")
@@ -574,7 +591,7 @@ function AppContent() {
     };
   }, []);
   useEffect(() => {
-    if (!data.signedIn) return;
+    if (!data.signedIn || data.shopExists === false) return;
     if (isExpoGo) return;
     let live = true;
     (async () => {
@@ -596,7 +613,7 @@ function AppContent() {
       }
     })();
     return () => { live = false; };
-  }, [data.signedIn]);
+  }, [data.signedIn, data.shopExists]);
   useEffect(() => observeConnectivity(setConnectivityStatus), []);
   useEffect(() => {
     const id = offlineAccountRef.current;
@@ -679,7 +696,7 @@ function AppContent() {
     }
   }, [data.signedIn, data.shop.phone]);
   useEffect(() => {
-    if (!data.signedIn) return;
+    if (!data.signedIn || data.shopExists === false) return;
     let live = true;
     let subscription: { remove: () => void } | undefined;
     (async () => {
@@ -703,9 +720,9 @@ function AppContent() {
       live = false;
       subscription?.remove();
     };
-  }, [data.signedIn]);
+  }, [data.signedIn, data.shopExists]);
   useEffect(() => {
-    if (route.screen !== "notifications" || !data.signedIn) return;
+    if (route.screen !== "notifications" || !data.signedIn || data.shopExists === false) return;
     api
       .getNotifications()
       .then((result) => setNotices(result.items))
@@ -715,14 +732,14 @@ function AppContent() {
           "Check your connection and open Notifications again to retry.",
         ),
       );
-  }, [route.screen, data.signedIn]);
+  }, [route.screen, data.signedIn, data.shopExists]);
   useEffect(() => {
     if (route.screen !== "otp" || seconds <= 0) return;
     const t = setTimeout(() => setSeconds(seconds - 1), 1000);
     return () => clearTimeout(t);
   }, [route.screen, seconds]);
   const back = () => {
-    if (route.screen === "setup" && data.signedIn && !data.shop.name) {
+    if (route.screen === "setup" && data.signedIn && data.shopExists === false) {
       setRoute({ screen: "login" });
       setHistory([{ screen: "welcome" }]);
       setSearch("");
@@ -732,7 +749,7 @@ function AppContent() {
       setHistory(history.slice(0, -1));
       setSearch("");
       setFilter("All");
-    } else if (data.signedIn && route.screen !== "home" && data.shop.name) {
+    } else if (data.signedIn && route.screen !== "home" && data.shopComplete) {
       setRoute({ screen: "home" });
     } else return false;
     return true;
@@ -826,6 +843,61 @@ function AppContent() {
     setBusy(true);
     try {
       if (await commit(next)) done();
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
+  }
+  async function completeShopSetup() {
+    if (lock.current) return;
+    if (!form.name?.trim() || !form.owner?.trim())
+      return Alert.alert("Required fields", "Enter the shop and owner names.");
+    if (form.whatsapp && !phoneValid(form.whatsapp))
+      return Alert.alert("Invalid WhatsApp number", "Enter a valid 10-digit mobile number.");
+    const connectivity = await checkConnectivity(true);
+    if (connectivity !== "online")
+      return Alert.alert(
+        connectivity === "offline" ? "You’re offline" : "Server unavailable",
+        "Shop registration requires a connection to verify and create your shop safely.",
+      );
+    lock.current = true;
+    setBusy(true);
+    try {
+      const registered = api.normalizeData(await api.registerShop({
+        name: form.name.trim(),
+        owner: form.owner.trim(),
+        address: String(form.address || "").trim(),
+        whatsapp: String(form.whatsapp || "").trim(),
+        language: data.language,
+      }));
+      if (!registered.shopExists)
+        throw new Error("Shop registration could not be confirmed. Please retry.");
+      const accountId = accountKey(registered.shop.phone);
+      offlineAccountRef.current = offlineStorageAvailable() ? accountId : null;
+      dataRef.current = registered;
+      persistedRef.current = registered;
+      setData(registered);
+      if (offlineAccountRef.current) {
+        try { await cacheAuthenticatedAccount(accountId, registered); }
+        catch {
+          offlineAccountRef.current = null;
+          Alert.alert("Offline data unavailable", "Your shop is registered, but encrypted offline storage could not be updated on this device.");
+        }
+      }
+      setHistory([]);
+      if (registered.shopComplete) setRoute({ screen: "home" });
+      else {
+        setForm({
+          name: registered.shop.name,
+          owner: registered.shop.owner,
+          address: registered.shop.address,
+          phone: registered.shop.phone,
+          whatsapp: registered.shop.whatsapp,
+        });
+        setRoute({ screen: "setup" });
+      }
+    } catch (error) {
+      Alert.alert("Unable to set up your shop", errorMessage(error, "No shop was created. Check your connection and try again."));
     } finally {
       lock.current = false;
       setBusy(false);
@@ -1714,6 +1786,7 @@ function AppContent() {
               try {
                 const result = await api.startOtp(`+91${phone}`);
                 setOtp("");
+                setOtpVerified(false);
                 setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A verification code was sent by SMS.");
                 setSeconds(30);
                 go("otp");
@@ -1727,6 +1800,17 @@ function AppContent() {
               We’ll send a one-time verification code to your mobile number.
             </Hint>
           </Card>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Network Diagnostics"
+            onPress={() => {
+              setNetworkDiagnosticsRevision((revision) => revision + 1);
+              setNetworkDiagnosticsVisible(true);
+            }}
+            style={{ paddingVertical: 8, alignItems: "center" }}
+          >
+            <Text style={s.link}>Network Diagnostics</Text>
+          </Pressable>
         </>
       );
       break;
@@ -1752,6 +1836,7 @@ function AppContent() {
               setSeconds(30);
               try {
                 const result = await api.startOtp(`+91${phone}`);
+                setOtpVerified(false);
                 setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A new verification code was sent by SMS.");
               } catch (error) { showOtpError("Could not resend OTP", error, "Please try again."); }
             }}
@@ -1763,7 +1848,7 @@ function AppContent() {
             </Text>
           </Pressable>
           <Button
-            title="Verify"
+            title={otpVerified ? "Continue" : "Verify"}
             disabled={busy}
             onPress={async () => {
               if (!/^\d{4,8}$/.test(otp)) return Alert.alert("Invalid code", "Enter the verification code sent to your phone.");
@@ -1772,9 +1857,27 @@ function AppContent() {
                 return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setBusy(true);
               try {
-                let remote = api.normalizeData(await api.verifyOtp(`+91${phone}`, otp));
-                const id = accountKey(remote.shop.phone || `+91${phone}`);
-                offlineAccountRef.current = offlineStorageAvailable() ? id : null;
+                let remote: Data;
+                if (otpVerified) {
+                  remote = api.normalizeData(await api.loadAccount());
+                } else {
+                  try {
+                    remote = api.normalizeData(await api.verifyOtp(`+91${phone}`, otp));
+                  } catch (error) {
+                    if (error instanceof api.OtpVerifiedAccountLoadError) {
+                      setOtpVerified(true);
+                      showOtpError(
+                        "OTP verified, but account details could not be loaded",
+                        error.cause,
+                        "Your sign-in is saved. Check your connection and tap Continue to retry.",
+                      );
+                      return;
+                    }
+                    throw error;
+                  }
+                }
+                const id = remote.shopExists ? accountKey(remote.shop.phone || `+91${phone}`) : "";
+                offlineAccountRef.current = id && offlineStorageAvailable() ? id : null;
                 if (id && offlineStorageAvailable()) {
                   try {
                     remote = (await synchronizePendingOnly(id)) || remote;
@@ -1788,16 +1891,17 @@ function AppContent() {
                 dataRef.current = remote;
                 setData(remote);
                 persistedRef.current = remote;
-                if (remote.shop.name) go("home", undefined, true);
+                setOtpVerified(false);
+                if (remote.shopComplete) go("home", undefined, true);
                 else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ name: remote.shop.name, owner: remote.shop.owner, address: remote.shop.address, phone, whatsapp: remote.shop.whatsapp }); }
-              } catch (error) { showOtpError("Could not verify OTP", error, "Check the code and try again."); }
+              } catch (error) { showOtpError(otpVerified ? "Could not load your account" : "Could not verify OTP", error, "Check your connection and try again."); }
               finally { setBusy(false); }
             }}
           />
           <Button
             title="Change mobile number"
             secondary
-            onPress={() => go("login")}
+            onPress={() => { setOtpVerified(false); go("login"); }}
           />
         </>
       );
@@ -1805,6 +1909,9 @@ function AppContent() {
     case "setup":
       content = (
         <>
+          {data.shopExists === false && (
+            <Hint>Complete your shop setup to start using Digital-Khata.</Hint>
+          )}
           {field("Shop Name *", "name", {
             placeholder: "Sharma General Store",
           })}
@@ -1819,10 +1926,16 @@ function AppContent() {
           <Chips
             items={["English", "हिन्दी"]}
             value={data.language}
-            onChange={(language) => commit({ ...data, language })}
+            onChange={(language) => {
+              if (data.shopExists === false) {
+                const next = { ...data, language };
+                dataRef.current = next;
+                setData(next);
+              } else void commit({ ...data, language });
+            }}
           />
           <Button
-            title={data.shop.name ? "Save Profile" : "Start Using Khata"}
+            title={data.shopExists !== false ? "Save Profile" : "Start Using Khata"}
             disabled={busy}
             onPress={() => {
               if (!form.name?.trim() || !form.owner?.trim())
@@ -1835,9 +1948,15 @@ function AppContent() {
                   "Invalid WhatsApp number",
                   "Enter a valid 10-digit mobile number.",
                 );
+              if (data.shopExists === false) {
+                void completeShopSetup();
+                return;
+              }
               save(
                 {
                   ...data,
+                  shopExists: true,
+                  shopComplete: true,
                   shop: {
                     name: form.name.trim(),
                     owner: form.owner.trim(),
@@ -3162,6 +3281,55 @@ function AppContent() {
             ))}
           </View>
         )}
+        <Modal
+          visible={networkDiagnosticsVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setNetworkDiagnosticsVisible(false)}
+        >
+          <View
+            style={{
+              flex: 1,
+              justifyContent: "center",
+              padding: 20,
+              backgroundColor: "rgba(0,0,0,0.42)",
+            }}
+          >
+            <Card style={{ maxHeight: "86%" }}>
+              <Text style={s.heading}>Network Diagnostics</Text>
+              <ScrollView
+                style={{ marginVertical: 10 }}
+                keyboardShouldPersistTaps="handled"
+              >
+                <Hint>{`App mode: ${networkBuildInfo.appMode}`}</Hint>
+                <Hint>{`Build profile: ${networkBuildInfo.buildProfile}`}</Hint>
+                <Hint>{`Configured API base URL: ${networkDiagnostics.apiBaseUrl || "Unavailable"}`}</Hint>
+                <Hint>{`Health-check URL: ${networkDiagnostics.healthUrl || "Unavailable"}`}</Hint>
+                <Hint>{`Network type: ${networkDiagnostics.networkType}`}</Hint>
+                <Hint>{`Device network connection: ${networkDiagnostics.networkConnected === null ? "Unknown" : networkDiagnostics.networkConnected ? "Connected" : "Disconnected"}`}</Hint>
+                <Hint>{`Backend reachability: ${connectivityStatus === "online" ? "Healthy" : connectivityStatus === "offline" ? "Not checked (offline)" : connectivityStatus === "server_unavailable" ? "Unavailable or unhealthy" : "Checking"}`}</Hint>
+                <Hint>{`Last health-check HTTP status: ${networkDiagnostics.healthHttpStatus ?? "Not received"}`}</Hint>
+                <Hint>{`Last request duration: ${networkDiagnostics.healthDurationMs === null ? "Not available" : `${networkDiagnostics.healthDurationMs} ms`}`}</Hint>
+                <Hint>{`Last network error category: ${networkDiagnostics.healthErrorCategory || "None"}`}</Hint>
+                {!!networkDiagnostics.healthErrorDetail && (
+                  <Hint>{`Diagnostic detail: ${networkDiagnostics.healthErrorDetail}`}</Hint>
+                )}
+                <Hint>{`Last successful connection: ${networkDiagnostics.lastSuccessfulConnectionAt ? new Date(networkDiagnostics.lastSuccessfulConnectionAt).toLocaleString() : "None in this app session"}`}</Hint>
+                <Hint>{`Cleartext HTTP: ${networkBuildInfo.cleartextHttpPermitted === null ? "Unknown" : networkBuildInfo.cleartextHttpPermitted ? "Permitted by build configuration" : "Disabled by build configuration"}`}</Hint>
+              </ScrollView>
+              <Button
+                title={networkDiagnosticsRetrying ? "Checking…" : "Retry Connection"}
+                disabled={networkDiagnosticsRetrying}
+                onPress={() => void retryNetworkDiagnostics()}
+              />
+              <Button
+                title="Close"
+                secondary
+                onPress={() => setNetworkDiagnosticsVisible(false)}
+              />
+            </Card>
+          </View>
+        </Modal>
       </SafeAreaView>
     </LanguageContext.Provider>
   );

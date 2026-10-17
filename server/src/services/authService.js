@@ -5,10 +5,7 @@ import { jwtKey } from "../config/env.js";
 import { digest } from "../utils/hashing.js";
 
 export async function signAccess(user) {
-  return new SignJWT({
-    sid: String(user.shopId),
-    ver: user.sessionVersion || 0,
-  })
+  return new SignJWT({ ver: user.sessionVersion || 0 })
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(String(user._id))
     .setIssuer("digital-khata-api")

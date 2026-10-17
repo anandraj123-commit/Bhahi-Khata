@@ -98,11 +98,14 @@ export const backupSchema = z
   .strict();
 export const shopSchema = z
   .object({
-    name: z.string().trim().max(120),
-    owner: z.string().trim().max(120),
+    name: z.string().trim().min(1).max(120),
+    owner: z.string().trim().min(1).max(120),
     address: z.string().max(500),
     phone: phoneSchema,
-    whatsapp: z.string().max(20),
+    whatsapp: z.string().trim().max(20).refine(
+      (value) => !value || /^[6-9]\d{9}$/.test(value) || /^\+[1-9]\d{7,14}$/.test(value),
+      "Enter a valid WhatsApp number",
+    ),
     language: z.string().max(20).optional(),
     defaultMethod: z.string().max(50).optional(),
     reminders: z
@@ -117,6 +120,16 @@ export const shopSchema = z
       .optional(),
   })
   .strict();
+export const shopRegistrationSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  owner: z.string().trim().min(1).max(120),
+  address: z.string().trim().max(500).default(""),
+  whatsapp: z.string().trim().max(20).refine(
+    (value) => !value || /^[6-9]\d{9}$/.test(value) || /^\+[1-9]\d{7,14}$/.test(value),
+    "Enter a valid WhatsApp number",
+  ).default(""),
+  language: z.string().trim().max(20).optional(),
+}).strict();
 export const shopConflictSchema = z.object({
   resolutionId: idSchema,
   expectedVersion: z.number().int().min(1),

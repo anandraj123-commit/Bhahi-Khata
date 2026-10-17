@@ -7,7 +7,9 @@ export const User = mongoose.model(
   new Schema(
     {
       phone: { type: String, required: true, unique: true, index: true },
-      shopId: { type: Schema.Types.ObjectId, required: true, index: true },
+      // An account is created after OTP verification; shop registration is a
+      // separate explicit operation, so incomplete accounts have no shopId.
+      shopId: { type: Schema.Types.ObjectId, index: true },
       disabledAt: Date,
       sessionVersion: { type: Number, default: 0 },
     },
@@ -22,7 +24,7 @@ export const Shop = mongoose.model(
       name: { type: String, default: "", maxlength: 120 },
       owner: { type: String, default: "", maxlength: 120 },
       address: { type: String, default: "", maxlength: 500 },
-      phone: { type: String, required: true },
+      phone: { type: String, required: true, unique: true, index: true },
       whatsapp: { type: String, default: "" },
       language: { type: String, default: "English" },
       defaultMethod: { type: String, default: "Cash" },

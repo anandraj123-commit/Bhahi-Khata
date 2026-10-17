@@ -1,8 +1,9 @@
-import { shopConflictSchema, shopSchema } from "../validators/schemas.js";
+import { shopConflictSchema, shopRegistrationSchema, shopSchema } from "../validators/schemas.js";
 import { shopOut } from "../utils/serializers.js";
 import { error } from "../utils/http.js";
-import { getShop, resolveShopConflict, updateShop } from "../services/shopService.js";
+import { getShop, registerShop, resolveShopConflict, updateShop } from "../services/shopService.js";
 import { digest } from "../utils/hashing.js";
+import { normalizePhone } from "../utils/phone.js";
 import { z } from "zod";
 
 export const handle_get_shop = async (req, res, next) => {
@@ -10,6 +11,21 @@ export const handle_get_shop = async (req, res, next) => {
     const s = await getShop(req.shopId);
     res.json(shopOut(s));
   } catch (e) {
+    next(e);
+  }
+};
+
+export const handle_post_shop_register = async (req, res, next) => {
+  const parsed = shopRegistrationSchema.safeParse(req.body || {});
+  if (!parsed.success) return error(res, 400, "Enter valid shop and owner names");
+  try {
+    const result = await registerShop({ userId: req.user._id, input: parsed.data });
+    res.status(result.created ? 201 : 200).json({
+      shop: shopOut(result.shop),
+      created: result.created,
+    });
+  } catch (e) {
+    if (e.status === 409 || e.status === 401) return error(res, e.status, e.message);
     next(e);
   }
 };
@@ -27,7 +43,7 @@ export const handle_patch_shop = async (req, res, next) => {
     const base = hasBaseSettings ? shopSchema.safeParse(baseSettings) : null;
     if (hasBaseSettings && !base?.success)
       return error(res, 400, "Invalid shop settings version");
-    if (parsed.data.phone !== req.user.phone)
+    if (normalizePhone(parsed.data.phone) !== normalizePhone(req.user.phone))
       return error(
         res,
         403,

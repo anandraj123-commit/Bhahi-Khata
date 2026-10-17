@@ -1,11 +1,86 @@
 import mongoose from "mongoose";
-import { Audit, Idempotency, Shop } from "../models.js";
+import {
+  Audit, Customer, Device, Entry, FinancialResolution, Idempotency, Notification,
+  PaymentOrder, PaymentTransaction, ReminderDelivery, Shop, ShopSubscription,
+  SubscriptionAuditLog, SubscriptionNotificationLog,
+  SubscriptionNotificationPreference, SubscriptionUsage, User,
+} from "../models.js";
 import { digest } from "../utils/hashing.js";
 import { shopOut } from "../utils/serializers.js";
 import { sameShopValues } from "../utils/records.js";
+import { normalizePhone } from "../utils/phone.js";
+
+const shopScopedModels = [
+  Customer, Entry, Audit, FinancialResolution, Notification, Device, Idempotency,
+  ReminderDelivery, ShopSubscription, PaymentOrder, PaymentTransaction,
+  SubscriptionAuditLog, SubscriptionNotificationLog,
+  SubscriptionNotificationPreference, SubscriptionUsage,
+];
+
+export async function hasShopScopedData(shopId, session) {
+  if (!shopId) return false;
+  const counts = await Promise.all(shopScopedModels.map((Model) => {
+    let query = Model.countDocuments({ shopId }).limit(1);
+    if (session) query = query.session(session);
+    return query;
+  }));
+  return counts.some((count) => count > 0);
+}
 
 export async function getShop(shopId) {
   return Shop.findById(shopId).lean();
+}
+
+export async function registerShop({ userId, input }) {
+  const session = await mongoose.startSession();
+  let result;
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findOne({ _id: userId, disabledAt: { $exists: false } }).session(session);
+      if (!user) throw Object.assign(new Error("Account unavailable"), { status: 401 });
+      const linkedShop = user.shopId ? await Shop.findById(user.shopId).session(session) : null;
+      if (linkedShop && String(linkedShop.ownerId) !== String(user._id))
+        throw Object.assign(new Error("Account and shop registration need support review"), { status: 409, code: "ACCOUNT_SHOP_LINK_CONFLICT" });
+      if (user.shopId && !linkedShop && await hasShopScopedData(user.shopId, session))
+        throw Object.assign(new Error("Existing shop data needs support recovery before registration"), { status: 409, code: "ACCOUNT_SHOP_LINK_CONFLICT" });
+      const owned = await Shop.findOne({ ownerId: user._id }).session(session);
+      if (owned) {
+        if (String(user.shopId || "") !== String(owned._id) || normalizePhone(owned.phone) !== normalizePhone(user.phone))
+          throw Object.assign(new Error("Account and shop registration need support review"), { status: 409, code: "ACCOUNT_SHOP_LINK_CONFLICT" });
+        result = { shop: owned, created: false };
+        return;
+      }
+      const phoneMatch = await Shop.findOne({ phone: normalizePhone(user.phone) }).session(session);
+      if (phoneMatch)
+        throw Object.assign(new Error("A shop is already registered with this mobile number"), { status: 409, code: "SHOP_PHONE_ALREADY_REGISTERED" });
+      if (!normalizePhone(user.phone))
+        throw Object.assign(new Error("Account mobile number is invalid; contact support"), { status: 409, code: "ACCOUNT_PHONE_INVALID" });
+      const [shop] = await Shop.create([{
+        ownerId: user._id,
+        name: input.name,
+        owner: input.owner,
+        address: input.address || "",
+        phone: normalizePhone(user.phone),
+        whatsapp: input.whatsapp || "",
+        ...(input.language ? { language: input.language } : {}),
+      }], { session });
+      user.shopId = shop._id;
+      await user.save({ session });
+      result = { shop, created: true };
+    });
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+    const [user, owned] = await Promise.all([
+      User.findById(userId).lean(),
+      Shop.findOne({ ownerId: userId }).lean(),
+    ]);
+    if (user && owned && String(user.shopId || "") === String(owned._id) && normalizePhone(owned.phone) === normalizePhone(user.phone))
+      return { shop: owned, created: false };
+    throw Object.assign(new Error("A shop is already registered with this mobile number"), { status: 409, code: "SHOP_PHONE_ALREADY_REGISTERED" });
+  } finally {
+    await session.endSession();
+  }
+  return result;
 }
 
 export async function updateShop({ shopId, input, base, baseVersion, baseResolutionVersion }) {

@@ -8,25 +8,114 @@ import type { PendingConflict, PendingSettingsConflict } from "./offlineStore";
 import { createSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
 import type { SubscriptionSnapshot } from "./subscription";
 
-const BASE = (
-  process.env.EXPO_PUBLIC_API_URL || "http://10.0.2.2:4000/api/v1"
-).replace(/\/$/, "");
+const configuredBase = process.env.EXPO_PUBLIC_API_URL || "http://10.0.2.2:4000/api/v1";
+export const API_BASE_URL = `${configuredBase.trim().replace(/\/+$/, "").replace(/(?:\/api\/v1)+$/i, "")}/api/v1`;
+export const HEALTH_CHECK_URL = `${API_BASE_URL}/health`;
+
+export type BackendProbeResult = {
+  apiBaseUrl: string;
+  healthUrl: string;
+  transportReachable: boolean;
+  healthy: boolean;
+  httpStatus: number | null;
+  errorCategory:
+    | "none"
+    | "http_error"
+    | "invalid_health_response"
+    | "invalid_url"
+    | "timeout"
+    | "cleartext_blocked"
+    | "network";
+  errorDetail: string | null;
+  durationMs: number;
+};
+
+function safeDiagnosticUrl(value: string) {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return "Invalid URL";
+  }
+}
 
 /** Lightweight unauthenticated probe; it checks the configured API, not public internet. */
-export async function probeBackendReachability(): Promise<boolean> {
+export async function probeBackendReachability(): Promise<BackendProbeResult> {
+  const healthUrl = HEALTH_CHECK_URL;
+  const startedAt = Date.now();
+  const diagnosticBaseUrl = safeDiagnosticUrl(API_BASE_URL);
+  const diagnosticHealthUrl = safeDiagnosticUrl(healthUrl);
+  try {
+    const parsed = new URL(healthUrl);
+    if (!/^https?:$/.test(parsed.protocol)) throw new Error("Unsupported URL scheme");
+  } catch {
+    return {
+      apiBaseUrl: diagnosticBaseUrl,
+      healthUrl: diagnosticHealthUrl,
+      transportReachable: false,
+      healthy: false,
+      httpStatus: null,
+      errorCategory: "invalid_url",
+      errorDetail: "The configured API address is not a valid HTTP or HTTPS URL.",
+      durationMs: Date.now() - startedAt,
+    };
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3500);
   try {
-    const response = await fetch(`${BASE}/health`, {
+    const response = await fetch(healthUrl, {
       method: "GET",
       headers: { Accept: "application/json", "Cache-Control": "no-cache" },
       signal: controller.signal,
     });
-    if (!response.ok) return false;
+    if (!response.ok)
+      return {
+        apiBaseUrl: diagnosticBaseUrl,
+        healthUrl: diagnosticHealthUrl,
+        transportReachable: true,
+        healthy: false,
+        httpStatus: response.status,
+        errorCategory: "http_error",
+        errorDetail: `Health endpoint returned HTTP ${response.status}.`,
+        durationMs: Date.now() - startedAt,
+      };
     const result = await response.json().catch(() => null);
-    return result?.status === "ok";
-  } catch {
-    return false;
+    const healthy = result?.status === "ok";
+    return {
+      apiBaseUrl: diagnosticBaseUrl,
+      healthUrl: diagnosticHealthUrl,
+      transportReachable: true,
+      healthy,
+      httpStatus: response.status,
+      errorCategory: healthy ? "none" : "invalid_health_response",
+      errorDetail: healthy ? null : "The endpoint did not return the expected healthy status.",
+      durationMs: Date.now() - startedAt,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Network request failed.";
+    const safeMessage = message
+      .replace(/[\r\n\t]+/g, " ")
+      .replace(/https?:\/\/\S+/gi, "[URL]")
+      .replace(/(authorization|bearer|token|password|secret)[^,; ]*/gi, "$1=[redacted]")
+      .slice(0, 180);
+    return {
+      apiBaseUrl: diagnosticBaseUrl,
+      healthUrl: diagnosticHealthUrl,
+      transportReachable: false,
+      healthy: false,
+      httpStatus: null,
+      errorCategory: controller.signal.aborted
+        ? "timeout"
+        : /cleartext.*not permitted|cleartext traffic.*not permitted/i.test(message)
+          ? "cleartext_blocked"
+          : "network",
+      errorDetail: safeMessage,
+      durationMs: Date.now() - startedAt,
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -58,6 +147,16 @@ export class ApiTransportError extends Error {
   }
 }
 
+/** OTP may be accepted and the session stored even if the following account
+ * bootstrap fails. Keep that stage distinct so callers do not ask users to
+ * repeat a successfully verified, potentially single-use OTP. */
+export class OtpVerifiedAccountLoadError extends Error {
+  constructor(readonly cause: unknown) {
+    super("OTP was verified, but account details could not be loaded");
+    this.name = "OtpVerifiedAccountLoadError";
+  }
+}
+
 async function request(
   path: string,
   options: RequestInit = {},
@@ -68,7 +167,7 @@ async function request(
   const timeout = setTimeout(() => controller.abort(), 20_000);
   let response: Response;
   try {
-    response = await fetch(`${BASE}${path}`, {
+    response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
       signal: controller.signal,
       headers: {
@@ -111,7 +210,7 @@ async function refresh(): Promise<RefreshOutcome> {
       const timeout = setTimeout(() => controller.abort(), 20_000);
       let response: Response;
         try {
-          response = await fetch(`${BASE}/auth/refresh`, {
+          response = await fetch(`${API_BASE_URL}/auth/refresh`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ refreshToken }),
@@ -175,6 +274,8 @@ export async function restoreSession(): Promise<Data | null> {
 }
 export async function loadAccount(): Promise<Data> {
   const base = (await request("/bootstrap")) as Data;
+  if (base.shopExists === false)
+    return normalizeData({ ...base, customers: [], entries: [], audit: [] });
   const pages = async <T>(path: string): Promise<T[]> => {
     const rows: T[] = [];
     let cursor = "";
@@ -202,6 +303,8 @@ export async function loadAccount(): Promise<Data> {
 export function normalizeData(value: Data): Data {
   return {
     ...value,
+    shopExists: value.shopExists ?? true,
+    shopComplete: value.shopComplete ?? Boolean(value.shop.name.trim() && value.shop.owner.trim()),
     shop: { ...value.shop, phone: value.shop.phone.replace(/^\+91/, "") },
   };
 }
@@ -219,6 +322,20 @@ export async function verifyOtp(phone: string, code: string): Promise<Data> {
     false,
   );
   await storeTokens(tokens);
+  try {
+    return await loadAccount();
+  } catch (cause) {
+    throw new OtpVerifiedAccountLoadError(cause);
+  }
+}
+export async function registerShop(input: {
+  name: string;
+  owner: string;
+  address: string;
+  whatsapp: string;
+  language: string;
+}): Promise<Data> {
+  await request("/shop/register", { method: "POST", body: JSON.stringify(input) });
   return loadAccount();
 }
 export async function logout() {

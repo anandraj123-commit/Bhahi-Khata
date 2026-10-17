@@ -206,6 +206,8 @@ async function openDatabase() {
 function preferencesOf(data: Data) {
   return {
     signedIn: data.signedIn,
+    shopExists: data.shopExists ?? true,
+    shopComplete: data.shopComplete ?? Boolean(data.shop.name.trim() && data.shop.owner.trim()),
     language: data.language,
     reminders: data.reminders,
     defaultMethod: data.defaultMethod,

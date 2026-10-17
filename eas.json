@@ -1,11 +1,18 @@
 {
   "build": {
     "preview": {
+      "environment": "preview",
       "distribution": "internal",
+      "env": {
+        "APP_MODE": "development",
+        "EXPO_PUBLIC_API_URL": "http://192.168.29.139:4000/api/v1",
+        "EXPO_PUBLIC_CONNECTIVITY_DIAGNOSTICS": "true"
+      },
       "android": { "buildType": "apk" }
     },
     "production": {
-      "env": { "NODE_ENV": "production" },
+      "environment": "production",
+      "env": { "APP_MODE": "production", "NODE_ENV": "production" },
       "android": { "buildType": "app-bundle" }
     }
   }

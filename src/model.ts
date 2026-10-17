@@ -54,6 +54,10 @@ export type Audit = {
 };
 export type Data = {
   shop: Shop;
+  /** True only when the authenticated account owns a persisted Shop document. */
+  shopExists?: boolean;
+  /** True when required display fields are present; legacy blank profiles remain editable. */
+  shopComplete?: boolean;
   customers: Customer[];
   entries: Entry[];
   audit: Audit[];
@@ -76,6 +80,8 @@ export const money = (n: number) =>
   `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 export const initialData: Data = {
   shop: { name: "", owner: "", address: "", phone: "", whatsapp: "" },
+  shopExists: false,
+  shopComplete: false,
   customers: [],
   entries: [],
   audit: [],
@@ -139,6 +145,8 @@ export function validBackup(value: unknown): value is Data {
   const d = value as Data;
   return (
     !!d.shop &&
+    (d.shopExists === undefined || typeof d.shopExists === "boolean") &&
+    (d.shopComplete === undefined || typeof d.shopComplete === "boolean") &&
     ["name", "owner", "address", "phone", "whatsapp"].every(
       (k) => typeof (d.shop as any)[k] === "string",
     ) &&
