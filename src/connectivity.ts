@@ -5,6 +5,7 @@ import {
   API_BASE_URL,
   HEALTH_CHECK_URL,
   probeBackendReachability,
+  setApiResponseObserver,
 } from "./api";
 
 export type ConnectivityStatus =
@@ -21,6 +22,8 @@ export type ConnectivityDetails = {
   healthErrorCategory: string | null;
   healthErrorDetail: string | null;
   healthDurationMs: number | null;
+  lastApiResponseStatus: number | null;
+  lastApiResponseAt: string | null;
   apiBaseUrl: string | null;
   healthUrl: string | null;
   lastSuccessfulConnectionAt: string | null;
@@ -57,6 +60,8 @@ let details: ConnectivityDetails = {
   healthErrorCategory: null,
   healthErrorDetail: null,
   healthDurationMs: null,
+  lastApiResponseStatus: null,
+  lastApiResponseAt: null,
   apiBaseUrl: API_BASE_URL,
   healthUrl: HEALTH_CHECK_URL,
   lastSuccessfulConnectionAt: null,
@@ -82,6 +87,25 @@ export function currentConnectivityDetails(): ConnectivityDetails {
   return details;
 }
 
+function noteBackendResponse(httpStatus: number) {
+  // Invalidate any older probe so a late timeout cannot overwrite newer API
+  // evidence. Any HTTP status proves transport/API reachability; it does not
+  // assert that the requested business operation succeeded.
+  generation += 1;
+  inFlight = null;
+  lastCheckAt = Date.now();
+  details = {
+    ...details,
+    backendReachable: true,
+    lastApiResponseStatus: httpStatus,
+    lastApiResponseAt: new Date().toISOString(),
+    lastSuccessfulConnectionAt: new Date().toISOString(),
+  };
+  publish("online");
+}
+
+setApiResponseObserver(noteBackendResponse);
+
 export async function checkConnectivity(force = false): Promise<ConnectivityStatus> {
   if (inFlight && !force) return inFlight;
   // A user-requested retry must start a fresh probe rather than joining a
@@ -105,6 +129,8 @@ export async function checkConnectivity(force = false): Promise<ConnectivityStat
       healthErrorCategory: null,
       healthErrorDetail: null,
       healthDurationMs: null,
+      lastApiResponseStatus: details.lastApiResponseStatus,
+      lastApiResponseAt: details.lastApiResponseAt,
       apiBaseUrl: API_BASE_URL,
       healthUrl: HEALTH_CHECK_URL,
       lastSuccessfulConnectionAt: details.lastSuccessfulConnectionAt,

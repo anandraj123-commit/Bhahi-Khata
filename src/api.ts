@@ -11,6 +11,11 @@ import type { SubscriptionSnapshot } from "./subscription";
 const configuredBase = process.env.EXPO_PUBLIC_API_URL || "http://10.0.2.2:4000/api/v1";
 export const API_BASE_URL = `${configuredBase.trim().replace(/\/+$/, "").replace(/(?:\/api\/v1)+$/i, "")}/api/v1`;
 export const HEALTH_CHECK_URL = `${API_BASE_URL}/health`;
+let apiResponseObserver: ((status: number) => void) | null = null;
+
+export function setApiResponseObserver(observer: (status: number) => void) {
+  apiResponseObserver = observer;
+}
 
 export type BackendProbeResult = {
   apiBaseUrl: string;
@@ -187,6 +192,10 @@ async function request(
   } finally {
     clearTimeout(timeout);
   }
+  // An HTTP response, including an authorization or validation response,
+  // proves the configured backend is reachable. Business errors must not be
+  // mistaken for network failures.
+  apiResponseObserver?.(response.status);
   if (response.status === 401 && retry && path !== "/auth/refresh") {
     const refreshed = await refresh();
     if (refreshed instanceof ApiTransportError) throw refreshed;
@@ -226,6 +235,7 @@ async function refresh(): Promise<RefreshOutcome> {
         } finally {
         clearTimeout(timeout);
       }
+      apiResponseObserver?.(response.status);
       if (!response.ok) {
         if (response.status === 401 || response.status === 403) {
           await clearTokens();

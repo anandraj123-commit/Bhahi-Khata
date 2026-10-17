@@ -1,5 +1,6 @@
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
+import * as FileSystem from "expo-file-system/legacy";
 import Constants, { ExecutionEnvironment } from "expo-constants";
 import type * as SQLiteTypes from "expo-sqlite";
 import type { Audit, Customer, Data, Entry } from "./model";
@@ -10,7 +11,51 @@ const KEY_NAME = "khata.sqlite.key.v1";
 const OFFLINE_SESSION = "khata.offline-session.v1";
 const OFFLINE_SESSION_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
 let database: Promise<SQLiteTypes.SQLiteDatabase | null> | null = null;
+let databaseEncryptionKey: string | null = null;
 let nativeDatabaseUnavailable = false;
+let databaseStatus: "not_checked" | "opening" | "ready" | "unavailable" = "not_checked";
+type OfflineDatabaseStage = "not_started" | "native_module" | "database_file_check" | "secure_key_read" | "secure_key_write" | "database_open" | "sqlcipher_check" | "key_apply" | "encryption_verify" | "migration" | "ready" | "failed";
+type OfflineDatabaseErrorCategory = "none" | "native_module_unavailable" | "secure_store_unavailable" | "existing_database_key_missing" | "invalid_key_metadata" | "database_open_failed" | "sqlcipher_unavailable" | "key_or_database_invalid" | "migration_failed" | "database_version_unsupported" | "unknown";
+let databaseDiagnostics = {
+  stage: "not_started" as OfflineDatabaseStage,
+  nativeSQLiteAvailable: false,
+  sqlCipherSupported: null as boolean | null,
+  secureKeyExists: null as boolean | null,
+  secureKeyReadSucceeded: null as boolean | null,
+  databaseOpenSucceeded: null as boolean | null,
+  encryptionVerified: null as boolean | null,
+  migrationSucceeded: null as boolean | null,
+  errorCategory: "none" as OfflineDatabaseErrorCategory,
+  errorMessage: "",
+};
+
+function sanitizedStorageError(error: unknown) {
+  const message = error instanceof Error ? error.message : "Storage operation failed";
+  const lower = message.toLowerCase();
+  let category: OfflineDatabaseErrorCategory = "unknown";
+  if (/existing encrypted database key is missing/.test(lower)) category = "existing_database_key_missing";
+  else if (/invalid stored encryption key|invalid key format/.test(lower)) category = "invalid_key_metadata";
+  else if (/sqlcipher.*unavailable/.test(lower)) category = "sqlcipher_unavailable";
+  else if (/not a database|malformed|file is encrypted|cipher.*(key|decrypt)/.test(lower)) category = "key_or_database_invalid";
+  else if (/newer than this app|unsupported.*version/.test(lower)) category = "database_version_unsupported";
+  else if (/securestore|keystore|keychain|biometric|authentication required/.test(lower)) category = "secure_store_unavailable";
+  else if (/no such module|native module|expo.?sqlite/.test(lower)) category = "native_module_unavailable";
+  else if (/unable to open|cannot open|disk i\/o|readonly|permission denied/.test(lower)) category = "database_open_failed";
+  else if (/syntax error|duplicate column|migration|unique constraint/.test(lower)) category = "migration_failed";
+  const messages: Record<OfflineDatabaseErrorCategory, string> = {
+    none: "", native_module_unavailable: "Encrypted SQLite is unavailable in this app build. Install a native preview or production build.",
+    secure_store_unavailable: "Android secure key storage could not be accessed. Existing local data was preserved.",
+    existing_database_key_missing: "The existing database key is missing from Android secure storage. Local data was preserved; no replacement key was generated.",
+    invalid_key_metadata: "The stored encryption key is invalid. Existing local data was preserved.",
+    database_open_failed: "The local database file could not be opened. Existing local data was preserved.",
+    sqlcipher_unavailable: "SQLCipher support is missing from this installed app build. Install a native build configured with SQLCipher.",
+    key_or_database_invalid: "The database could not be decrypted or read. Existing local data was preserved.",
+    migration_failed: "A local database migration could not be completed. Existing local data was preserved.",
+    database_version_unsupported: "This local database was created by a newer app version. Update the app to continue.",
+    unknown: "Encrypted local storage initialization failed. Existing local data was preserved.",
+  };
+  return { category, message: messages[category] };
+}
 
 export type OfflineSession = {
   accountId: string;
@@ -68,134 +113,265 @@ export const offlineStorageAvailable = () =>
   Constants.executionEnvironment !== ExecutionEnvironment.StoreClient &&
   !nativeDatabaseUnavailable;
 
+export function offlineStorageReadiness() {
+  if (Constants.executionEnvironment === ExecutionEnvironment.StoreClient)
+    return "unsupported" as const;
+  if (nativeDatabaseUnavailable) return "unsupported" as const;
+  return databaseStatus;
+}
+
+export function offlineStorageDiagnostics() {
+  const extra = Constants.expoConfig?.extra as Record<string, unknown> | undefined;
+  return {
+    ...databaseDiagnostics,
+    readiness: offlineStorageReadiness(),
+    buildProfile: typeof extra?.buildProfile === "string" ? extra.buildProfile : "unknown",
+    appMode: typeof extra?.appMode === "string" ? extra.appMode : "unknown",
+  };
+}
+
+/** User-initiated retry that never removes or recreates the database or key. */
+export async function retryOfflineStorageInitialization() {
+  if (databaseStatus === "ready") return true;
+  database = null;
+  databaseStatus = "not_checked";
+  nativeDatabaseUnavailable = false;
+  databaseDiagnostics = { ...databaseDiagnostics, stage: "not_started", errorCategory: "none", errorMessage: "" };
+  return Boolean(await openDatabase());
+}
+
+async function runMigrations(db: SQLiteTypes.SQLiteDatabase) {
+  const currentVersion =
+    (await db.getFirstAsync<{ user_version: number }>("PRAGMA user_version"))?.user_version || 0;
+  if (currentVersion > 5) throw new Error("Offline database version is newer than this app");
+  await db.execAsync("PRAGMA journal_mode = WAL;");
+  await withEncryptedTransaction(db, async (tx) => {
+    await tx.execAsync(`
+      CREATE TABLE IF NOT EXISTS local_accounts (
+        account_id TEXT PRIMARY KEY NOT NULL, shop_json TEXT NOT NULL,
+        preferences_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS local_customers (
+        account_id TEXT NOT NULL, customer_id TEXT NOT NULL, record_json TEXT NOT NULL,
+        PRIMARY KEY (account_id, customer_id)
+      );
+      CREATE TABLE IF NOT EXISTS local_ledger (
+        account_id TEXT NOT NULL, entry_id TEXT NOT NULL, customer_id TEXT NOT NULL,
+        record_json TEXT NOT NULL, PRIMARY KEY (account_id, entry_id)
+      );
+      CREATE INDEX IF NOT EXISTS local_ledger_customer_idx ON local_ledger (account_id, customer_id);
+      CREATE TABLE IF NOT EXISTS local_audit (
+        account_id TEXT NOT NULL, audit_id TEXT NOT NULL, record_json TEXT NOT NULL,
+        PRIMARY KEY (account_id, audit_id)
+      );
+      CREATE TABLE IF NOT EXISTS local_subscription_cache (
+        account_id TEXT PRIMARY KEY NOT NULL, snapshot_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sync_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, previous_json TEXT,
+        next_json TEXT, change_json TEXT NOT NULL, created_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+        state TEXT NOT NULL DEFAULT 'pending', conflict_json TEXT, operation_id TEXT,
+        entity_type TEXT, entity_id TEXT, base_version INTEGER,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS sync_queue_account_order_idx ON sync_queue (account_id, id);
+    `);
+    const columns = await tx.getAllAsync<{ name: string }>("PRAGMA table_info(sync_queue)");
+    const names = new Set(columns.map((column) => column.name));
+    for (const [name, definition] of [
+      ["change_json", "TEXT"], ["state", "TEXT NOT NULL DEFAULT 'pending'"],
+      ["conflict_json", "TEXT"], ["operation_id", "TEXT"], ["entity_type", "TEXT"],
+      ["entity_id", "TEXT"], ["base_version", "INTEGER"],
+      ["next_attempt_at", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const) {
+      if (!names.has(name)) await tx.execAsync(`ALTER TABLE sync_queue ADD COLUMN ${name} ${definition}`);
+    }
+    if (names.has("previous_json") && names.has("next_json")) {
+      const legacy = await tx.getAllAsync<{ id: number; previous_json: string; next_json: string }>(
+        "SELECT id, previous_json, next_json FROM sync_queue WHERE change_json IS NULL",
+      );
+      for (const row of legacy) {
+        const change = createSyncDelta(JSON.parse(row.previous_json), JSON.parse(row.next_json));
+        await tx.runAsync("UPDATE sync_queue SET change_json = ? WHERE id = ?", JSON.stringify(change), row.id);
+      }
+    }
+    if (currentVersion < 5) {
+      const queue = await tx.getAllAsync<{ id: number; operation_id: string | null }>(
+        "SELECT id, operation_id FROM sync_queue WHERE operation_id IS NULL",
+      );
+      for (const row of queue)
+        await tx.runAsync("UPDATE sync_queue SET operation_id = ? WHERE id = ?", Crypto.randomUUID(), row.id);
+      await tx.execAsync("CREATE UNIQUE INDEX IF NOT EXISTS sync_queue_operation_id_idx ON sync_queue (operation_id)");
+      await tx.execAsync("PRAGMA user_version = 5;");
+    }
+  });
+}
+
+/** Expo's exclusive transaction helper opens a new connection. SQLCipher keys are
+ * connection-scoped, so every such connection must receive the key before BEGIN
+ * or any query. This preserves transaction isolation without using an unkeyed
+ * connection against the encrypted database. */
+async function withEncryptedTransaction<T>(
+  _databaseHandle: SQLiteTypes.SQLiteDatabase,
+  task: (transaction: SQLiteTypes.SQLiteDatabase) => Promise<T>,
+): Promise<T> {
+  if (!databaseEncryptionKey) throw new Error("Encrypted database key is not initialized");
+  const SQLite = await import("expo-sqlite");
+  const transaction = await SQLite.openDatabaseAsync(DATABASE, { useNewConnection: true });
+  let began = false;
+  try {
+    await transaction.execAsync(`PRAGMA key = "x'${databaseEncryptionKey}'";`);
+    const cipher = await transaction.getFirstAsync<{ cipher_version: string }>("PRAGMA cipher_version");
+    if (!cipher?.cipher_version) throw new Error("SQLCipher is unavailable on transaction connection");
+    await transaction.getFirstAsync<{ name: string }>("SELECT name FROM sqlite_master LIMIT 1");
+    await transaction.execAsync("BEGIN IMMEDIATE;");
+    began = true;
+    const result = await task(transaction);
+    await transaction.execAsync("COMMIT;");
+    began = false;
+    return result;
+  } catch (error) {
+    if (began) {
+      try { await transaction.execAsync("ROLLBACK;"); } catch { /* Preserve the triggering error. */ }
+    }
+    throw error;
+  } finally {
+    try { await transaction.closeAsync(); } catch { /* Do not mask commit or task results. */ }
+  }
+}
+
 async function openDatabase() {
   if (!offlineStorageAvailable()) return null;
   if (!database) {
+    databaseStatus = "opening";
     database = (async () => {
       let SQLite: typeof import("expo-sqlite");
       try {
         SQLite = await import("expo-sqlite");
-      } catch {
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "native_module", nativeSQLiteAvailable: true };
+      } catch (error) {
         nativeDatabaseUnavailable = true;
+        databaseStatus = "unavailable";
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", nativeSQLiteAvailable: false,
+          errorCategory: "native_module_unavailable", errorMessage: sanitizedStorageError(error).message };
         return null;
       }
-      let key = await SecureStore.getItemAsync(KEY_NAME);
+      databaseDiagnostics = { ...databaseDiagnostics, stage: "sqlcipher_check" };
+      try {
+        const probe = await SQLite.openDatabaseAsync(":memory:", { useNewConnection: true });
+        try {
+          const cipher = await probe.getFirstAsync<{ cipher_version: string }>("PRAGMA cipher_version");
+          databaseDiagnostics = { ...databaseDiagnostics, sqlCipherSupported: Boolean(cipher?.cipher_version) };
+          if (!cipher?.cipher_version) {
+            nativeDatabaseUnavailable = true;
+            throw new Error("SQLCipher is unavailable in the installed app build");
+          }
+        } finally {
+          await probe.closeAsync();
+        }
+      } catch (error) {
+        const cipherMissing = !databaseDiagnostics.sqlCipherSupported;
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed",
+          errorCategory: cipherMissing ? "sqlcipher_unavailable" : "native_module_unavailable",
+          errorMessage: sanitizedStorageError(new Error(cipherMissing ? "SQLCipher unavailable" : "native SQLite unavailable")).message };
+        if (cipherMissing) nativeDatabaseUnavailable = true;
+        throw error;
+      }
+      let databaseFileExists = false;
+      databaseDiagnostics = { ...databaseDiagnostics, stage: "database_file_check" };
+      try {
+        const directory = SQLite.defaultDatabaseDirectory;
+        if (typeof directory !== "string" || !directory) throw new Error("SQLite database directory unavailable");
+        const uri = `file://${directory.replace(/\/$/, "")}/${DATABASE}`;
+        databaseFileExists = (await FileSystem.getInfoAsync(uri)).exists;
+      } catch (error) {
+        const safe = sanitizedStorageError(error);
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", errorCategory: safe.category, errorMessage: safe.message };
+        throw error;
+      }
+      let key: string | null;
+      databaseDiagnostics = { ...databaseDiagnostics, stage: "secure_key_read" };
+      try {
+        key = await SecureStore.getItemAsync(KEY_NAME);
+        databaseDiagnostics = { ...databaseDiagnostics, secureKeyReadSucceeded: true, secureKeyExists: Boolean(key) };
+      } catch (error) {
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", secureKeyReadSucceeded: false,
+          errorCategory: "secure_store_unavailable", errorMessage: sanitizedStorageError(error).message };
+        throw error;
+      }
       if (!key) {
+        if (databaseFileExists) {
+          databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", secureKeyExists: false,
+            errorCategory: "existing_database_key_missing",
+            errorMessage: sanitizedStorageError(new Error("Existing encrypted database key is missing")).message };
+          throw new Error("Existing encrypted database key is missing");
+        }
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "secure_key_write" };
         const bytes = await Crypto.getRandomBytesAsync(32);
-        key = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-        await SecureStore.setItemAsync(KEY_NAME, key);
-      }
-      const db = await SQLite.openDatabaseAsync(DATABASE);
-      await db.execAsync(`PRAGMA key = "x'${key}'";`);
-      const cipher = await db.getFirstAsync<{ cipher_version: string }>(
-        "PRAGMA cipher_version",
-      );
-      if (!cipher?.cipher_version)
-        throw new Error("Encrypted local storage requires the installed app build");
-      await db.execAsync("PRAGMA journal_mode = WAL;");
-      const currentVersion =
-        (await db.getFirstAsync<{ user_version: number }>("PRAGMA user_version"))?.user_version || 0;
-      if (currentVersion > 5)
-        throw new Error("Offline database version is newer than this app");
-      await db.execAsync(`
-        CREATE TABLE IF NOT EXISTS local_accounts (
-          account_id TEXT PRIMARY KEY NOT NULL,
-          shop_json TEXT NOT NULL,
-          preferences_json TEXT NOT NULL,
-          updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS local_customers (
-          account_id TEXT NOT NULL,
-          customer_id TEXT NOT NULL,
-          record_json TEXT NOT NULL,
-          PRIMARY KEY (account_id, customer_id)
-        );
-        CREATE TABLE IF NOT EXISTS local_ledger (
-          account_id TEXT NOT NULL,
-          entry_id TEXT NOT NULL,
-          customer_id TEXT NOT NULL,
-          record_json TEXT NOT NULL,
-          PRIMARY KEY (account_id, entry_id)
-        );
-        CREATE INDEX IF NOT EXISTS local_ledger_customer_idx
-          ON local_ledger (account_id, customer_id);
-        CREATE TABLE IF NOT EXISTS local_audit (
-          account_id TEXT NOT NULL,
-          audit_id TEXT NOT NULL,
-          record_json TEXT NOT NULL,
-          PRIMARY KEY (account_id, audit_id)
-        );
-        CREATE TABLE IF NOT EXISTS local_subscription_cache (
-          account_id TEXT PRIMARY KEY NOT NULL,
-          snapshot_json TEXT NOT NULL,
-          updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sync_queue (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          account_id TEXT NOT NULL,
-          previous_json TEXT,
-          next_json TEXT,
-          change_json TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          attempts INTEGER NOT NULL DEFAULT 0,
-          last_error TEXT,
-          state TEXT NOT NULL DEFAULT 'pending',
-          conflict_json TEXT,
-          operation_id TEXT,
-          entity_type TEXT,
-          entity_id TEXT,
-          base_version INTEGER,
-          next_attempt_at INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS sync_queue_account_order_idx
-          ON sync_queue (account_id, id);
-      `);
-      {
-        const columns = await db.getAllAsync<{ name: string }>("PRAGMA table_info(sync_queue)");
-        if (!columns.some((column) => column.name === "change_json")) {
-          await db.execAsync("ALTER TABLE sync_queue ADD COLUMN change_json TEXT");
-          columns.push({ name: "change_json" });
-        }
-        if (!columns.some((column) => column.name === "state")) {
-          await db.execAsync("ALTER TABLE sync_queue ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'");
-        }
-        if (!columns.some((column) => column.name === "conflict_json")) {
-          await db.execAsync("ALTER TABLE sync_queue ADD COLUMN conflict_json TEXT");
-        }
-        for (const [name, definition] of [
-          ["operation_id", "TEXT"],
-          ["entity_type", "TEXT"],
-          ["entity_id", "TEXT"],
-          ["base_version", "INTEGER"],
-          ["next_attempt_at", "INTEGER NOT NULL DEFAULT 0"],
-        ] as const) {
-          if (!columns.some((column) => column.name === name))
-            await db.execAsync(`ALTER TABLE sync_queue ADD COLUMN ${name} ${definition}`);
-        }
-        if (columns.some((column) => column.name === "previous_json") &&
-            columns.some((column) => column.name === "next_json")) {
-        const legacy = await db.getAllAsync<{
-          id: number;
-          previous_json: string;
-          next_json: string;
-        }>("SELECT id, previous_json, next_json FROM sync_queue WHERE change_json IS NULL");
-        for (const row of legacy) {
-          const change = createSyncDelta(JSON.parse(row.previous_json), JSON.parse(row.next_json));
-          await db.runAsync("UPDATE sync_queue SET change_json = ? WHERE id = ?", JSON.stringify(change), row.id);
-        }
+        const newKey = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+        try {
+          await SecureStore.setItemAsync(KEY_NAME, newKey);
+          key = await SecureStore.getItemAsync(KEY_NAME);
+          if (key !== newKey) throw new Error("Secure key persistence could not be confirmed");
+          databaseEncryptionKey = key;
+          databaseDiagnostics = { ...databaseDiagnostics, secureKeyExists: true, secureKeyReadSucceeded: true };
+        } catch (error) {
+          databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", errorCategory: "secure_store_unavailable",
+            errorMessage: sanitizedStorageError(error).message };
+          throw error;
         }
       }
-      if (currentVersion < 5) {
-        const legacyQueue = await db.getAllAsync<{ id: number; operation_id: string | null }>(
-          "SELECT id, operation_id FROM sync_queue WHERE operation_id IS NULL",
-        );
-        for (const row of legacyQueue)
-          await db.runAsync("UPDATE sync_queue SET operation_id = ? WHERE id = ?", Crypto.randomUUID(), row.id);
-        await db.execAsync("CREATE UNIQUE INDEX IF NOT EXISTS sync_queue_operation_id_idx ON sync_queue (operation_id)");
-        await db.execAsync("PRAGMA user_version = 5;");
+      if (!/^[0-9a-f]{64}$/i.test(key)) {
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", errorCategory: "invalid_key_metadata",
+          errorMessage: sanitizedStorageError(new Error("Invalid stored encryption key format")).message };
+        throw new Error("Invalid stored encryption key format");
       }
+      databaseEncryptionKey = key;
+      let db: SQLiteTypes.SQLiteDatabase | null = null;
+      try {
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "database_open" };
+        db = await SQLite.openDatabaseAsync(DATABASE);
+        databaseDiagnostics = { ...databaseDiagnostics, databaseOpenSucceeded: true, stage: "key_apply" };
+        // SQLCipher requires the key before the first database access on this connection.
+        await db.execAsync(`PRAGMA key = "x'${key}'";`);
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "sqlcipher_check" };
+        const cipher = await db.getFirstAsync<{ cipher_version: string }>("PRAGMA cipher_version");
+        databaseDiagnostics = { ...databaseDiagnostics, sqlCipherSupported: Boolean(cipher?.cipher_version) };
+        if (!cipher?.cipher_version) {
+          nativeDatabaseUnavailable = true;
+          throw new Error("SQLCipher is unavailable in the installed app build");
+        }
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "encryption_verify" };
+        await db.getFirstAsync<{ name: string }>("SELECT name FROM sqlite_master LIMIT 1");
+        databaseDiagnostics = { ...databaseDiagnostics, encryptionVerified: true, stage: "migration" };
+        await runMigrations(db);
+        databaseDiagnostics = { ...databaseDiagnostics, migrationSucceeded: true, stage: "ready",
+          errorCategory: "none", errorMessage: "" };
+      } catch (error) {
+        try { await db?.closeAsync(); } catch { /* Keep the original initialization error. */ }
+        const failedAtStage = databaseDiagnostics.stage;
+        const safe = sanitizedStorageError(error);
+        const cipherMissing = failedAtStage === "sqlcipher_check" && !databaseDiagnostics.sqlCipherSupported;
+        const stageCategory = failedAtStage === "database_open" ? "database_open_failed"
+          : failedAtStage === "key_apply" || failedAtStage === "encryption_verify" ? "key_or_database_invalid"
+            : failedAtStage === "migration" ? "migration_failed" : safe.category;
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed",
+          errorCategory: cipherMissing ? "sqlcipher_unavailable" : stageCategory,
+          errorMessage: cipherMissing ? sanitizedStorageError(new Error("SQLCipher is unavailable")).message : safe.message,
+          encryptionVerified: databaseDiagnostics.encryptionVerified === true ? true
+            : failedAtStage === "encryption_verify" ? false : databaseDiagnostics.encryptionVerified,
+          migrationSucceeded: failedAtStage === "migration" ? false : databaseDiagnostics.migrationSucceeded };
+        throw error;
+      }
+      databaseStatus = "ready";
       return db;
     })().catch((error) => {
+      if (databaseStatus !== "unavailable") databaseStatus = "unavailable";
+      if (databaseDiagnostics.stage !== "failed") {
+        const safe = sanitizedStorageError(error);
+        databaseDiagnostics = { ...databaseDiagnostics, stage: "failed", errorCategory: safe.category, errorMessage: safe.message };
+      }
       database = null;
       throw error;
     });
@@ -318,7 +494,7 @@ export async function cacheAuthenticatedAccount(accountId: string, data: Data) {
   if (!offlineStorageAvailable()) return;
   const db = await openDatabase();
   if (!db) return;
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const pending = await transaction.getFirstAsync<{ count: number }>(
       "SELECT COUNT(*) AS count FROM sync_queue WHERE account_id = ?",
       accountId,
@@ -349,7 +525,7 @@ export async function adoptServerDataIfQueueEmpty(accountId: string, data: Data)
   const db = await openDatabase();
   if (!db) return false;
   let adopted = false;
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const pending = await transaction.getFirstAsync<{ count: number }>(
       "SELECT COUNT(*) AS count FROM sync_queue WHERE account_id = ?",
       accountId,
@@ -370,7 +546,7 @@ export async function saveLocalChange(
   const db = await openDatabase();
   if (!db) return null;
   let queueId: number | null = null;
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const change = createSyncDelta(previous, next);
     await writeChange(transaction, accountId, next, change);
     const customerChange = change.customers[0];
@@ -763,7 +939,7 @@ export async function chooseSettingsConflictResolution(id: number, choice: "keep
 export async function completeSettingsConflict(accountId: string, conflict: PendingSettingsConflict, authoritative: SyncSettings, audit: Audit) {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const conflicted = await transaction.getFirstAsync<{ change_json: string }>(
       "SELECT change_json FROM sync_queue WHERE account_id = ? AND id = ? AND state = 'conflict'",
       accountId, conflict.queueId,
@@ -854,7 +1030,7 @@ export async function completeCustomerConflict(
 ) {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const conflicted = await transaction.getFirstAsync<{ change_json: string }>(
       "SELECT change_json FROM sync_queue WHERE account_id = ? AND id = ? AND state = 'conflict'",
       accountId, conflict.queueId,
@@ -953,7 +1129,7 @@ export async function chooseConflictResolution(id: number, choice: "keep_local" 
 export async function completeConflict(accountId: string, conflict: PendingConflict, authoritative: PendingConflict["server"], serverVersion: number, serverResolutionVersion: number, audit: Audit) {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const conflictedRow = await transaction.getFirstAsync<{ change_json: string }>(
       "SELECT change_json FROM sync_queue WHERE account_id = ? AND id = ? AND state = 'conflict'",
       accountId, conflict.queueId,
@@ -1088,7 +1264,7 @@ export async function acknowledgeChange(
 ) {
   const db = await openDatabase();
   if (!db) return;
-  await db.withExclusiveTransactionAsync(async (transaction) => {
+  await withEncryptedTransaction(db, async (transaction) => {
     const row = await transaction.getFirstAsync<{ account_id: string; change_json: string; state: string }>(
       "SELECT account_id, change_json, state FROM sync_queue WHERE id = ?",
       id,
@@ -1244,7 +1420,7 @@ export async function retryFailedChanges(accountId: string) {
 export async function clearOfflineAccount(accountId: string) {
   const db = await openDatabase();
   if (db)
-    await db.withExclusiveTransactionAsync(async (transaction) => {
+    await withEncryptedTransaction(db, async (transaction) => {
       for (const table of ["local_accounts", "local_customers", "local_ledger", "local_audit", "local_subscription_cache", "sync_queue"])
         await transaction.runAsync(`DELETE FROM ${table} WHERE account_id = ?`, accountId);
     });

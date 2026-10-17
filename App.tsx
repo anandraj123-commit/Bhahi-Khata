@@ -47,6 +47,9 @@ import {
   chooseCustomerConflictResolution,
   chooseSettingsConflictResolution,
   offlineStorageAvailable,
+  offlineStorageReadiness,
+  offlineStorageDiagnostics,
+  retryOfflineStorageInitialization,
   readCachedAccount,
   readSubscriptionSnapshot,
   readPendingConflicts,
@@ -291,9 +294,11 @@ function AppContent() {
   const [connectivityStatus, setConnectivityStatus] = useState<ConnectivityStatus>("checking");
   const [networkDiagnosticsVisible, setNetworkDiagnosticsVisible] = useState(false);
   const [networkDiagnosticsRetrying, setNetworkDiagnosticsRetrying] = useState(false);
+  const [storageRetrying, setStorageRetrying] = useState(false);
   const [, setNetworkDiagnosticsRevision] = useState(0);
   const networkDiagnostics = currentConnectivityDetails();
   const networkBuildInfo = connectivityBuildInfo();
+  const storageDiagnostics = offlineStorageDiagnostics();
   const retryNetworkDiagnostics = async () => {
     setNetworkDiagnosticsRetrying(true);
     try {
@@ -301,6 +306,15 @@ function AppContent() {
     } finally {
       setNetworkDiagnosticsRevision((revision) => revision + 1);
       setNetworkDiagnosticsRetrying(false);
+    }
+  };
+  const retryStorageInitialization = async () => {
+    setStorageRetrying(true);
+    try { await retryOfflineStorageInitialization(); }
+    catch { /* The safe, sanitized result is shown in diagnostics. */ }
+    finally {
+      setNetworkDiagnosticsRevision((revision) => revision + 1);
+      setStorageRetrying(false);
     }
   };
   const lock = useRef(false);
@@ -448,7 +462,7 @@ function AppContent() {
     (async () => {
       try {
         const connectivity = await checkConnectivity();
-        if (connectivity !== "online") {
+        if (connectivity === "offline") {
           const offlineSession = await readOfflineSession();
           const cached = offlineSession
             ? await readCachedAccount(offlineSession.accountId)
@@ -462,10 +476,8 @@ function AppContent() {
           } else if (live) {
             setRoute({ screen: "login" });
             Alert.alert(
-              connectivity === "offline" ? "You’re offline" : "Server unavailable",
-              connectivity === "offline"
-                ? "Connect to Wi-Fi or another network to sign in."
-                : "A network is connected, but the Digital-Khata server could not be reached.",
+              "You’re offline",
+              "Connect to Wi-Fi or another network to sign in.",
             );
           }
           return;
@@ -516,28 +528,12 @@ function AppContent() {
           persistedRef.current = parsed;
           setRoute({ screen: parsed.shopComplete ? "home" : "setup" });
         } else if (live) {
-          const offlineSession = await readOfflineSession();
-          const cached = offlineSession
-            ? await readCachedAccount(offlineSession.accountId)
-            : null;
-          if (offlineSession && cached && validBackup(cached)) {
-            offlineAccountRef.current = offlineSession.accountId;
-            setData(cached);
-            dataRef.current = cached;
-            persistedRef.current = cached;
-            setRoute({ screen: (cached.shopComplete ?? Boolean(cached.shop.name.trim() && cached.shop.owner.trim())) ? "home" : "setup" });
-          } else {
-            const connectivity = await checkConnectivity();
-            if (connectivity !== "online") {
-              setRoute({ screen: "login" });
-              Alert.alert(
-                connectivity === "offline" ? "You’re offline" : "Server unavailable",
-                connectivity === "offline"
-                  ? "Connect to Wi-Fi or another network to sign in."
-                  : "A network is connected, but the Digital-Khata server could not be reached.",
-              );
-            }
-          }
+          // A successful health probe is not required to establish an
+          // authenticated session. A real API request may work even if the
+          // lightweight health endpoint failed. Conversely, a server-confirmed
+          // invalid session must not fall back to cached offline authorization.
+          offlineAccountRef.current = null;
+          setRoute({ screen: "login" });
         }
       } catch (error) {
         const canUseCachedSession =
@@ -815,6 +811,11 @@ function AppContent() {
               });
             return true;
           }
+          if ((await checkConnectivity()) === "offline") {
+            if (!accountId)
+              throw new Error("OFFLINE_AUTHORIZATION_UNAVAILABLE");
+            throw new Error("OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE");
+          }
           await api.syncChange(persisted, next);
           persistedRef.current = next;
         }
@@ -827,6 +828,8 @@ function AppContent() {
         }
         if (error instanceof Error && error.message === "OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE")
           Alert.alert("Offline saving unavailable", "Offline changes require the installed Digital-Khata app with encrypted storage. Open the app in an installed development or release build; Expo Go cannot use this encrypted database.");
+        else if (error instanceof Error && error.message === "OFFLINE_AUTHORIZATION_UNAVAILABLE")
+          Alert.alert("Offline access unavailable", "No valid offline authorization is active for this shop. Reconnect and sign in before making offline changes.");
         else if (error instanceof Error && /Encrypted local storage requires the installed app build/.test(error.message))
           Alert.alert("Secure storage unavailable", "No changes were saved. Install the supported Digital-Khata build with encrypted local storage and try again.");
         else
@@ -855,9 +858,9 @@ function AppContent() {
     if (form.whatsapp && !phoneValid(form.whatsapp))
       return Alert.alert("Invalid WhatsApp number", "Enter a valid 10-digit mobile number.");
     const connectivity = await checkConnectivity(true);
-    if (connectivity !== "online")
+    if (connectivity === "offline")
       return Alert.alert(
-        connectivity === "offline" ? "You’re offline" : "Server unavailable",
+        "You’re offline",
         "Shop registration requires a connection to verify and create your shop safely.",
       );
     lock.current = true;
@@ -907,12 +910,10 @@ function AppContent() {
     const accountId = offlineAccountRef.current;
     if (!accountId || lock.current) return;
     const connection = await checkConnectivity(true);
-    if (connection !== "online") {
+    if (connection === "offline") {
       Alert.alert(
-        connection === "offline" ? "You’re offline" : "Server unavailable",
-        connection === "offline"
-          ? "Connect to Wi-Fi or another network before retrying synchronization."
-          : "The network is connected, but the Digital-Khata server is unavailable. Your saved changes remain on this phone.",
+        "You’re offline",
+        "Connect to Wi-Fi or another network before retrying synchronization.",
       );
       return;
     }
@@ -1780,7 +1781,7 @@ function AppContent() {
                   "Enter a valid 10-digit Indian mobile number.",
                 );
               const network = await checkConnectivity(true);
-              if (network !== "online")
+              if (network === "offline")
                 return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setBusy(true);
               try {
@@ -1805,6 +1806,7 @@ function AppContent() {
             accessibilityLabel="Network Diagnostics"
             onPress={() => {
               setNetworkDiagnosticsRevision((revision) => revision + 1);
+              void refreshSyncStatus();
               setNetworkDiagnosticsVisible(true);
             }}
             style={{ paddingVertical: 8, alignItems: "center" }}
@@ -1831,7 +1833,7 @@ function AppContent() {
             disabled={seconds > 0}
             onPress={async () => {
               const network = await checkConnectivity(true);
-              if (network !== "online")
+              if (network === "offline")
                 return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setSeconds(30);
               try {
@@ -1853,7 +1855,7 @@ function AppContent() {
             onPress={async () => {
               if (!/^\d{4,8}$/.test(otp)) return Alert.alert("Invalid code", "Enter the verification code sent to your phone.");
               const network = await checkConnectivity(true);
-              if (network !== "online")
+              if (network === "offline")
                 return Alert.alert(network === "offline" ? "You’re offline" : "Server unavailable", network === "offline" ? "Connect to Wi-Fi or another network to sign in." : "The network is connected, but the Digital-Khata server could not be reached.");
               setBusy(true);
               try {
@@ -1886,7 +1888,13 @@ function AppContent() {
                     if (cached && validBackup(cached)) remote = cached;
                   }
                   try { await cacheAuthenticatedAccount(id, remote); }
-                  catch { offlineAccountRef.current = null; }
+                  catch {
+                    offlineAccountRef.current = null;
+                    Alert.alert(
+                      "Offline storage unavailable",
+                      "Your shop is signed in, but encrypted local storage could not be opened. Offline changes are not enabled on this installation.",
+                    );
+                  }
                 }
                 dataRef.current = remote;
                 setData(remote);
@@ -3307,8 +3315,23 @@ function AppContent() {
                 <Hint>{`Health-check URL: ${networkDiagnostics.healthUrl || "Unavailable"}`}</Hint>
                 <Hint>{`Network type: ${networkDiagnostics.networkType}`}</Hint>
                 <Hint>{`Device network connection: ${networkDiagnostics.networkConnected === null ? "Unknown" : networkDiagnostics.networkConnected ? "Connected" : "Disconnected"}`}</Hint>
-                <Hint>{`Backend reachability: ${connectivityStatus === "online" ? "Healthy" : connectivityStatus === "offline" ? "Not checked (offline)" : connectivityStatus === "server_unavailable" ? "Unavailable or unhealthy" : "Checking"}`}</Hint>
+                <Hint>{`Backend reachability: ${connectivityStatus === "online" ? "Reachable" : connectivityStatus === "offline" ? "Not checked (offline)" : connectivityStatus === "server_unavailable" ? "Unavailable or unhealthy" : "Checking"}`}</Hint>
+                <Hint>{`Offline encrypted database: ${offlineStorageReadiness()}`}</Hint>
+                <Hint>{`SQLite initialization stage: ${storageDiagnostics.stage}`}</Hint>
+                <Hint>{`Native SQLite available: ${storageDiagnostics.nativeSQLiteAvailable ? "Yes" : "No / not initialized"}`}</Hint>
+                <Hint>{`SQLCipher supported: ${storageDiagnostics.sqlCipherSupported === null ? "Not checked" : storageDiagnostics.sqlCipherSupported ? "Yes" : "No"}`}</Hint>
+                <Hint>{`SecureStore key exists: ${storageDiagnostics.secureKeyExists === null ? "Not checked" : storageDiagnostics.secureKeyExists ? "Yes" : "No"}`}</Hint>
+                <Hint>{`SecureStore key retrieval: ${storageDiagnostics.secureKeyReadSucceeded === null ? "Not checked" : storageDiagnostics.secureKeyReadSucceeded ? "Succeeded" : "Failed"}`}</Hint>
+                <Hint>{`Database open: ${storageDiagnostics.databaseOpenSucceeded === null ? "Not checked" : storageDiagnostics.databaseOpenSucceeded ? "Succeeded" : "Failed"}`}</Hint>
+                <Hint>{`Encryption verification: ${storageDiagnostics.encryptionVerified === null ? "Not checked" : storageDiagnostics.encryptionVerified ? "Succeeded" : "Failed"}`}</Hint>
+                <Hint>{`Migration: ${storageDiagnostics.migrationSucceeded === null ? "Not checked" : storageDiagnostics.migrationSucceeded ? "Succeeded" : "Failed"}`}</Hint>
+                <Hint>{`Storage error category: ${storageDiagnostics.errorCategory}`}</Hint>
+                {!!storageDiagnostics.errorMessage && <Hint>{`Storage detail: ${storageDiagnostics.errorMessage}`}</Hint>}
+                <Hint>{`Offline database ready: ${storageDiagnostics.readiness === "ready" ? "Yes" : "No"}`}</Hint>
+                <Hint>{`Offline authorization: ${offlineAccountRef.current && data.signedIn ? "Active for this shop (30-day policy)" : "Not active"}`}</Hint>
+                <Hint>{`Sync queue: ${syncStatus ? `${syncStatus.pending} pending, ${syncStatus.failed} failed, ${syncStatus.conflicts} conflicted` : "Unavailable or not initialized"}`}</Hint>
                 <Hint>{`Last health-check HTTP status: ${networkDiagnostics.healthHttpStatus ?? "Not received"}`}</Hint>
+                <Hint>{`Last API response: ${networkDiagnostics.lastApiResponseStatus === null ? "None" : `HTTP ${networkDiagnostics.lastApiResponseStatus}`}${networkDiagnostics.lastApiResponseAt ? ` at ${new Date(networkDiagnostics.lastApiResponseAt).toLocaleString()}` : ""}`}</Hint>
                 <Hint>{`Last request duration: ${networkDiagnostics.healthDurationMs === null ? "Not available" : `${networkDiagnostics.healthDurationMs} ms`}`}</Hint>
                 <Hint>{`Last network error category: ${networkDiagnostics.healthErrorCategory || "None"}`}</Hint>
                 {!!networkDiagnostics.healthErrorDetail && (
@@ -3321,6 +3344,11 @@ function AppContent() {
                 title={networkDiagnosticsRetrying ? "Checking…" : "Retry Connection"}
                 disabled={networkDiagnosticsRetrying}
                 onPress={() => void retryNetworkDiagnostics()}
+              />
+              <Button
+                title={storageRetrying ? "Retrying storage…" : "Retry Storage Initialization"}
+                disabled={storageRetrying || storageDiagnostics.readiness === "ready"}
+                onPress={() => void retryStorageInitialization()}
               />
               <Button
                 title="Close"

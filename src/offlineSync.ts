@@ -25,7 +25,11 @@ const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 async function runOnce(accountId: string, pullRemote: boolean) {
   const offlineSession = await readOfflineSession();
   if (!offlineSession || offlineSession.accountId !== accountId) return null;
-  if ((await checkConnectivity()) !== "online") return null;
+  // Do not gate mutation replay on the unauthenticated health probe. The API
+  // request itself is the authoritative reachability check; any HTTP response
+  // updates shared connectivity evidence, while transport failures leave the
+  // durable queue untouched for retry.
+  if ((await checkConnectivity()) === "offline") return null;
   while (true) {
     let pending = await readNextChange(accountId);
     while (pending) {
