@@ -1,5 +1,17 @@
 import React, { createContext, useContext } from "react";
-import { Text as NativeText, TextProps } from "react-native";
+import { Alert, AlertButton, AlertOptions, Text as NativeText, TextProps } from "react-native";
+import { localeId } from "./locales";
+import { localeDictionaries } from "./translations";
+import { APP_RUNTIME_TRANSLATION_KEYS, APP_STATIC_TRANSLATION_KEYS } from "./translationInventory";
+import {
+  formatCurrency,
+  formatLocaleDate,
+  interpolate,
+  localeDirection,
+  measureTranslationCoverage,
+  pluralTemplate,
+  resolveLocaleText,
+} from "./localization";
 export const LanguageContext = createContext("English");
 const hindi: Record<string, string> = {
   "Welcome to": "स्वागत है",
@@ -169,11 +181,69 @@ const hindi: Record<string, string> = {
   हिन्दी: "हिन्दी",
 };
 export function translate(value: string, language: string): string {
-  if (language !== "हिन्दी") return value;
-  const trim = value.trim();
-  if (hindi[trim]) return value.replace(trim, hindi[trim]);
-  return value;
+  const id = localeId(language);
+  if (id === "en") return value;
+  const dictionary = id === "hi"
+    ? { ...hindi, ...localeDictionaries.hi }
+    : localeDictionaries[id] || {};
+  return resolveLocaleText(value, dictionary);
 }
+
+export function t(
+  key: string,
+  language: string,
+  parameters: Record<string, string | number> = {},
+) {
+  return interpolate(translate(key, language), parameters);
+}
+
+/** Localizes application-owned Alert copy at the call site using the active locale. */
+export function showLocalizedAlert(
+  language: string,
+  title: string,
+  message?: string,
+  buttons?: AlertButton[],
+  options?: AlertOptions,
+) {
+  return Alert.alert(
+    translate(title, language),
+    message === undefined ? undefined : translate(message, language),
+    buttons?.map((button) => ({
+      ...button,
+      text: button.text ? translate(button.text, language) : button.text,
+    })),
+    options,
+  );
+}
+
+export function plural(
+  language: string,
+  count: number,
+  forms: Partial<Record<Intl.LDMLPluralRule, string>> & { other: string },
+) {
+  return t(pluralTemplate(language, count, forms), language);
+}
+
+export { formatCurrency, formatLocaleDate, localeDirection };
+
+const untranslatedButLocaleInvariant = new Set(["SMS", "WhatsApp"]);
+
+export function translationCoverageStats(language: string) {
+  const id = localeId(language);
+  const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
+    .filter((key) => key !== "98XXXXXXXX");
+  const dictionary = id === "hi" ? { ...hindi, ...localeDictionaries.hi } : localeDictionaries[id] || {};
+  return measureTranslationCoverage(required, dictionary, id, untranslatedButLocaleInvariant);
+}
+
+export function translationCoverage(language: string) {
+  const id = localeId(language);
+  if (id === "en") return "English source text";
+  const { required, translated } = translationCoverageStats(id);
+  const percent = required ? Math.round((translated * 100) / required) : 100;
+  return `${translated}/${required} UI strings · ${percent}%`;
+}
+
 export function Text({ children, ...props }: TextProps) {
   const language = useContext(LanguageContext);
   const transform = (child: React.ReactNode): React.ReactNode =>
@@ -182,5 +252,15 @@ export function Text({ children, ...props }: TextProps) {
       : Array.isArray(child)
         ? child.map(transform)
         : child;
-  return <NativeText {...props}>{transform(children)}</NativeText>;
+  return (
+    <NativeText
+      {...props}
+      style={[
+        props.style,
+        localeDirection(language) === "rtl" ? { writingDirection: "rtl" } : null,
+      ]}
+    >
+      {transform(children)}
+    </NativeText>
+  );
 }

@@ -40,7 +40,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
         if (
           error instanceof api.ApiError &&
           error.status === 409 &&
-          error.payload?.type === "shop_settings_conflict" &&
+          (error.payload?.type === "shop_settings_conflict" || error.payload?.code === "SHOP_SETTINGS_CONFLICT") &&
           pending.change.settings
         ) {
           await markSettingsConflict(pending.id, pending.change, error.payload.current || {});
@@ -138,7 +138,8 @@ export function synchronizeAccount(
       try {
         result = await runOnce(accountId, state.pullRemote);
       } catch (error) {
-        if (state.rerun) continue;
+        // A concurrent caller must not turn the same failed queue item into an
+        // immediate retry loop. The durable retry schedule owns the next try.
         throw error;
       }
       if (!state.rerun) return result;

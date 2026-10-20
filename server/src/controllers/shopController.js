@@ -59,7 +59,7 @@ export const handle_patch_shop = async (req, res, next) => {
     res.json(shopOut(s));
   } catch (e) {
     if (e.status === 409 && e.current !== undefined)
-      return res.status(409).json({ error: e.message, type: "shop_settings_conflict", current: e.current, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1 });
+      return res.status(409).json({ error: e.message, code: e.code || "SHOP_SETTINGS_CONFLICT", type: "shop_settings_conflict", current: e.current, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1 });
     if (e.status === 404 || e.status === 409) return error(res, e.status, e.message);
     next(e);
   }
@@ -80,7 +80,7 @@ export const handle_post_shop_resolve = async (req, res, next) => {
     }));
   } catch (e) {
     if (e.status === 409)
-      return res.status(409).json({ error: e.message, ...(e.current !== undefined ? { type: "shop_settings_conflict", current: e.current, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1 } : {}), ...(e.code ? { code: e.code } : {}), ...(e.audit ? { audit: e.audit } : {}) });
+      return res.status(409).json({ error: e.message, ...(e.current !== undefined ? { type: "shop_settings_conflict", current: e.current, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1, code: e.code || "SHOP_SETTINGS_CONFLICT" } : {}), ...(e.code ? { code: e.code } : {}), ...(e.audit ? { audit: e.audit } : {}) });
     if (e.status === 403 || e.status === 404) return error(res, e.status, e.message);
     next(e);
   }

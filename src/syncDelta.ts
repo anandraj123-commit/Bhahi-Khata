@@ -1,5 +1,6 @@
 import type { Audit, Customer, Data, Entry } from "./model";
 import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
+import { shouldSyncShopSettings } from "./settingsSync";
 
 export type RecordChange<T> = {
   operation: "create" | "update" | "delete";
@@ -20,8 +21,12 @@ export type SyncDelta = {
 
 /** Normalize durable queue records written by app versions that had Due Date. */
 export function normalizeSyncDelta(change: SyncDelta): SyncDelta {
+  const { settings, ...records } = change;
+  const serverSettingsChanged = settings &&
+    shouldSyncShopSettings(settings.before, settings.after);
   return {
-    ...change,
+    ...records,
+    ...(serverSettingsChanged ? { settings } : {}),
     entries: change.entries.map((item) => ({
       ...item,
       ...(item.before ? { before: withoutLegacyDue(item.before) as Entry } : {}),
@@ -63,7 +68,7 @@ export function createSyncDelta(previous: Data, next: Data): SyncDelta {
   const after = settingsOf(next);
   const priorAuditIds = new Set(previous.audit.map((item) => item.id));
   return normalizeSyncDelta({
-    ...(equal(before, after) ? {} : { settings: { before, after } }),
+    ...(shouldSyncShopSettings(before, after) ? { settings: { before, after } } : {}),
     customers: changes(previous.customers, next.customers),
     entries: changes(
       previous.entries.map((entry) => withoutLegacyDue(entry) as Entry),

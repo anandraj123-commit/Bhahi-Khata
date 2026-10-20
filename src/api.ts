@@ -488,7 +488,6 @@ export async function syncQueuedChange(change: SyncDelta) {
       address: value.shop.address,
       phone: value.shop.phone.startsWith("+") ? value.shop.phone : `+91${value.shop.phone}`,
       whatsapp: value.shop.whatsapp,
-      language: value.language,
       defaultMethod: value.defaultMethod,
       reminders: value.reminders,
     });
@@ -503,7 +502,8 @@ export async function syncQueuedChange(change: SyncDelta) {
     }) as Record<string, any>;
     acknowledged.settings = {
       shop: { name: saved.name, owner: saved.owner, address: saved.address, phone: String(saved.phone).replace(/^\+91/, ""), whatsapp: saved.whatsapp, serverVersion: saved.serverVersion, resolutionVersion: saved.resolutionVersion },
-      language: saved.language,
+      // Language is a device-local preference, not part of this server update.
+      language: settings.language,
       defaultMethod: saved.defaultMethod,
       reminders: saved.reminders,
     };
@@ -648,7 +648,6 @@ export async function resolveSettingsConflict(conflict: PendingSettingsConflict,
   const proposed = {
     ...conflict.local.shop,
     phone: conflict.local.shop.phone.startsWith("+") ? conflict.local.shop.phone : `+91${conflict.local.shop.phone}`,
-    language: conflict.local.language,
     defaultMethod: conflict.local.defaultMethod,
     reminders: conflict.local.reminders,
   };

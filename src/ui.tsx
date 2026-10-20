@@ -1,6 +1,8 @@
-import { Text } from "./i18n";
-import React from "react";
+import { LanguageContext, Text, localeDirection, t, translate } from "./i18n";
+import React, { useMemo, useState } from "react";
 import {
+  FlatList,
+  Modal,
   View,
   Pressable,
   TextInput,
@@ -9,6 +11,8 @@ import {
   TextInputProps,
 } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
+import { LOCALE_BY_ID, LOCALES, localeId } from "./locales";
+import { translationCoverage } from "./i18n";
 export const colors = {
   green: "#15803D",
   greenBg: "#F0FDF4",
@@ -76,17 +80,21 @@ export function Button({
   );
 }
 export function Field({ label, ...props }: TextInputProps & { label: string }) {
+  const language = React.useContext(LanguageContext);
+  const numericInput = ["phone-pad", "numeric", "decimal-pad"].includes(String(props.keyboardType || ""));
   return (
     <View style={s.field}>
       <Text style={s.label}>{label}</Text>
       <TextInput
-        accessibilityLabel={label}
+        accessibilityLabel={translate(label, language)}
         placeholderTextColor="#9AA49F"
         style={[
           s.input,
           props.multiline && { height: 120, textAlignVertical: "top" },
+          localeDirection(language) === "rtl" && !numericInput ? { writingDirection: "rtl", textAlign: "right" } : null,
         ]}
         {...props}
+        placeholder={props.placeholder ? translate(props.placeholder, language) : undefined}
       />
     </View>
   );
@@ -133,7 +141,81 @@ export function Chips({
           </Text>
         </Pressable>
       ))}
-    </View>
+  </View>
+);
+}
+
+export function LanguagePicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (locale: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const language = React.useContext(LanguageContext);
+  const selectedId = localeId(value);
+  const selected = LOCALE_BY_ID[selectedId];
+  const options = useMemo(() => {
+    const search = query.trim().toLocaleLowerCase();
+    return LOCALES.filter((locale) =>
+      !search || `${locale.nativeName} ${locale.englishName} ${locale.id}`.toLocaleLowerCase().includes(search),
+    );
+  }, [query]);
+  return (
+    <>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={t("Language: {{name}}", language, { name: selected.nativeName })}
+        onPress={() => { setQuery(""); setOpen(true); }}
+        style={[s.row, { backgroundColor: "white", borderRadius: 9, borderWidth: 1, borderColor: colors.border, padding: 13 }]}
+      >
+        <View style={{ flex: 1 }}>
+          <Text style={s.rowTitle}>{selected.nativeName}</Text>
+          <Text style={s.small}>{selected.englishName} · {translationCoverage(selectedId)}</Text>
+        </View>
+        <Ionicons name="chevron-down" size={18} color={colors.muted} />
+      </Pressable>
+      <Modal visible={open} animationType="slide" transparent onRequestClose={() => setOpen(false)}>
+        <View style={{ flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(15,23,42,0.4)" }}>
+          <View style={{ maxHeight: "88%", backgroundColor: colors.bg, borderTopLeftRadius: 18, borderTopRightRadius: 18, padding: 18 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <Text style={s.heading}>Choose language</Text>
+              <Pressable accessibilityRole="button" accessibilityLabel={translate("Close language picker", language)} onPress={() => setOpen(false)} style={{ padding: 8 }}>
+                <Ionicons name="close" size={22} color={colors.dark} />
+              </Pressable>
+            </View>
+            <TextInput
+              accessibilityLabel={translate("Search languages", language)}
+              value={query}
+              onChangeText={setQuery}
+              placeholder={translate("Search by language name or code", language)}
+              placeholderTextColor="#9AA49F"
+              style={{ backgroundColor: "white", borderWidth: 1, borderColor: colors.border, borderRadius: 9, paddingHorizontal: 13, paddingVertical: 11, marginBottom: 10, color: colors.dark }}
+              autoCapitalize="none"
+            />
+            <FlatList
+              data={options}
+              keyExtractor={(locale) => locale.id}
+              keyboardShouldPersistTaps="handled"
+              renderItem={({ item: locale }) => (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: locale.id === selectedId }}
+                  onPress={() => { onChange(locale.id); setOpen(false); }}
+                  style={{ backgroundColor: locale.id === selectedId ? colors.greenBg : "white", borderWidth: 1, borderColor: locale.id === selectedId ? colors.greenBorder : colors.border, borderRadius: 9, padding: 12, marginBottom: 7 }}
+                >
+                  <Text style={[s.rowTitle, locale.id === selectedId && { color: colors.green }]}>{locale.nativeName}</Text>
+                  <Text style={s.small}>{locale.englishName} · {translationCoverage(locale.id)}</Text>
+                </Pressable>
+              )}
+              ListEmptyComponent={<Hint>No matching languages</Hint>}
+            />
+          </View>
+        </View>
+      </Modal>
+    </>
   );
 }
 export function Row({

@@ -7,6 +7,21 @@ export const sameEntryValues = (left, right) =>
     (key) => left[key] === right[key],
   );
 export const sameShopValues = (left, right) =>
-  ["name", "owner", "address", "phone", "whatsapp", "language", "defaultMethod"].every(
+  ["name", "owner", "address", "phone", "whatsapp", "defaultMethod"].every(
     (key) => left[key] === right[key],
-  ) && JSON.stringify(left.reminders) === JSON.stringify(right.reminders);
+  ) && (right.language === undefined || left.language === right.language) &&
+  JSON.stringify(left.reminders) === JSON.stringify(right.reminders);
+
+export const isShopSettingsConflict = ({
+  current,
+  input,
+  base,
+  actualVersion,
+  baseVersion,
+  actualResolutionVersion,
+  baseResolutionVersion,
+}) =>
+  ((base?.success && !sameShopValues(current, base.data)) ||
+    (baseVersion && actualVersion !== baseVersion) ||
+    (baseResolutionVersion && actualResolutionVersion !== baseResolutionVersion)) &&
+  !sameShopValues(current, input);

@@ -1,9 +1,11 @@
-import { LanguageContext, Text } from "./src/i18n";
+import { formatCurrency, LanguageContext, showLocalizedAlert, t, Text } from "./src/i18n";
+import { apiErrorTranslationKey } from "./src/localization";
+import { readLanguagePreference, saveLanguagePreference } from "./src/languagePreference";
 import ErrorBoundary from "./src/ErrorBoundary";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Alert,
+  Alert as NativeAlert,
   BackHandler,
   FlatList,
   KeyboardAvoidingView,
@@ -29,7 +31,6 @@ import {
   Entry,
   financialSummary,
   initialData,
-  money,
   monthly,
   periodReceived,
   periodUdhari,
@@ -67,6 +68,7 @@ import {
   offlineStorageReadiness,
   offlineStorageDiagnostics,
   retryOfflineStorageInitialization,
+  saveLocalLanguagePreference,
   readCachedAccount,
   readSubscriptionSnapshot,
   readPendingConflicts,
@@ -102,6 +104,7 @@ import {
   Field,
   Hint,
   Icon,
+  LanguagePicker,
   Row,
   s,
   Title,
@@ -161,10 +164,11 @@ const isOfflineError = (error: unknown) =>
       /network request failed|failed to fetch|network error|internet connection/i.test(
         error.message,
       )));
-const showOtpError = (title: string, error: unknown, fallback: string) => {
+const showOtpError = (title: string, error: unknown, fallback: string, language: string) => {
   const unreachable = isOfflineError(error);
   const offline = currentConnectivity() === "offline";
-  Alert.alert(
+  showLocalizedAlert(
+    language,
     unreachable && offline ? "You’re offline" : unreachable ? "Server unavailable" : title,
     unreachable && offline
       ? "Connect to Wi-Fi or another network to sign in."
@@ -181,7 +185,18 @@ const errorMessage = (error: unknown, fallback: string) =>
         ? "No active network connection. Connect to Wi-Fi or another network and try again."
         : "Could not reach the Digital-Khata server on the current network. Try again when the server is available."
     : error instanceof api.ApiError
-      ? error.message
+      ? (() => {
+          const code = error.payload?.code;
+          if (__DEV__) {
+            // Server text is diagnostic only; never render it directly. Do not log response bodies.
+            console.warn("Digital-Khata API request failed", {
+              status: error.status,
+              code: typeof code === "string" ? code : undefined,
+              message: error.message.slice(0, 240),
+            });
+          }
+          return apiErrorTranslationKey(code, error.status);
+        })()
       : fallback;
 const titles: Partial<Record<Screen, string>> = {
   login: "Login",
@@ -217,11 +232,12 @@ async function scheduleSubscriptionNotifications(
   snapshot: SubscriptionSnapshot,
   accountId: string,
   requestPermission: boolean,
+  language: string,
 ) {
   const Notifications = await loadNotifications();
   if (Platform.OS === "android")
     await Notifications.setNotificationChannelAsync("subscription", {
-      name: "Subscription reminders",
+      name: t("Subscription reminders", language),
       importance: Notifications.AndroidImportance.DEFAULT,
     });
   let permission = await Notifications.getPermissionsAsync();
@@ -257,11 +273,13 @@ async function scheduleSubscriptionNotifications(
     triggerDate.setDate(triggerDate.getDate() - days);
     triggerDate.setHours(9, 0, 0, 0);
     if (triggerDate.getTime() <= Date.now()) continue;
-    const remaining = days === 0 ? "expires today" : `expires in ${days} ${days === 1 ? "day" : "days"}`;
+    const remaining = days === 0
+      ? t("expires today", language)
+      : t("expires in {{days}} days", language, { days });
     const identifier = await Notifications.scheduleNotificationAsync({
       content: {
-        title: "Digital-Khata subscription reminder",
-        body: `Your ${snapshot.current.plan.name} plan ${remaining}. Review renewal options in My Subscription.`,
+        title: t("Digital-Khata subscription reminder", language),
+        body: t("Your {{plan}} plan {{remaining}}. Review renewal options in My Subscription.", language, { plan: snapshot.current.plan.name, remaining }),
         data: { kind: "subscription-expiry", accountId, screen: "subscription" },
       },
       trigger: {
@@ -287,6 +305,18 @@ async function cancelSubscriptionNotifications(accountId: string) {
 
 function AppContent() {
   const [data, setData] = useState<Data>(initialData);
+  const activeLanguageRef = useRef(data.language);
+  activeLanguageRef.current = data.language;
+  const languagePreferenceRevision = useRef(0);
+  const languageChosenRef = useRef(false);
+  // Keep existing Alert call sites reactive to the current render's locale.
+  const Alert = {
+    alert: (...args: Parameters<typeof NativeAlert.alert>) => showLocalizedAlert(activeLanguageRef.current, ...args),
+  };
+  const money = (amount: number) => formatCurrency(amount, data.language);
+  const withDeviceLanguage = (value: Data): Data => languageChosenRef.current
+    ? { ...value, language: activeLanguageRef.current }
+    : value;
   const dataRef = useRef(data);
   const persistedRef = useRef<Data | null>(null);
   const offlineAccountRef = useRef<string | null>(null);
@@ -405,7 +435,7 @@ function AppContent() {
   const [form, setForm] = useState<Record<string, string>>({});
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
-  const [otpHint, setOtpHint] = useState("");
+  const [otpHint, setOtpHint] = useState<{ key: string; parameters?: Record<string, string | number> } | null>(null);
   const [otpVerified, setOtpVerified] = useState(false);
   const [notices, setNotices] = useState<{id:string;title:string;body:string;read:boolean;date:string}[]>([]);
   const [seconds, setSeconds] = useState(30);
@@ -501,6 +531,7 @@ function AppContent() {
           snapshot,
           accountId,
           promptPermission,
+          dataRef.current.language,
         );
         snapshot.notificationsGranted = reminders.granted;
         snapshot.localNotificationIds = reminders.identifiers;
@@ -517,7 +548,7 @@ function AppContent() {
         setSubscriptionSnapshot(snapshot);
         setSubscriptionLoadError("");
         try {
-          const reminders = await scheduleSubscriptionNotifications(snapshot, accountId, false);
+          const reminders = await scheduleSubscriptionNotifications(snapshot, accountId, false, dataRef.current.language);
           snapshot.notificationsGranted = reminders.granted;
           snapshot.localNotificationIds = reminders.identifiers;
         } catch { snapshot.notificationsGranted = false; }
@@ -652,11 +683,12 @@ function AppContent() {
             ? await readCachedAccount(offlineSession.accountId)
             : null;
           if (live && offlineSession && cached && validBackup(cached)) {
+            const local = withDeviceLanguage(cached);
             offlineAccountRef.current = offlineSession.accountId;
-            setData(cached);
-            dataRef.current = cached;
-            persistedRef.current = cached;
-            setRoute({ screen: (cached.shopComplete ?? Boolean(cached.shop.name.trim() && cached.shop.owner.trim())) ? "home" : "setup" });
+            setData(local);
+            dataRef.current = local;
+            persistedRef.current = local;
+            setRoute({ screen: (local.shopComplete ?? Boolean(local.shop.name.trim() && local.shop.owner.trim())) ? "home" : "setup" });
           } else if (live) {
             setRoute({ screen: "login" });
             Alert.alert(
@@ -707,6 +739,7 @@ function AppContent() {
               }
             }
           }
+          parsed = withDeviceLanguage(parsed);
           setData(parsed);
           dataRef.current = parsed;
           persistedRef.current = parsed;
@@ -735,11 +768,12 @@ function AppContent() {
             cached = null;
           }
           if (offlineSession && cached && validBackup(cached)) {
+            const local = withDeviceLanguage(cached);
             offlineAccountRef.current = offlineSession.accountId;
-            setData(cached);
-            dataRef.current = cached;
-            persistedRef.current = cached;
-            setRoute({ screen: (cached.shopComplete ?? Boolean(cached.shop.name.trim() && cached.shop.owner.trim())) ? "home" : "setup" });
+            setData(local);
+            dataRef.current = local;
+            persistedRef.current = local;
+            setRoute({ screen: (local.shopComplete ?? Boolean(local.shop.name.trim() && local.shop.owner.trim())) ? "home" : "setup" });
           } else {
             setRoute({ screen: "login" });
             if (isOfflineError(error) && currentConnectivity() === "offline")
@@ -769,6 +803,22 @@ function AppContent() {
     return () => {
       live = false;
     };
+  }, []);
+  useEffect(() => {
+    let live = true;
+    const revisionAtRead = languagePreferenceRevision.current;
+    void readLanguagePreference().then((language) => {
+      if (!live || !language || languagePreferenceRevision.current !== revisionAtRead) return;
+      const next = { ...dataRef.current, language };
+      languageChosenRef.current = true;
+      activeLanguageRef.current = language;
+      localRevision.current += 1;
+      dataRef.current = next;
+      setData(next);
+      if (persistedRef.current?.signedIn)
+        persistedRef.current = { ...persistedRef.current, language };
+    }).catch(() => { /* Language selection is optional if SecureStore is unavailable. */ });
+    return () => { live = false; };
   }, []);
   useEffect(() => {
     if (!data.signedIn || data.shopExists === false) return;
@@ -938,9 +988,9 @@ function AppContent() {
     const sub = BackHandler.addEventListener("hardwareBackPress", back);
     return () => sub.remove();
   }, [history, route, data.signedIn]);
-  function commit(next: Data): Promise<boolean> {
+  function commit(next: Data, previousOverride?: Data): Promise<boolean> {
     if (loadError) return Promise.resolve(false);
-    const previous = dataRef.current;
+    const previous = previousOverride || dataRef.current;
     dataRef.current = next;
     const operation = writeQueue.current.then(async () => {
       try {
@@ -963,14 +1013,14 @@ function AppContent() {
                 throw new Error("OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE");
               await api.syncChange(persisted, next);
               persistedRef.current = next;
-              setData(next);
+              if (dataRef.current === next) setData(next);
               return true;
             }
             localRevision.current += 1;
             void refreshSyncStatus(accountId);
             const revision = localRevision.current;
             persistedRef.current = next;
-            setData(next);
+            if (dataRef.current === next) setData(next);
             void synchronizeAccount(accountId, false)
               .then(async (remote) => {
                 syncNotice.current = null;
@@ -1003,7 +1053,7 @@ function AppContent() {
           await api.syncChange(persisted, next);
           persistedRef.current = next;
         }
-        setData(next);
+        if (dataRef.current === next) setData(next);
         return true;
       } catch (error) {
         if (dataRef.current === next) {
@@ -1034,6 +1084,23 @@ function AppContent() {
       lock.current = false;
       setBusy(false);
     }
+  }
+  function selectLanguage(language: string) {
+    languageChosenRef.current = true;
+    languagePreferenceRevision.current += 1;
+    const next = { ...dataRef.current, language };
+    // Language is device-local presentation state. Persist it locally without
+    // creating a versioned shop-settings write or queue entry.
+    dataRef.current = next;
+    activeLanguageRef.current = language;
+    localRevision.current += 1;
+    setData(next);
+    void saveLanguagePreference(language).catch(() => {});
+    const accountId = offlineAccountRef.current;
+    if (accountId && offlineStorageAvailable())
+      void saveLocalLanguagePreference(accountId, language).catch(() => {});
+    if (persistedRef.current?.signedIn)
+      persistedRef.current = { ...persistedRef.current, language };
   }
   async function completeShopSetup() {
     if (lock.current) return;
@@ -2027,11 +2094,7 @@ function AppContent() {
             <Title>Simple digital khata</Title>
             <Hint>Udhari ka hisaab, ab aur bhi aasan</Hint>
           </Card>
-          <Chips
-            items={["English", "हिन्दी"]}
-            value={data.language}
-            onChange={(language) => commit({ ...data, language })}
-          />
+          <LanguagePicker value={data.language} onChange={selectLanguage} />
           <Button title="Login" onPress={() => go("login")} />
           <Button
             title="Create Account"
@@ -2074,11 +2137,13 @@ function AppContent() {
                 const result = await api.startOtp(`+91${phone}`);
                 setOtp("");
                 setOtpVerified(false);
-                setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A verification code was sent by SMS.");
+                setOtpHint(result.developmentCode
+                  ? { key: "Local development OTP: {{code}}", parameters: { code: result.developmentCode } }
+                  : { key: "A verification code was sent by SMS." });
                 setSeconds(30);
                 go("otp");
               } catch (error) {
-                showOtpError("Could not send OTP", error, "Please try again.");
+                showOtpError("Could not send OTP", error, "Please try again.", activeLanguageRef.current);
               } finally { setBusy(false); }
             }}
           />
@@ -2106,7 +2171,9 @@ function AppContent() {
       content = (
         <>
           <Title>Enter OTP</Title>
-          <Hint>{otpHint || `Verification code sent to +91 ${phone}`}</Hint>
+          <Hint>{otpHint
+            ? t(otpHint.key, data.language, otpHint.parameters)
+            : t("Verification code sent to +91 {{phone}}", data.language, { phone })}</Hint>
           <Field
             label="Verification code"
             keyboardType="number-pad"
@@ -2125,13 +2192,15 @@ function AppContent() {
               try {
                 const result = await api.startOtp(`+91${phone}`);
                 setOtpVerified(false);
-                setOtpHint(result.developmentCode ? `Local development OTP: ${result.developmentCode}` : "A new verification code was sent by SMS.");
-              } catch (error) { showOtpError("Could not resend OTP", error, "Please try again."); }
+                setOtpHint(result.developmentCode
+                  ? { key: "Local development OTP: {{code}}", parameters: { code: result.developmentCode } }
+                  : { key: "A new verification code was sent by SMS." });
+              } catch (error) { showOtpError("Could not resend OTP", error, "Please try again.", activeLanguageRef.current); }
             }}
           >
-            <Text style={s.link}>
+              <Text style={s.link}>
               {seconds
-                ? `Resend OTP in 00:${String(seconds).padStart(2, "0")}`
+                ? t("Resend OTP in 00:{{seconds}}", data.language, { seconds: String(seconds).padStart(2, "0") })
                 : "Resend OTP"}
             </Text>
           </Pressable>
@@ -2158,12 +2227,15 @@ function AppContent() {
                         "OTP verified, but account details could not be loaded",
                         error.cause,
                         "Your sign-in is saved. Check your connection and tap Continue to retry.",
+                        activeLanguageRef.current,
                       );
                       return;
                     }
                     throw error;
                   }
                 }
+                if (languageChosenRef.current)
+                  remote = { ...remote, language: activeLanguageRef.current };
                 const id = remote.shopExists ? accountKey(remote.shop.phone || `+91${phone}`) : "";
                 offlineAccountRef.current = id && offlineStorageAvailable() ? id : null;
                 if (id && offlineStorageAvailable()) {
@@ -2188,7 +2260,7 @@ function AppContent() {
                 setOtpVerified(false);
                 if (remote.shopComplete) go("home", undefined, true);
                 else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ name: remote.shop.name, owner: remote.shop.owner, address: remote.shop.address, phone, whatsapp: remote.shop.whatsapp }); }
-              } catch (error) { showOtpError(otpVerified ? "Could not load your account" : "Could not verify OTP", error, "Check your connection and try again."); }
+              } catch (error) { showOtpError(otpVerified ? "Could not load your account" : "Could not verify OTP", error, "Check your connection and try again.", activeLanguageRef.current); }
               finally { setBusy(false); }
             }}
           />
@@ -2217,17 +2289,7 @@ function AppContent() {
             placeholder: "98XXXXXXXX",
           })}
           <Title>Language</Title>
-          <Chips
-            items={["English", "हिन्दी"]}
-            value={data.language}
-            onChange={(language) => {
-              if (data.shopExists === false) {
-                const next = { ...data, language };
-                dataRef.current = next;
-                setData(next);
-              } else void commit({ ...data, language });
-            }}
-          />
+          <LanguagePicker value={data.language} onChange={selectLanguage} />
           <Button
             title={data.shopExists !== false ? "Save Profile" : "Start Using Khata"}
             disabled={busy}
@@ -2438,7 +2500,7 @@ function AppContent() {
         if ((customer.openingAdvance || 0) > 0)
           historyItems.push({ id: "opening-advance", element: <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} /> });
         if (customer.opening > 0 && (customer.openingAdvance || 0) > 0)
-          historyItems.push({ id: "opening-adjustment", element: <Row title="Opening Advance Adjusted Against Udhari" subtitle={`Remaining advance: ${money(Math.max(0, customer.openingAdvance! - customer.opening))}`} value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} /> });
+          historyItems.push({ id: "opening-adjustment", element: <Row title="Opening Advance Adjusted Against Udhari" subtitle={t("Remaining advance: {{amount}}", data.language, { amount: money(Math.max(0, customer.openingAdvance! - customer.opening)) })} value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} /> });
         historyItems.push(...entries.map((entry) => ({ id: entry.id, element: entryRow(entry) })));
         const transactionPage = pageRecords(historyItems);
         const customerFinancial = financialSummary(data, customer.id);
@@ -2822,7 +2884,7 @@ function AppContent() {
         footer: listFooter(transactionPage.hasMore),
         empty: !data.customers.some((customer) => khataCustomerMatchesSearch(customer.name, search))
           ? <Empty title={data.customers.length ? "No matching customers" : "Your monthly khata"} description={data.customers.length ? "Try a different customer search." : "Customer balances will appear here after you add customers."} />
-          : <Empty title="No matching transactions" description={`No ${filter === "All" ? "transactions" : filter === "Udhari" ? "Udhari transactions" : "payments"} for this customer search and month.`} />,
+          : <Empty title="No matching transactions" description={t("No {{items}} for this customer search and month.", data.language, { items: t(filter === "All" ? "transactions" : filter === "Udhari" ? "Udhari transactions" : "payments", data.language) })} />,
       };
       break;
     }
@@ -2912,7 +2974,7 @@ function AppContent() {
               multiline: true,
               style: [s.input, { height: 240, textAlignVertical: "top" }],
             })}
-            <Button title={`Open ${channel}`} onPress={sendStatement} />
+            <Button title={t("Open {{channel}}", data.language, { channel })} onPress={sendStatement} />
             <Hint>You can review and send the message in {channel}.</Hint>
           </>
         );
@@ -3178,11 +3240,7 @@ function AppContent() {
           <Row title="Save backup (JSON)" onPress={() => exportData(true)} />
           <Row title="Restore backup" onPress={restore} />
           <Title>LANGUAGE</Title>
-          <Chips
-            items={["English", "हिन्दी"]}
-            value={data.language}
-            onChange={(language) => commit({ ...data, language })}
-          />
+          <LanguagePicker value={data.language} onChange={selectLanguage} />
           <Hint>Your account data syncs with the server. Export backups regularly.</Hint>
         </>
       );
@@ -3325,34 +3383,34 @@ function AppContent() {
       const asRupees = (minor?: number | null) => money((minor || 0) / 100);
       const remainingText = current?.expiresAt
         ? current.remainingMilliseconds !== null && current.remainingMilliseconds < 86400000
-          ? `${Math.max(0, Math.floor(current.remainingMilliseconds / 3600000))} hours ${Math.max(0, Math.floor((current.remainingMilliseconds % 3600000) / 60000))} minutes remaining`
-          : `${current.remainingDays ?? 0} days remaining`
-        : "Never expires";
+          ? t("{{hours}} hours {{minutes}} minutes remaining", data.language, { hours: Math.max(0, Math.floor(current.remainingMilliseconds / 3600000)), minutes: Math.max(0, Math.floor((current.remainingMilliseconds % 3600000) / 60000)) })
+          : t("{{days}} days remaining", data.language, { days: current.remainingDays ?? 0 })
+        : t("Never expires", data.language);
       content = (
         <>
           {current && (
             <Card>
               <Title>Current Subscription</Title>
               <Row title="Plan" value={current.plan.name} />
-              <Row title="Status" value="Active" />
+              <Row title="Status" value={t("Active", data.language)} />
               <Row title="Start date" value={current.startsAt ? new Date(current.startsAt).toLocaleDateString("en-IN") : "—"} />
-              <Row title="Expiry" value={current.expiresAt ? new Date(current.expiresAt).toLocaleDateString("en-IN") : "Never"} />
+              <Row title="Expiry" value={current.expiresAt ? new Date(current.expiresAt).toLocaleDateString("en-IN") : t("Never", data.language)} />
               <Row title="Time remaining" value={remainingText} />
-              <Row title="Customer limit" value={current.customerUsage.unlimited ? "Unlimited" : String(current.customerUsage.limit ?? 0)} />
+              <Row title="Customer limit" value={current.customerUsage.unlimited ? t("Unlimited", data.language) : String(current.customerUsage.limit ?? 0)} />
               <Row title="Customers used" value={String(current.customerUsage.used)} />
               {!current.customerUsage.unlimited && <Row title="Customer capacity left" value={String(current.customerUsage.remaining ?? 0)} />}
-              {current.durationMonths > 0 && <Row title="Duration" value={`${current.durationMonths} months`} />}
+              {current.durationMonths > 0 && <Row title="Duration" value={t("{{count}} months", data.language, { count: current.durationMonths })} />}
               {current.amountPaidMinor !== null && <Row title="Amount paid" value={asRupees(current.amountPaidMinor)} />}
               {current.scheduled && (
                 <>
                   <Title>Next Scheduled Plan</Title>
                   <Row title="Plan" value={current.scheduled.plan.name} />
                   <Row title="Starts" value={new Date(current.scheduled.startsAt).toLocaleDateString("en-IN")} />
-                  <Row title="Activation" value={`Starts in ${Math.max(0, Math.ceil((new Date(current.scheduled.startsAt).getTime() - Date.now()) / 86400000))} days`} />
-                  <Row title="Duration" value={`${current.scheduled.durationMonths} months`} />
+                  <Row title="Activation" value={t("Starts in {{days}} days", data.language, { days: Math.max(0, Math.ceil((new Date(current.scheduled.startsAt).getTime() - Date.now()) / 86400000)) })} />
+                  <Row title="Duration" value={t("{{count}} months", data.language, { count: current.scheduled.durationMonths })} />
                 </>
               )}
-              {current.isFallback && <Hint>Free plan • ₹0 • 50 customers • Expiry: Never</Hint>}
+              {current.isFallback && <Hint>{t("Free plan • ₹0 • 50 customers • Expiry: Never", data.language)}</Hint>}
             </Card>
           )}
           {(subscriptionSnapshot?.history || []).length > 0 && (
@@ -3361,10 +3419,10 @@ function AppContent() {
               {historyPage.items.map((item) => {
                 const timeRemaining = item.remainingMilliseconds;
                 const remaining = timeRemaining !== null && timeRemaining < 86400000
-                  ? `${Math.floor(timeRemaining / 3600000)} hours ${Math.floor((timeRemaining % 3600000) / 60000)} minutes remaining`
-                  : `${item.remainingDays ?? 0} days remaining`;
+                  ? t("{{hours}} hours {{minutes}} minutes remaining", data.language, { hours: Math.floor(timeRemaining / 3600000), minutes: Math.floor((timeRemaining % 3600000) / 60000) })
+                  : t("{{days}} days remaining", data.language, { days: item.remainingDays ?? 0 });
                 const startsIn = item.startsInDays !== null
-                  ? `Starts in ${item.startsInDays} days`
+                  ? t("Starts in {{days}} days", data.language, { days: item.startsInDays })
                   : null;
                 return (
                   <Card key={item.id}>
@@ -3374,7 +3432,7 @@ function AppContent() {
                     {item.expiresAt && <Row title="Expires" value={new Date(item.expiresAt).toLocaleDateString("en-IN")} />}
                     {item.status === "active" && item.remainingMilliseconds !== null && <Row title="Time remaining" value={remaining} />}
                     {startsIn && <Row title="Activation" value={startsIn} />}
-                    <Row title="Duration" value={`${item.durationMonths} months`} />
+                    <Row title="Duration" value={t("{{count}} months", data.language, { count: item.durationMonths })} />
                     {item.amountPaidMinor !== null && <Row title="Amount paid" value={asRupees(item.amountPaidMinor)} />}
                   </Card>
                 );
@@ -3397,20 +3455,20 @@ function AppContent() {
                   <Text style={[s.heading, { fontSize: 20 }]}>{item.name}</Text>
                   <Text style={s.stat}>{asRupees(item.monthlyPriceMinor)}{item.monthlyPriceMinor ? "/mo" : ""}</Text>
                 </View>
-                <Hint>{item.unlimitedCustomers ? "Unlimited customers" : `${item.customerLimit} customers`}</Hint>
+                <Hint>{item.unlimitedCustomers ? t("Unlimited customers", data.language) : t("{{count}} customers", data.language, { count: item.customerLimit ?? 0 })}</Hint>
               </Card>
             </Pressable>
           ))}
           {selected && selected.code !== "free" && (
             <Card>
               <Title>Subscription duration</Title>
-              <Chips items={selected.durations.map((item) => `${item.months} months`)} value={`${duration} months`} onChange={(value) => setSubscriptionDuration(value.split(" ")[0])} />
+              <Chips items={selected.durations.map((item) => t("{{count}} months", data.language, { count: item.months }))} value={t("{{count}} months", data.language, { count: duration })} onChange={(value) => setSubscriptionDuration(value.split(" ")[0])} />
               {price && (
                 <>
-                  {price.discountPercent > 0 && <Hint>Save {price.discountPercent}% for {price.months} months</Hint>}
+                  {price.discountPercent > 0 && <Hint>{t("Save {{discountPercent}}% for {{months}} months", data.language, { discountPercent: price.discountPercent, months: price.months })}</Hint>}
                   <Row title="Original amount" value={asRupees(price.originalAmountMinor)} />
-                  <Row title={`Discount (${price.discountPercent}%)`} value={`−${asRupees(price.discountAmountMinor)}`} />
-                  <Row title={`Tax (${(price.taxRateBps / 100).toFixed(2)}%)${price.taxInclusive ? " included" : ""}`} value={asRupees(price.taxAmountMinor)} />
+                  <Row title={t("Discount ({{percent}}%)", data.language, { percent: price.discountPercent })} value={`−${asRupees(price.discountAmountMinor)}`} />
+                  <Row title={price.taxInclusive ? t("Tax ({{rate}}%) included", data.language, { rate: (price.taxRateBps / 100).toFixed(2) }) : t("Tax ({{rate}}%)", data.language, { rate: (price.taxRateBps / 100).toFixed(2) })} value={asRupees(price.taxAmountMinor)} />
                   <Row title="Final payable" value={asRupees(price.finalAmountMinor)} />
                 </>
               )}

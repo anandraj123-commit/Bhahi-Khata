@@ -7,7 +7,7 @@ import {
 } from "../models.js";
 import { digest } from "../utils/hashing.js";
 import { shopOut } from "../utils/serializers.js";
-import { sameShopValues } from "../utils/records.js";
+import { isShopSettingsConflict, sameShopValues } from "../utils/records.js";
 import { normalizePhone } from "../utils/phone.js";
 
 const shopScopedModels = [
@@ -92,14 +92,18 @@ export async function updateShop({ shopId, input, base, baseVersion, baseResolut
       if (!shop) throw Object.assign(new Error("Shop not found"), { status: 404 });
       const current = shopOut(shop);
       const actualVersion = shop.serverVersion || 1;
-      if (
-        ((base?.success && !sameShopValues(current, base.data)) ||
-          (baseVersion && actualVersion !== baseVersion) ||
-          (baseResolutionVersion && (shop.resolutionVersion || 1) !== baseResolutionVersion)) &&
-        !sameShopValues(current, input)
-      )
+      if (isShopSettingsConflict({
+        current,
+        input,
+        base,
+        actualVersion,
+        baseVersion,
+        actualResolutionVersion: shop.resolutionVersion || 1,
+        baseResolutionVersion,
+      }))
         throw Object.assign(new Error("Shop settings changed on another device"), {
           status: 409,
+          code: "SHOP_SETTINGS_CONFLICT",
           current,
           serverVersion: actualVersion,
           resolutionVersion: shop.resolutionVersion || 1,

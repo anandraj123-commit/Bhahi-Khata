@@ -651,6 +651,28 @@ export async function readCachedAccount(accountId: string): Promise<Data | null>
   } as Data;
 }
 
+/** Persist a device-local language choice without creating a shop-settings
+ * synchronization operation or replacing cached financial records. */
+export async function saveLocalLanguagePreference(accountId: string, language: string) {
+  const db = await openDatabase();
+  if (!db) return false;
+  let saved = false;
+  await withEncryptedTransaction(db, async (transaction) => {
+    const row = await transaction.getFirstAsync<{ preferences_json: string }>(
+      "SELECT preferences_json FROM local_accounts WHERE account_id = ?",
+      accountId,
+    );
+    if (!row) return;
+    const preferences = JSON.parse(row.preferences_json);
+    await transaction.runAsync(
+      "UPDATE local_accounts SET preferences_json = ?, updated_at = ? WHERE account_id = ?",
+      JSON.stringify({ ...preferences, language }), Date.now(), accountId,
+    );
+    saved = true;
+  });
+  return saved;
+}
+
 export async function cacheSubscriptionSnapshot(accountId: string, snapshot: unknown) {
   const db = await openDatabase();
   if (!db) return false;
@@ -1016,7 +1038,6 @@ export async function completeSettingsConflict(accountId: string, conflict: Pend
       const shop = dependent ? { ...oldShop, serverVersion: authoritative.shop.serverVersion, resolutionVersion: authoritative.shop.resolutionVersion } : authoritative.shop;
       const preferences = dependent ? oldPreferences : {
         ...oldPreferences,
-        language: authoritative.language,
         defaultMethod: authoritative.defaultMethod,
         reminders: authoritative.reminders,
       };
@@ -1344,7 +1365,6 @@ export async function acknowledgeChange(
           JSON.stringify(hasDependent ? { ...oldShop, serverVersion: authoritative.shop.serverVersion, resolutionVersion: authoritative.shop.resolutionVersion } : authoritative.shop),
           JSON.stringify(hasDependent ? oldPreferences : {
             ...oldPreferences,
-            language: authoritative.language,
             defaultMethod: authoritative.defaultMethod,
             reminders: authoritative.reminders,
           }),
