@@ -10,14 +10,26 @@ import {
 } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 export const colors = {
-  green: "#0B9E59",
+  green: "#15803D",
+  greenBg: "#F0FDF4",
+  greenBorder: "#BBF7D0",
   dark: "#203044",
-  muted: "#76818C",
-  orange: "#FF8A00",
-  bg: "#F7FAF8",
-  pale: "#EAF6EF",
-  border: "#E1E8E4",
-  red: "#DC4545",
+  muted: "#475569",
+  orange: "#C2410C",
+  amberBg: "#FFF7ED",
+  amberBorder: "#FED7AA",
+  blue: "#1D4ED8",
+  blueBg: "#EFF6FF",
+  blueBorder: "#BFDBFE",
+  neutral: "#475569",
+  neutralBg: "#F1F5F9",
+  neutralBorder: "#CBD5E1",
+  bg: "#F1F5F9",
+  pale: "#F1F5F9",
+  border: "#CBD5E1",
+  red: "#B91C1C",
+  redBg: "#FEE2E2",
+  redBorder: "#FECACA",
 };
 export const Icon = ({
   name,
@@ -52,12 +64,12 @@ export function Button({
       style={({ pressed }) => [
         s.button,
         secondary && s.secondary,
-        orange && { backgroundColor: colors.orange },
+        orange && { backgroundColor: colors.orange, borderColor: colors.orange },
         danger && { backgroundColor: colors.red },
         (pressed || disabled) && { opacity: 0.55 },
       ]}
     >
-      <Text style={[s.buttonText, secondary && { color: colors.green }]}>
+      <Text style={[s.buttonText, secondary && !orange && !danger && { color: colors.green }]}>
         {title}
       </Text>
     </Pressable>
@@ -89,8 +101,8 @@ export const Card = ({
 export const Title = ({ children }: { children: React.ReactNode }) => (
   <Text style={s.section}>{children}</Text>
 );
-export const Hint = ({ children }: { children: React.ReactNode }) => (
-  <Text style={s.hint}>{children}</Text>
+export const Hint = ({ children, style }: { children: React.ReactNode; style?: any }) => (
+  <Text style={[s.hint, style]}>{children}</Text>
 );
 export function Chips({
   items,
@@ -171,7 +183,7 @@ export function Toggle({
         accessibilityLabel={label}
         value={value}
         onValueChange={onChange}
-        trackColor={{ false: "#D6DFD9", true: "#9CDEBB" }}
+        trackColor={{ false: colors.neutralBorder, true: colors.greenBorder }}
         thumbColor={value ? colors.green : "#fff"}
       />
     </View>
@@ -269,7 +281,7 @@ export const s = StyleSheet.create({
   chipActive: { backgroundColor: colors.green },
   empty: { padding: 28, alignItems: "center", gap: 10 },
   split: { flexDirection: "row", gap: 12 },
-  amount: { fontSize: 32, fontWeight: "800", color: colors.green },
+  amount: { fontSize: 32, fontWeight: "800", color: colors.neutral },
   avatar: {
     width: 44,
     height: 44,
@@ -321,6 +333,6 @@ export const s = StyleSheet.create({
     padding: 12,
   },
   statLabel: { fontSize: 12, color: colors.muted },
-  stat: { fontSize: 22, fontWeight: "800", color: colors.green },
+  stat: { fontSize: 22, fontWeight: "800", color: colors.neutral },
   divider: { height: 1, backgroundColor: colors.border, marginVertical: 8 },
 });

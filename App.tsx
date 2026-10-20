@@ -1312,24 +1312,37 @@ function AppContent() {
       </Pressable>
     </View>
   );
-  const stat = (label: string, value: string, pale = false) => (
-    <Card style={{ flex: 1, backgroundColor: pale ? colors.pale : "white" }}>
-      <Text style={s.statLabel}>{label}</Text>
-      <Text style={s.stat}>{value}</Text>
-    </Card>
-  );
+  const financialPalette = {
+    red: { text: colors.red, background: colors.redBg, border: colors.redBorder },
+    green: { text: colors.green, background: colors.greenBg, border: colors.greenBorder },
+    blue: { text: colors.blue, background: colors.blueBg, border: colors.blueBorder },
+    amber: { text: colors.orange, background: colors.amberBg, border: colors.amberBorder },
+    neutral: { text: colors.neutral, background: colors.neutralBg, border: colors.neutralBorder },
+  };
+  type FinancialTone = keyof typeof financialPalette;
+  const toneForBalance = (amount: number): FinancialTone =>
+    amount > 0 ? "red" : amount < 0 ? "green" : "neutral";
+  const stat = (label: string, value: string, tone: FinancialTone = "neutral") => {
+    const palette = financialPalette[tone];
+    return (
+      <Card style={{ flex: 1, backgroundColor: palette.background, borderColor: palette.border }}>
+        <Text style={s.statLabel}>{label}</Text>
+        <Text style={[s.stat, { color: palette.text }]}>{value}</Text>
+      </Card>
+    );
+  };
   const actions = (id?: string) => (
     <>
       <View style={s.split}>
         <View style={{ flex: 1 }}>
-          <Button title="+ Give Udhari" onPress={() => go("credit", id)} />
+          <Button title="+ Give Udhari" danger onPress={() => go("credit", id)} />
         </View>
         <View style={{ flex: 1 }}>
-          <Button title="Receive Money / Add Advance" orange onPress={() => go("payment", id)} />
+          <Button title="Receive Money / Add Advance" onPress={() => go("payment", id)} />
         </View>
       </View>
       {id && balance(data, id) < 0 && (
-        <Button title="Refund Advance (एडवांस वापस करें)" secondary onPress={() => go("refund", id)} />
+        <Button title="Refund Advance (एडवांस वापस करें)" orange onPress={() => go("refund", id)} />
       )}
     </>
   );
@@ -1353,7 +1366,7 @@ function AppContent() {
               {c.phone || "No phone added"}
             </Text>
           </View>
-          <Text style={{ color: colors.green, fontWeight: "700" }}>
+          <Text style={{ color: financialPalette[isOverdue(c) ? "red" : toneForBalance(balance(data, c.id))].text, fontWeight: "700" }}>
             {balance(data, c.id) < 0
               ? `Advance ${money(-balance(data, c.id))}`
               : money(balance(data, c.id))}
@@ -1391,7 +1404,7 @@ function AppContent() {
           <Text
             style={{
               fontWeight: "700",
-              color: e.type === "payment" ? colors.orange : colors.green,
+              color: financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text,
             }}
           >
             {entrySign(e.type)}
@@ -2098,19 +2111,19 @@ function AppContent() {
             </Pressable>
           </View>
           <View style={s.split}>
-            {stat("Current Outstanding", money(financial.outstandingPaise / 100), true)}
-            {stat("Total Udhari", money(financial.totalUdhariPaise / 100))}
+            {stat("Current Outstanding", money(financial.outstandingPaise / 100), financial.outstandingPaise > 0 ? "red" : "neutral")}
+            {stat("Total Udhari", money(financial.totalUdhariPaise / 100), "blue")}
           </View>
           <View style={s.split}>
-            {stat("Total Money Received", money(financial.totalReceivedPaise / 100))}
-            {stat("Udhari Recovered", money(financial.totalUdhariRecoveredPaise / 100))}
+            {stat("Total Money Received", money(financial.totalReceivedPaise / 100), "green")}
+            {stat("Udhari Recovered", money(financial.totalUdhariRecoveredPaise / 100), "green")}
           </View>
           <View style={s.split}>
-            {stat("Available Advances", money(financial.availableAdvancePaise / 100))}
-            {stat("Advance Deposited", money(financial.totalAdvanceDepositedPaise / 100))}
+            {stat("Available Advances", money(financial.availableAdvancePaise / 100), financial.availableAdvancePaise > 0 ? "green" : "neutral")}
+            {stat("Advance Deposited", money(financial.totalAdvanceDepositedPaise / 100), "blue")}
           </View>
           <View style={s.split}>
-            {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100))}
+            {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100), "amber")}
             {stat("Customers", String(data.customers.length))}
           </View>
           <Hint>Current outstanding and advances are balances. The other totals show recorded activity.</Hint>
@@ -2119,10 +2132,12 @@ function AppContent() {
             {stat(
               "This month’s udhari",
               money(periodUdhari(data, today().slice(0, 7))),
+              "blue",
             )}
             {stat(
               "This month’s collection",
               money(periodReceived(data, today().slice(0, 7))),
+              "green",
             )}
           </View>
           <Title>Recent Transactions</Title>
@@ -2246,29 +2261,31 @@ function AppContent() {
               {customer.phone || "No phone number"} •{" "}
               {customer.address || "No address"}
             </Hint>
-            <Card style={{ backgroundColor: colors.pale }}>
-              <Hint>Current Outstanding</Hint>
-              <Text style={s.amount}>{money(currentOutstandingPaise / 100)}</Text>
-              <Hint>Available Advance: {money(availableAdvancePaise / 100)}</Hint>
+            <Card style={{ backgroundColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].background, borderColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].border }}>
+              <Hint style={{ color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }}>Current Outstanding</Hint>
+              <Text style={[s.amount, { color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }]}>{money(currentOutstandingPaise / 100)}</Text>
+              <Hint style={{ color: financialPalette[availableAdvancePaise > 0 ? "green" : "neutral"].text }}>Available Advance: {money(availableAdvancePaise / 100)}</Hint>
             </Card>
             {actions(customer.id)}
             <View style={s.split}>
               {stat(
                 "Total Udhari",
                 money(totalUdhari(data, customer.id)),
+                "blue",
               )}
               {stat(
                 "Total Money Received",
                 money(customerFinancial.totalReceivedPaise / 100),
+                "green",
               )}
             </View>
             <View style={s.split}>
-              {stat("Udhari Recovered", money(customerFinancial.totalUdhariRecoveredPaise / 100))}
-              {stat("Advance Deposited", money(customerFinancial.totalAdvanceDepositedPaise / 100))}
+              {stat("Udhari Recovered", money(customerFinancial.totalUdhariRecoveredPaise / 100), "green")}
+              {stat("Advance Deposited", money(customerFinancial.totalAdvanceDepositedPaise / 100), "blue")}
             </View>
             <View style={s.split}>
-              {stat("Advance Refunded", money(customerFinancial.totalAdvanceRefundedPaise / 100))}
-              {stat("Available Advance", money(availableAdvancePaise / 100))}
+              {stat("Advance Refunded", money(customerFinancial.totalAdvanceRefundedPaise / 100), "amber")}
+              {stat("Available Advance", money(availableAdvancePaise / 100), availableAdvancePaise > 0 ? "green" : "neutral")}
             </View>
             <View style={s.split}>
               <View style={{ flex: 1 }}>
@@ -2288,16 +2305,17 @@ function AppContent() {
             </View>
             <Title>Transaction History</Title>
             {customer.opening > 0 && (
-              <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`+${money(customer.opening)}`} />
+              <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`+${money(customer.opening)}`} color={colors.blue} />
             )}
             {(customer.openingAdvance || 0) > 0 && (
-              <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`−${money(customer.openingAdvance || 0)}`} />
+              <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`−${money(customer.openingAdvance || 0)}`} color={colors.blue} />
             )}
             {customer.opening > 0 && (customer.openingAdvance || 0) > 0 && (
               <Row
                 title="Opening Advance Adjusted Against Udhari"
                 subtitle={`Remaining advance: ${money(Math.max(0, customer.openingAdvance! - customer.opening))}`}
                 value={money(Math.min(customer.opening, customer.openingAdvance || 0))}
+                color={colors.green}
               />
             )}
             {entries
@@ -2492,9 +2510,9 @@ function AppContent() {
         content = (
           <>
             <Card style={{ alignItems: "center", paddingVertical: 30 }}>
-              <Text style={s.amount}>{money(entry.amount)}</Text>
-              <View style={s.badge}>
-                <Text style={{ color: colors.green, fontWeight: "700" }}>
+              <Text style={[s.amount, { color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text }]}>{money(entry.amount)}</Text>
+              <View style={[s.badge, { backgroundColor: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].background }]}>
+                <Text style={{ color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text, fontWeight: "700" }}>
                   {entryLabel(entry.type).toUpperCase()}
                 </Text>
               </View>
@@ -2518,7 +2536,7 @@ function AppContent() {
             {entry.type === "credit" && (entry.advanceApplied || 0) > 0 && (
               <Row title="Adjusted From Advance" value={money(entry.advanceApplied || 0)} />
             )}
-            {entry.due && <Row title="Due Date" value={entry.due} />}
+            {entry.due && <Row title="Due Date" value={entry.due} color={colors.orange} />}
             <Button
               title="Edit"
               onPress={() => go("editTransaction", entry.id)}
@@ -2569,7 +2587,7 @@ function AppContent() {
                     <Row
                       title="Closing Balance"
                       value={money(m.closing)}
-                      color={colors.green}
+                      color={financialPalette[toneForBalance(m.closing)].text}
                     />
                   </Card>
                 </Pressable>
@@ -2597,21 +2615,22 @@ function AppContent() {
               <Title>{data.shop.name}</Title>
               <Hint>{data.shop.address}</Hint>
               <Text style={s.rowTitle}>{customer.name}</Text>
-              <Row title="Opening Balance" value={money(m.opening)} />
+              <Row title="Opening Balance" value={money(m.opening)} color={colors.blue} />
               {m.entries.map((e) => (
                 <Row
                   key={e.id}
                   title={e.note || entryLabel(e.type)}
                   subtitle={e.date}
                   value={`${entrySign(e.type)}${money(e.amount)}`}
+                  color={financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text}
                   onPress={() => go("transaction", e.id)}
                 />
               ))}
-              <Row title="Total Udhari" value={money(m.credit)} />
-              <Row title="Total Payment" value={money(m.payment)} />
-              {m.refund > 0 && <Row title="Advance Refund" value={money(m.refund)} />}
+              <Row title="Total Udhari" value={money(m.credit)} color={colors.blue} />
+              <Row title="Total Payment" value={money(m.payment)} color={colors.green} />
+              {m.refund > 0 && <Row title="Advance Refund" value={money(m.refund)} color={colors.orange} />}
               <Hint>Outstanding</Hint>
-              <Text style={s.amount}>{money(m.closing)}</Text>
+              <Text style={[s.amount, { color: financialPalette[toneForBalance(m.closing)].text }]}>{money(m.closing)}</Text>
             </Card>
             <Button
               title="WhatsApp / SMS Share"
@@ -2637,9 +2656,9 @@ function AppContent() {
             <Title>
               {customer.name} • {monthLabel(month)}
             </Title>
-            <Card style={{ backgroundColor: colors.pale }}>
+            <Card style={{ backgroundColor: financialPalette[toneForBalance(monthly(data, customer.id, month).closing)].background, borderColor: financialPalette[toneForBalance(monthly(data, customer.id, month).closing)].border }}>
               <Hint>Outstanding</Hint>
-              <Text style={s.amount}>
+              <Text style={[s.amount, { color: financialPalette[toneForBalance(monthly(data, customer.id, month).closing)].text }]}>
                 {money(monthly(data, customer.id, month).closing)}
               </Text>
             </Card>
@@ -2721,11 +2740,11 @@ function AppContent() {
         <>
           {monthPicker()}
           <View style={s.split}>
-            {stat("Monthly Udhari", money(totalCredit), true)}
-            {stat("Collection", money(totalPayment))}
+            {stat("Monthly Udhari", money(totalCredit), "blue")}
+            {stat("Collection", money(totalPayment), "green")}
           </View>
           <View style={s.split}>
-            {stat("Outstanding (all time)", money(outstanding))}
+            {stat("Outstanding (all time)", money(outstanding), outstanding > 0 ? "red" : "neutral")}
             {stat(
               "Active customers",
               String(new Set(monthEntries.map((e) => e.customerId)).size),
@@ -2750,7 +2769,7 @@ function AppContent() {
                   <View
                     style={{
                       height: Math.max(3, (t.value / max) * 115),
-                      backgroundColor: colors.green,
+                      backgroundColor: colors.blue,
                       width: "75%",
                       borderTopLeftRadius: 5,
                       borderTopRightRadius: 5,
@@ -2768,6 +2787,7 @@ function AppContent() {
               value={String(
                 data.customers.filter((c) => balance(data, c.id) <= 0).length,
               )}
+              color={colors.green}
             />
             <Row
               title="Pending"
@@ -2776,10 +2796,12 @@ function AppContent() {
                   (c) => balance(data, c.id) > 0 && !isOverdue(c),
                 ).length,
               )}
+              color={colors.red}
             />
             <Row
               title="Overdue"
               value={String(data.customers.filter(isOverdue).length)}
+              color={colors.red}
             />
           </Card>
         </>
