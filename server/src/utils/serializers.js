@@ -3,10 +3,14 @@ export const customerOut = (d) => ({
   serverVersion: d.serverVersion || 1,
   resolutionVersion: d.resolutionVersion || 1,
   createdAt: d.createdAt?.toISOString?.(),
+  openingDate:
+    d.openingDate?.toISOString?.().slice(0, 10) ||
+    d.createdAt?.toISOString?.().slice(0, 10),
   name: d.name,
-  phone: d.phone,
+  phone: d.phoneNormalized || d.phone || "",
   address: d.address,
   opening: d.openingPaise / 100,
+  openingAdvance: (d.openingAdvancePaise || 0) / 100,
   limit: d.limitPaise / 100,
   reminder: d.reminder,
 });
@@ -18,8 +22,13 @@ export const entryOut = (d) => ({
   type: d.type,
   amount: d.amountPaise / 100,
   date: d.date,
+  recordedAt: d.recordedAt?.toISOString?.() || d.createdAt?.toISOString?.(),
   note: d.note,
   method: d.method,
+  reference: d.reference || "",
+  appliedToUdhari: (d.appliedToUdhariPaise || 0) / 100,
+  addedToAdvance: (d.addedToAdvancePaise || 0) / 100,
+  advanceApplied: (d.advanceAppliedPaise || 0) / 100,
   due: d.due,
 });
 export const financialAuditOut = (record) => ({

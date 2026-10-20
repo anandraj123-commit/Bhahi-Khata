@@ -65,11 +65,13 @@ export async function getBootstrap(user, shopId) {
         _id: "$customerClientId",
         total: {
           $sum: {
-            $cond: [
-              { $eq: ["$type", "credit"] },
-              "$amountPaise",
-              { $multiply: ["$amountPaise", -1] },
-            ],
+            $switch: {
+              branches: [
+                { case: { $in: ["$type", ["credit", "refund"]] }, then: "$amountPaise" },
+                { case: { $eq: ["$type", "payment"] }, then: { $multiply: ["$amountPaise", -1] } },
+              ],
+              default: 0,
+            },
           },
         },
       },
@@ -79,7 +81,8 @@ export async function getBootstrap(user, shopId) {
   const byId = new Map(
     customers.map((customer) => [
       customer.clientId,
-      (customer.openingPaise || 0) + (creditById.get(customer.clientId) || 0),
+      (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) +
+        (creditById.get(customer.clientId) || 0),
     ]),
   );
   return {

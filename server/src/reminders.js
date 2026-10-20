@@ -92,7 +92,7 @@ export function startReminderWorker(log) {
                 paise: {
                   $sum: {
                     $cond: [
-                      { $eq: ["$type", "credit"] },
+                      { $in: ["$type", ["credit", "refund"]] },
                       "$amountPaise",
                       { $multiply: ["$amountPaise", -1] },
                     ],
@@ -106,7 +106,7 @@ export function startReminderWorker(log) {
             const due =
               Math.max(
                 0,
-                (customer.openingPaise || 0) +
+                (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) +
                   (totals.get(customer.clientId) || 0),
               ) / 100;
             if (due <= 0 || due < Number(shop.reminders.minimum || 0)) continue;

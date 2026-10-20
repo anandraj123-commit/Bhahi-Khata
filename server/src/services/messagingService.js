@@ -59,7 +59,7 @@ export async function sendCustomerSms({ shopId, customerId }) {
         total: {
           $sum: {
             $cond: [
-              { $eq: ["$type", "credit"] },
+              { $in: ["$type", ["credit", "refund"]] },
               "$amountPaise",
               { $multiply: ["$amountPaise", -1] },
             ],
@@ -68,7 +68,7 @@ export async function sendCustomerSms({ shopId, customerId }) {
       },
     },
   ]);
-  const due = Math.max(0, (customer.openingPaise || 0) + total) / 100;
+  const due = Math.max(0, (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) + total) / 100;
   await sendSms(
     phone.length === 10 ? `+91${phone}` : `+${phone}`,
     { customer: customer.name, shop: shop.name, amount: due },

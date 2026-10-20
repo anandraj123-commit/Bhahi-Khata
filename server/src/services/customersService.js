@@ -4,12 +4,34 @@ import { digest } from "../utils/hashing.js";
 import { paise } from "../utils/money.js";
 import { customerOut } from "../utils/serializers.js";
 import { sameCustomerValues } from "../utils/records.js";
+import { normalizeCustomerMobile } from "../utils/phone.js";
 import { saveAudit } from "./auditService.js";
 import {
   ensureCustomerUsage,
   releaseCustomerCapacity,
   reserveCustomerCapacity,
 } from "./subscriptionService.js";
+
+function duplicateCustomerMobile() {
+  return Object.assign(new Error("A customer with this mobile number already exists in this shop"), {
+    status: 409,
+    code: "CUSTOMER_MOBILE_ALREADY_EXISTS",
+  });
+}
+
+async function assertCustomerMobileAvailable({ shopId, phone, excludeClientId, session }) {
+  if (!phone) return;
+  const normalized = normalizeCustomerMobile(phone);
+  if (!normalized) throw Object.assign(new Error("Enter a valid 10-digit Indian mobile number"), { status: 400 });
+  const candidates = await Customer.find({ shopId, deletedAt: { $exists: false }, phone: { $ne: "" } })
+    .select("clientId phone phoneNormalized")
+    .session(session)
+    .lean();
+  if (candidates.some((candidate) =>
+    candidate.clientId !== excludeClientId &&
+    normalizeCustomerMobile(candidate.phoneNormalized || candidate.phone) === normalized
+  )) throw duplicateCustomerMobile();
+}
 
 export async function listCustomers({ shopId, query, cursorId, limit }) {
   const filter = { shopId, deletedAt: { $exists: false } };
@@ -41,6 +63,8 @@ export async function listCustomers({ shopId, query, cursorId, limit }) {
 
 export async function createCustomer({ shopId, actorId, customer, audit }) {
   await ensureCustomerUsage(shopId);
+  const openingPaise = paise(customer.opening);
+  const openingAdvancePaise = paise(customer.openingAdvance || 0);
   const session = await mongoose.startSession();
   let doc;
   try {
@@ -57,6 +81,7 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
             serverVersion: doc.serverVersion || 1,
           });
       } else {
+        await assertCustomerMobileAvailable({ shopId, phone: customer.phone, excludeClientId: customer.id, session });
         await reserveCustomerCapacity({ shopId, session });
         doc = await Customer.findOneAndUpdate(
             { shopId, clientId: customer.id },
@@ -67,11 +92,18 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
               name: customer.name,
               nameFolded: customer.name.toLocaleLowerCase("en"),
               phone: customer.phone,
+              ...(customer.phone ? { phoneNormalized: customer.phone } : {}),
+              phoneActive: Boolean(customer.phone),
               address: customer.address,
-              openingPaise: paise(customer.opening),
+              openingPaise,
+              openingAdvancePaise,
+              openingDate: customer.openingDate
+                ? new Date(`${customer.openingDate}T00:00:00.000Z`)
+                : new Date(),
               limitPaise: paise(customer.limit),
               reminder: customer.reminder,
             },
+            ...(customer.phone ? {} : { $unset: { phoneNormalized: 1 } }),
           },
           { upsert: true, new: true, runValidators: true, session },
         );
@@ -83,6 +115,8 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
     // A retry after an ambiguous response, or a concurrent request using the
     // same client UUID, must resolve to the original customer rather than
     // failing as a duplicate-key server error.
+    if (error.code === 11000 && (error.keyPattern?.phoneNormalized || String(error.message).includes("active_customer_mobile_unique")))
+      throw duplicateCustomerMobile();
     if (error.code === 11000) {
       const existing = await Customer.findOne({ shopId, clientId: customer.id }).lean();
       if (existing && !existing.deletedAt && sameCustomerValues(customerOut(existing), customer))
@@ -134,17 +168,20 @@ export async function updateCustomer({ shopId, actorId, customer, base, baseVers
           resolutionVersion: doc.resolutionVersion || 1,
         });
       if (!sameCustomerValues(current, customer)) {
+        await assertCustomerMobileAvailable({ shopId, phone: customer.phone, excludeClientId: customer.id, session });
         doc.set({
           name: customer.name,
           nameFolded: customer.name.toLocaleLowerCase("en"),
           phone: customer.phone,
+          phoneNormalized: customer.phone || undefined,
+          phoneActive: Boolean(customer.phone),
           address: customer.address,
-          openingPaise: paise(customer.opening),
           limitPaise: paise(customer.limit),
           reminder: customer.reminder,
           serverVersion: actualVersion + 1,
           resolutionVersion: (doc.resolutionVersion || 1) + 1,
         });
+        if (!customer.phone) doc.phoneNormalized = undefined;
         await doc.save({ session });
       }
       if (audit)
@@ -180,6 +217,7 @@ export async function deleteCustomer({ shopId, actorId, id, base, baseVersion, b
           resolutionVersion: customer.resolutionVersion || 1,
         });
       customer.deletedAt = new Date();
+      customer.phoneActive = false;
       customer.serverVersion = actualVersion + 1;
       customer.resolutionVersion = (customer.resolutionVersion || 1) + 1;
       await customer.save({ session });
@@ -251,12 +289,16 @@ export async function resolveCustomerConflict({
         if (input.localDeleted) {
           if (!wasDeleted) {
             customer.deletedAt = new Date();
+            customer.phoneActive = false;
             customer.serverVersion = actualVersion + 1;
             await releaseCustomerCapacity({ shopId, session });
           }
           selected = null;
         } else {
           const proposed = input.proposed;
+          await assertCustomerMobileAvailable({ shopId, phone: proposed.phone, excludeClientId: customerId, session });
+          const openingPaise = paise(proposed.opening);
+          const openingAdvancePaise = paise(proposed.openingAdvance || 0);
           const changed = wasDeleted || !sameCustomerValues(customerOut(customer), proposed);
           if (changed) {
             if (wasDeleted) await reserveCustomerCapacity({ shopId, session });
@@ -264,14 +306,21 @@ export async function resolveCustomerConflict({
               name: proposed.name,
               nameFolded: proposed.name.toLocaleLowerCase("en"),
               phone: proposed.phone,
+              phoneNormalized: proposed.phone || undefined,
+              phoneActive: Boolean(proposed.phone),
               address: proposed.address,
-              openingPaise: paise(proposed.opening),
+              openingPaise,
+              openingAdvancePaise,
+              openingDate: proposed.openingDate
+                ? new Date(`${proposed.openingDate}T00:00:00.000Z`)
+                : customer.openingDate || customer.createdAt,
               limitPaise: paise(proposed.limit),
               reminder: proposed.reminder,
               deletedAt: undefined,
               serverVersion: actualVersion + 1,
               resolutionVersion: actualResolutionVersion + 1,
             });
+            if (!proposed.phone) customer.phoneNormalized = undefined;
           }
           selected = customerOut(customer);
         }

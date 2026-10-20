@@ -49,6 +49,8 @@ export const handle_post_customers = async (req, res, next) => {
     });
     res.status(201).json(customerOut(doc));
   } catch (e) {
+    if (e.status === 409 && e.code === "CUSTOMER_MOBILE_ALREADY_EXISTS")
+      return res.status(409).json({ error: e.message, code: e.code });
     if (e.status === 409 && e.current !== undefined)
       return res.status(409).json({ error: e.message, type: "customer_conflict", current: e.current, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1 });
     if (e.status === 409) return res.status(409).json({ error: e.message, ...(e.code ? { code: e.code } : {}) });
@@ -82,6 +84,8 @@ export const handle_patch_customers_id = async (req, res, next) => {
     res.json(customerOut(doc));
   } catch (e) {
     if (e.status === 404) return error(res, 404, e.message);
+    if (e.status === 409 && e.code === "CUSTOMER_MOBILE_ALREADY_EXISTS")
+      return res.status(409).json({ error: e.message, code: e.code });
     if (e.status === 409 && e.current !== undefined)
       return res.status(409).json({ error: e.message, type: "customer_conflict", current: e.current ?? null, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1 });
     if (e.status === 409) return res.status(409).json({ error: e.message, ...(e.code ? { code: e.code } : {}) });

@@ -26,13 +26,18 @@ import {
   Customer,
   Data,
   Entry,
+  financialSummary,
   initialData,
   money,
   monthly,
+  periodReceived,
+  periodUdhari,
   today,
+  totalUdhari,
   uid,
   validBackup,
 } from "./src/model";
+import { normalizeCustomerMobile } from "./src/customerPhone";
 import * as api from "./src/api";
 import {
   cacheAuthenticatedAccount,
@@ -102,6 +107,7 @@ type Screen =
   | "customer"
   | "credit"
   | "payment"
+  | "refund"
   | "transaction"
   | "editTransaction"
   | "khata"
@@ -171,7 +177,8 @@ const titles: Partial<Record<Screen, string>> = {
   customers: "Customers",
   customerForm: "Add Customer",
   credit: "Add Udhari",
-  payment: "Record Payment",
+  payment: "Receive Money / Add Advance",
+  refund: "Refund Advance",
   transaction: "Transaction",
   editTransaction: "Edit Transaction",
   khata: "Khata",
@@ -189,6 +196,9 @@ const titles: Partial<Record<Screen, string>> = {
   account: "Account",
   audit: "Activity History",
 };
+const entryLabel = (type: Entry["type"]) =>
+  type === "credit" ? "Udhari Given" : type === "refund" ? "Advance Refund" : "Payment Received";
+const entrySign = (type: Entry["type"]) => type === "payment" ? "−" : "+";
 
 async function scheduleSubscriptionNotifications(
   snapshot: SubscriptionSnapshot,
@@ -290,6 +300,7 @@ function AppContent() {
     pending: number;
     failed: number;
     conflicts: number;
+    mobileConflicts: number;
   } | null>(null);
   const [connectivityStatus, setConnectivityStatus] = useState<ConnectivityStatus>("checking");
   const [networkDiagnosticsVisible, setNetworkDiagnosticsVisible] = useState(false);
@@ -1091,15 +1102,15 @@ function AppContent() {
     const localCustomer = dataRef.current.customers.find((item) => item.id === conflict.local.customerId);
     const serverCustomer = serverEntry ? dataRef.current.customers.find((item) => item.id === serverEntry.customerId) : undefined;
     const describe = (entry: NonNullable<PendingConflict["server"]>, name?: string) =>
-      `${money(entry.amount)} ${entry.type === "credit" ? "udhari" : "payment"} · ${name || "customer"} · ${entry.date}${entry.note ? ` · ${entry.note}` : ""}`;
+      `${money(entry.amount)} ${entryLabel(entry.type)} · ${name || "customer"} · ${entry.date}${entry.note ? ` · ${entry.note}` : ""}`;
     const localText = conflict.localDeleted ? "Deleted on this phone" : describe(conflict.local, localCustomer?.name);
     const serverText = serverEntry ? describe(serverEntry, serverCustomer?.name) : "Deleted on server";
     const localAmount = money(conflict.local.amount);
     const serverAmount = conflict.server ? money(conflict.server.amount) : "deleted";
     let impact = "";
     if (serverEntry && !conflict.localDeleted && serverEntry.customerId === conflict.local.customerId) {
-      const localSigned = conflict.local.amount * (conflict.local.type === "credit" ? 1 : -1);
-      const serverSigned = serverEntry.amount * (serverEntry.type === "credit" ? 1 : -1);
+      const localSigned = conflict.local.amount * (conflict.local.type === "payment" ? -1 : 1);
+      const serverSigned = serverEntry.amount * (serverEntry.type === "payment" ? -1 : 1);
       const difference = localSigned - serverSigned;
       if (difference) impact = `\nEstimated ${customer?.name || "customer"} outstanding change if you keep the phone value: ${difference > 0 ? "+" : "−"}${money(Math.abs(difference))}.`;
     }
@@ -1167,6 +1178,7 @@ function AppContent() {
               phone: c.phone,
               address: c.address,
               opening: String(c.opening),
+              openingAdvance: String(c.openingAdvance || 0),
               limit: String(c.limit),
               reminder: String(c.reminder),
             }
@@ -1175,6 +1187,7 @@ function AppContent() {
               phone: "",
               address: "",
               opening: "0",
+              openingAdvance: "0",
               limit: "10000",
               reminder: "false",
             },
@@ -1183,6 +1196,7 @@ function AppContent() {
     if (
       screen === "credit" ||
       screen === "payment" ||
+      screen === "refund" ||
       screen === "editTransaction"
     ) {
       const e =
@@ -1197,8 +1211,10 @@ function AppContent() {
           "",
         amount: e ? String(e.amount) : "",
         date: e?.date || today(),
+        recordedAt: e?.recordedAt || new Date().toISOString(),
         note: e?.note || "",
         method: e?.method || data.defaultMethod,
+        reference: e?.reference || "",
         due: e?.due || "",
       });
     }
@@ -1237,13 +1253,10 @@ function AppContent() {
     (sum, c) => sum + Math.max(0, balance(data, c.id)),
     0,
   );
+  const financial = financialSummary(data);
   const monthEntries = data.entries.filter((e) => e.date.startsWith(month));
-  const totalCredit = monthEntries
-    .filter((e) => e.type === "credit")
-    .reduce((s, e) => s + e.amount, 0);
-  const totalPayment = monthEntries
-    .filter((e) => e.type === "payment")
-    .reduce((s, e) => s + e.amount, 0);
+  const totalCredit = periodUdhari(data, month);
+  const totalPayment = periodReceived(data, month);
   const isOverdue = (c: Customer) =>
     balance(data, c.id) > 0 &&
     data.entries.some(
@@ -1306,14 +1319,19 @@ function AppContent() {
     </Card>
   );
   const actions = (id?: string) => (
-    <View style={s.split}>
-      <View style={{ flex: 1 }}>
-        <Button title="+ Add Udhari" onPress={() => go("credit", id)} />
+    <>
+      <View style={s.split}>
+        <View style={{ flex: 1 }}>
+          <Button title="+ Give Udhari" onPress={() => go("credit", id)} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Button title="Receive Money / Add Advance" orange onPress={() => go("payment", id)} />
+        </View>
       </View>
-      <View style={{ flex: 1 }}>
-        <Button title="₹ Payment" orange onPress={() => go("payment", id)} />
-      </View>
-    </View>
+      {id && balance(data, id) < 0 && (
+        <Button title="Refund Advance (एडवांस वापस करें)" secondary onPress={() => go("refund", id)} />
+      )}
+    </>
   );
   const customerRow = (c: Customer) => (
     <Pressable
@@ -1336,7 +1354,9 @@ function AppContent() {
             </Text>
           </View>
           <Text style={{ color: colors.green, fontWeight: "700" }}>
-            {money(balance(data, c.id))}
+            {balance(data, c.id) < 0
+              ? `Advance ${money(-balance(data, c.id))}`
+              : money(balance(data, c.id))}
           </Text>
         </View>
       </Card>
@@ -1365,16 +1385,16 @@ function AppContent() {
               {data.customers.find((c) => c.id === e.customerId)?.name}
             </Text>
             <Text style={s.small}>
-              {e.type === "credit" ? "Udhari" : "Payment"} • {e.date}
+              {entryLabel(e.type)} • {e.date}
             </Text>
           </View>
           <Text
             style={{
               fontWeight: "700",
-              color: e.type === "credit" ? colors.green : colors.orange,
+              color: e.type === "payment" ? colors.orange : colors.green,
             }}
           >
-            {e.type === "credit" ? "+" : "−"}
+            {entrySign(e.type)}
             {money(e.amount)}
           </Text>
         </View>
@@ -1383,37 +1403,63 @@ function AppContent() {
   );
   function saveCustomer() {
     const name = form.name?.trim();
+    const normalizedPhone = normalizeCustomerMobile(form.phone);
     const opening = Number(form.opening || 0),
+      openingAdvance = Number(form.openingAdvance || 0),
       limit = Number(form.limit || 0);
     if (!name)
       return Alert.alert("Name required", "Enter the customer’s name.");
-    if (form.phone && !phoneValid(form.phone))
+    if (form.phone?.trim() && normalizedPhone === null)
       return Alert.alert(
         "Invalid phone",
-        "Enter a valid 10-digit Indian mobile number.",
+        "Enter a valid Indian mobile number, such as 9876543210 or +91 9876543210.",
       );
+    if (normalizedPhone) {
+      const duplicate = data.customers.find((item) =>
+        item.id !== route.id && normalizeCustomerMobile(item.phone) === normalizedPhone,
+      );
+      if (duplicate)
+        return Alert.alert(
+          "Mobile number already used",
+          "A customer with this mobile number already exists in your shop. Please open the existing customer.",
+          [
+            { text: "Cancel", style: "cancel" },
+            { text: "Open Customer", onPress: () => go("customer", duplicate.id) },
+          ],
+        );
+    }
     if (
       !Number.isFinite(opening) ||
       opening < 0 ||
       opening > 1e9 ||
+      !Number.isFinite(openingAdvance) ||
+      openingAdvance < 0 ||
+      openingAdvance > 1e9 ||
+      [opening, openingAdvance, limit].some(
+        (value) => Math.abs(value * 100 - Math.round(value * 100)) > 0.00001,
+      ) ||
       !Number.isFinite(limit) ||
       limit < 0 ||
       limit > 1e9
     )
       return Alert.alert(
         "Invalid balance",
-        "Opening outstanding and credit limit must be between ₹0 and ₹100 crore.",
+        "Opening balances and credit limit must be between ₹0 and ₹100 crore.",
       );
+    const existingCustomer = data.customers.find((x) => x.id === route.id);
     const c: Customer = {
       id: route.id || uid(),
-      serverVersion: data.customers.find((x) => x.id === route.id)?.serverVersion,
-      createdAt:
-        data.customers.find((x) => x.id === route.id)?.createdAt ||
-        new Date().toISOString(),
+      serverVersion: existingCustomer?.serverVersion,
+      createdAt: existingCustomer?.createdAt || new Date().toISOString(),
+      openingDate:
+        existingCustomer?.openingDate ||
+        existingCustomer?.createdAt?.slice(0, 10) ||
+        (!route.id ? today() : undefined),
       name,
-      phone: form.phone.trim(),
+      phone: normalizedPhone || "",
       address: form.address.trim(),
       opening: Math.round(opening * 100) / 100,
+      openingAdvance: Math.round(openingAdvance * 100) / 100,
       limit: Math.round(limit * 100) / 100,
       reminder: form.reminder === "true",
     };
@@ -1453,8 +1499,8 @@ function AppContent() {
   }
   function saveEntry() {
     const old = route.screen === "editTransaction" ? entry : undefined;
-    const type =
-      old?.type || (route.screen === "payment" ? "payment" : "credit");
+    const type = old?.type ||
+      (route.screen === "credit" ? "credit" : route.screen === "refund" ? "refund" : "payment");
     const amount = Number(form.amount);
     const c = data.customers.find((c) => c.id === form.customerId);
     if (!c)
@@ -1482,6 +1528,24 @@ function AppContent() {
         "Invalid due date",
         "Due date cannot be before the transaction date.",
       );
+    const amountPaise = Math.round(amount * 100);
+    const oldSignedPaise = old
+      ? Math.round(old.amount * 100) * (old.type === "payment" ? -1 : 1)
+      : 0;
+    // Preview/validation uses the balance before the transaction being edited;
+    // the server will then reallocate the full chronological ledger atomically.
+    const currentPaise = Math.round(balance(data, c.id) * 100) - oldSignedPaise;
+    if (type === "refund" && (currentPaise >= 0 || amountPaise > -currentPaise))
+      return Alert.alert("Insufficient advance", "A refund cannot exceed the customer’s available advance.");
+    const appliedToUdhariPaise = type === "payment"
+      ? Math.min(Math.max(0, currentPaise), amountPaise)
+      : 0;
+    const addedToAdvancePaise = type === "payment"
+      ? amountPaise - appliedToUdhariPaise
+      : 0;
+    const advanceAppliedPaise = type === "credit"
+      ? Math.min(Math.max(0, -currentPaise), amountPaise)
+      : 0;
     const e: Entry = {
       id: old?.id || uid(),
       serverVersion: old?.serverVersion,
@@ -1489,9 +1553,14 @@ function AppContent() {
       type,
       amount: Math.round(amount * 100) / 100,
       date: form.date,
+      recordedAt: old?.recordedAt || form.recordedAt || new Date().toISOString(),
       note: form.note.trim(),
       method: form.method,
+      reference: form.reference?.trim() || "",
       due: type === "credit" ? form.due : "",
+      appliedToUdhari: appliedToUdhariPaise / 100,
+      addedToAdvance: addedToAdvancePaise / 100,
+      advanceApplied: advanceAppliedPaise / 100,
     };
     const next = {
       ...data,
@@ -1503,7 +1572,7 @@ function AppContent() {
           id: uid(),
           action: old
             ? "Edited transaction"
-            : `Recorded ${type === "credit" ? "udhari" : "payment"}`,
+            : `Recorded ${type === "credit" ? "Udhari" : type === "refund" ? "Advance Refund" : "Payment Received"}`,
           date: new Date().toISOString(),
           ...(old ? { before: old } : {}),
           after: e,
@@ -1512,6 +1581,31 @@ function AppContent() {
       ],
     };
     const apply = () => save(next, () => go("customer", c.id, true));
+    if (type === "payment") {
+      Alert.alert(
+        "Confirm money received",
+        `Amount Received: ${money(amountPaise / 100)}\nAdjusted Against Udhari: ${money(appliedToUdhariPaise / 100)}\nAdded to Advance: ${money(addedToAdvancePaise / 100)}`,
+        [{ text: "Cancel", style: "cancel" }, { text: "Confirm", onPress: apply }],
+      );
+      return;
+    }
+    if (type === "credit" && advanceAppliedPaise > 0) {
+      const newOutstandingPaise = Math.max(0, currentPaise + amountPaise);
+      Alert.alert(
+        "Confirm Udhari",
+        `Purchase Amount: ${money(amountPaise / 100)}\nAdjusted From Advance: ${money(advanceAppliedPaise / 100)}\nNew Outstanding: ${money(newOutstandingPaise / 100)}`,
+        [{ text: "Cancel", style: "cancel" }, { text: "Confirm", onPress: apply }],
+      );
+      return;
+    }
+    if (type === "refund") {
+      Alert.alert(
+        "Confirm advance refund",
+        `Refund: ${money(amountPaise / 100)}\nRemaining Advance: ${money((-currentPaise - amountPaise) / 100)}`,
+        [{ text: "Cancel", style: "cancel" }, { text: "Confirm", onPress: apply }],
+      );
+      return;
+    }
     if (type === "credit" && c.limit > 0 && balance(next, c.id) > c.limit)
       Alert.alert(
         "Credit limit exceeded",
@@ -2004,34 +2098,31 @@ function AppContent() {
             </Pressable>
           </View>
           <View style={s.split}>
-            {stat("Total Outstanding", money(outstanding), true)}
+            {stat("Current Outstanding", money(financial.outstandingPaise / 100), true)}
+            {stat("Total Udhari", money(financial.totalUdhariPaise / 100))}
+          </View>
+          <View style={s.split}>
+            {stat("Total Money Received", money(financial.totalReceivedPaise / 100))}
+            {stat("Udhari Recovered", money(financial.totalUdhariRecoveredPaise / 100))}
+          </View>
+          <View style={s.split}>
+            {stat("Available Advances", money(financial.availableAdvancePaise / 100))}
+            {stat("Advance Deposited", money(financial.totalAdvanceDepositedPaise / 100))}
+          </View>
+          <View style={s.split}>
+            {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100))}
             {stat("Customers", String(data.customers.length))}
           </View>
+          <Hint>Current outstanding and advances are balances. The other totals show recorded activity.</Hint>
           {actions()}
           <View style={s.split}>
             {stat(
               "This month’s udhari",
-              money(
-                data.entries
-                  .filter(
-                    (e) =>
-                      e.date.startsWith(today().slice(0, 7)) &&
-                      e.type === "credit",
-                  )
-                  .reduce((s, e) => s + e.amount, 0),
-              ),
+              money(periodUdhari(data, today().slice(0, 7))),
             )}
             {stat(
               "This month’s collection",
-              money(
-                data.entries
-                  .filter(
-                    (e) =>
-                      e.date.startsWith(today().slice(0, 7)) &&
-                      e.type === "payment",
-                  )
-                  .reduce((s, e) => s + e.amount, 0),
-              ),
+              money(periodReceived(data, today().slice(0, 7))),
             )}
           </View>
           <Title>Recent Transactions</Title>
@@ -2101,7 +2192,7 @@ function AppContent() {
           {field("Name *", "name", { placeholder: "Rahul Kumar" })}
           {field("Phone Number", "phone", {
             keyboardType: "phone-pad",
-            maxLength: 10,
+            maxLength: 32,
             placeholder: "98XXXXXXXX",
           })}
           {field("Address", "address", { placeholder: "Delhi" })}
@@ -2109,13 +2200,21 @@ function AppContent() {
             keyboardType: "decimal-pad",
             editable: !route.id,
           })}
+          {field("Opening Advance (जमा राशि) (₹)", "openingAdvance", {
+            keyboardType: "decimal-pad",
+            editable: !route.id,
+          })}
           {route.id ? (
             <Hint>
-              Opening outstanding is fixed after creation. Use ledger entries to
-              record subsequent changes.
+              Opening balances are fixed after creation. Use ledger transactions
+              to record later payments or advance deposits.
             </Hint>
           ) : (
-            <Hint>Amount the customer already owed before using Digital Khata.</Hint>
+            <Hint>
+              Opening outstanding is money already owed; opening advance is money
+              already deposited. If both are entered, they are netted into one
+              opening balance.
+            </Hint>
           )}
           {field("Credit Limit (₹, 0 = no limit)", "limit", {
             keyboardType: "decimal-pad",
@@ -2138,6 +2237,9 @@ function AppContent() {
         const entries = data.entries.filter(
           (e) => e.customerId === customer.id,
         );
+        const customerFinancial = financialSummary(data, customer.id);
+        const currentOutstandingPaise = customerFinancial.outstandingPaise;
+        const availableAdvancePaise = customerFinancial.availableAdvancePaise;
         content = (
           <>
             <Hint>
@@ -2146,26 +2248,27 @@ function AppContent() {
             </Hint>
             <Card style={{ backgroundColor: colors.pale }}>
               <Hint>Current Outstanding</Hint>
-              <Text style={s.amount}>{money(balance(data, customer.id))}</Text>
+              <Text style={s.amount}>{money(currentOutstandingPaise / 100)}</Text>
+              <Hint>Available Advance: {money(availableAdvancePaise / 100)}</Hint>
             </Card>
             {actions(customer.id)}
             <View style={s.split}>
               {stat(
                 "Total Udhari",
-                money(
-                  entries
-                    .filter((e) => e.type === "credit")
-                    .reduce((s, e) => s + e.amount, 0),
-                ),
+                money(totalUdhari(data, customer.id)),
               )}
               {stat(
-                "Total Payments",
-                money(
-                  entries
-                    .filter((e) => e.type === "payment")
-                    .reduce((s, e) => s + e.amount, 0),
-                ),
+                "Total Money Received",
+                money(customerFinancial.totalReceivedPaise / 100),
               )}
+            </View>
+            <View style={s.split}>
+              {stat("Udhari Recovered", money(customerFinancial.totalUdhariRecoveredPaise / 100))}
+              {stat("Advance Deposited", money(customerFinancial.totalAdvanceDepositedPaise / 100))}
+            </View>
+            <View style={s.split}>
+              {stat("Advance Refunded", money(customerFinancial.totalAdvanceRefundedPaise / 100))}
+              {stat("Available Advance", money(availableAdvancePaise / 100))}
             </View>
             <View style={s.split}>
               <View style={{ flex: 1 }}>
@@ -2184,11 +2287,24 @@ function AppContent() {
               </View>
             </View>
             <Title>Transaction History</Title>
+            {customer.opening > 0 && (
+              <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`+${money(customer.opening)}`} />
+            )}
+            {(customer.openingAdvance || 0) > 0 && (
+              <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`−${money(customer.openingAdvance || 0)}`} />
+            )}
+            {customer.opening > 0 && (customer.openingAdvance || 0) > 0 && (
+              <Row
+                title="Opening Advance Adjusted Against Udhari"
+                subtitle={`Remaining advance: ${money(Math.max(0, customer.openingAdvance! - customer.opening))}`}
+                value={money(Math.min(customer.opening, customer.openingAdvance || 0))}
+              />
+            )}
             {entries
               .slice()
               .sort((a, b) => b.date.localeCompare(a.date))
               .map(entryRow)}
-            {!entries.length && (
+            {!entries.length && !customer.opening && !customer.openingAdvance && (
               <Empty
                 title="No transactions yet"
                 description="Opening outstanding is included in the outstanding amount."
@@ -2200,10 +2316,11 @@ function AppContent() {
       break;
     case "credit":
     case "payment":
+    case "refund":
     case "editTransaction":
       content = (
         <>
-          {route.screen === "credit" && route.id ? (
+          {(route.screen === "credit" || route.screen === "refund") && route.id ? (
             <>
               <Field
                 label="Customer"
@@ -2338,9 +2455,10 @@ function AppContent() {
                 </>
               )}
               {field("Description / Note", "note", {
-                placeholder:
-                  route.screen === "credit"
-                    ? "Grocery Items"
+                placeholder: route.screen === "credit"
+                  ? "Grocery Items"
+                  : route.screen === "refund"
+                    ? "Advance refund"
                     : "Received payment",
                 multiline: true,
               })}
@@ -2350,7 +2468,9 @@ function AppContent() {
                     ? "Save Changes"
                     : route.screen === "credit"
                       ? "Save Udhari"
-                      : "Save Payment"
+                      : route.screen === "refund"
+                        ? "Refund Advance"
+                        : "Save Payment"
                 }
                 disabled={busy}
                 onPress={saveEntry}
@@ -2375,7 +2495,7 @@ function AppContent() {
               <Text style={s.amount}>{money(entry.amount)}</Text>
               <View style={s.badge}>
                 <Text style={{ color: colors.green, fontWeight: "700" }}>
-                  {entry.type === "credit" ? "UDHARI" : "PAYMENT"}
+                  {entryLabel(entry.type).toUpperCase()}
                 </Text>
               </View>
               <Title>
@@ -2385,8 +2505,18 @@ function AppContent() {
             </Card>
             <Title>Description</Title>
             <Text style={s.rowTitle}>{entry.note || "No description"}</Text>
-            {entry.type === "payment" && (
+            {entry.type !== "credit" && (
               <Row title="Payment Method" value={entry.method} />
+            )}
+            {entry.reference ? <Row title="Reference" value={entry.reference} /> : null}
+            {entry.type === "payment" && entry.appliedToUdhari !== undefined && (
+              <>
+                <Row title="Adjusted Against Udhari" value={money(entry.appliedToUdhari)} />
+                <Row title="Added to Advance" value={money(entry.addedToAdvance || 0)} />
+              </>
+            )}
+            {entry.type === "credit" && (entry.advanceApplied || 0) > 0 && (
+              <Row title="Adjusted From Advance" value={money(entry.advanceApplied || 0)} />
             )}
             {entry.due && <Row title="Due Date" value={entry.due} />}
             <Button
@@ -2432,9 +2562,10 @@ function AppContent() {
                 >
                   <Card>
                     <Title>{c.name}</Title>
-                    <Row title="Opening Outstanding" value={money(m.opening)} />
+                    <Row title="Opening Balance" value={money(m.opening)} />
                     <Row title="Udhari" value={money(m.credit)} />
                     <Row title="Payment" value={money(m.payment)} />
+                    {m.refund > 0 && <Row title="Advance Refund" value={money(m.refund)} />}
                     <Row
                       title="Closing Balance"
                       value={money(m.closing)}
@@ -2466,18 +2597,19 @@ function AppContent() {
               <Title>{data.shop.name}</Title>
               <Hint>{data.shop.address}</Hint>
               <Text style={s.rowTitle}>{customer.name}</Text>
-              <Row title="Opening Outstanding" value={money(m.opening)} />
+              <Row title="Opening Balance" value={money(m.opening)} />
               {m.entries.map((e) => (
                 <Row
                   key={e.id}
-                  title={e.note || (e.type === "credit" ? "Udhari" : "Payment")}
+                  title={e.note || entryLabel(e.type)}
                   subtitle={e.date}
-                  value={`${e.type === "credit" ? "+" : "−"}${money(e.amount)}`}
+                  value={`${entrySign(e.type)}${money(e.amount)}`}
                   onPress={() => go("transaction", e.id)}
                 />
               ))}
               <Row title="Total Udhari" value={money(m.credit)} />
               <Row title="Total Payment" value={money(m.payment)} />
+              {m.refund > 0 && <Row title="Advance Refund" value={money(m.refund)} />}
               <Hint>Outstanding</Hint>
               <Text style={s.amount}>{money(m.closing)}</Text>
             </Card>
@@ -2581,9 +2713,7 @@ function AppContent() {
         const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
         return {
           label: d.toLocaleDateString("en-IN", { month: "short" }),
-          value: data.entries
-            .filter((e) => e.type === "credit" && e.date.startsWith(key))
-            .reduce((s, e) => s + e.amount, 0),
+          value: periodUdhari(data, key),
         };
       });
       const max = Math.max(...trend.map((t) => t.value), 1);
@@ -2734,6 +2864,11 @@ function AppContent() {
           {!!syncStatus?.conflicts && (
             <Hint>
               {syncStatus.conflicts} transaction conflict{syncStatus.conflicts === 1 ? " needs" : "s need"} your decision. Both versions remain saved.
+            </Hint>
+          )}
+          {!!syncStatus?.mobileConflicts && (
+            <Hint>
+              {syncStatus.mobileConflicts} customer change{syncStatus.mobileConflicts === 1 ? " uses" : "s use"} a mobile number already assigned in this shop. The local customer and its ledger remain saved; no records were merged. Change the number on the local customer, then retry synchronization.
             </Hint>
           )}
           {!!syncStatus?.pending && (

@@ -5,6 +5,7 @@ import Constants, { ExecutionEnvironment } from "expo-constants";
 import type * as SQLiteTypes from "expo-sqlite";
 import type { Audit, Customer, Data, Entry } from "./model";
 import { createSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
+import { normalizeCustomerMobile } from "./customerPhone";
 
 const DATABASE = "digital-khata-offline.db";
 const KEY_NAME = "khata.sqlite.key.v1";
@@ -70,6 +71,7 @@ export type SyncQueueStatus = {
   pending: number;
   failed: number;
   conflicts: number;
+  mobileConflicts: number;
 };
 export type PendingConflict = {
   kind?: "entry";
@@ -548,7 +550,40 @@ export async function saveLocalChange(
   let queueId: number | null = null;
   await withEncryptedTransaction(db, async (transaction) => {
     const change = createSyncDelta(previous, next);
+    const changedCustomerIds = new Set(change.customers.map((item) => (item.after || item.before)?.id).filter(Boolean));
+    const seenMobiles = new Map<string, string>();
+    for (const customer of next.customers) {
+      const mobile = normalizeCustomerMobile(customer.phone);
+      if (!mobile) continue;
+      const prior = seenMobiles.get(mobile);
+      if (prior && prior !== customer.id && (changedCustomerIds.has(prior) || changedCustomerIds.has(customer.id)))
+        throw Object.assign(new Error("A customer with this mobile number already exists in this shop"), { code: "CUSTOMER_MOBILE_ALREADY_EXISTS" });
+      seenMobiles.set(mobile, customer.id);
+    }
     await writeChange(transaction, accountId, next, change);
+    const changedCustomer = change.customers.find((item) => item.after);
+    if (changedCustomer?.after) {
+      const failedCreate = await transaction.getFirstAsync<{ id: number; change_json: string }>(
+        `SELECT id, change_json FROM sync_queue
+         WHERE account_id = ? AND state = 'failed' AND last_error LIKE 'CUSTOMER_MOBILE_ALREADY_EXISTS:%'
+           AND entity_type = 'customer' AND entity_id = ? ORDER BY id LIMIT 1`,
+        accountId, changedCustomer.after.id,
+      );
+      if (failedCreate) {
+        const original = JSON.parse(failedCreate.change_json) as SyncDelta;
+        const originalCustomer = original.customers.find((item) => (item.after || item.before)?.id === changedCustomer.after!.id);
+        if (originalCustomer) {
+          originalCustomer.after = { ...changedCustomer.after };
+          original.audit = [...new Map([...original.audit, ...change.audit].map((item) => [item.id, item])).values()];
+          await transaction.runAsync(
+            "UPDATE sync_queue SET change_json = ?, state = 'pending', last_error = NULL, next_attempt_at = 0 WHERE id = ?",
+            JSON.stringify(original), failedCreate.id,
+          );
+          queueId = failedCreate.id;
+        }
+      }
+    }
+    if (queueId !== null) return;
     const customerChange = change.customers[0];
     const entryChange = change.entries[0];
     const operation = customerChange || entryChange;
@@ -1366,9 +1401,10 @@ export async function noteSyncFailure(id: number, error: unknown) {
       id,
     );
     const retryDelay = Math.min(6 * 60 * 60 * 1000, 5000 * 2 ** Math.min(prior?.attempts || 0, 12));
+    const errorCode = (error as { payload?: { code?: string } })?.payload?.code;
     const message =
       error instanceof Error && error.name === "ApiError"
-        ? error.message.slice(0, 300)
+        ? `${errorCode === "CUSTOMER_MOBILE_ALREADY_EXISTS" ? `${errorCode}: ` : ""}${error.message}`.slice(0, 300)
         : error instanceof Error && error.name === "ApiTransportError"
           ? error.message
           : "Synchronization failed";
@@ -1395,8 +1431,8 @@ export async function readSyncQueueStatus(
 ): Promise<SyncQueueStatus> {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
-  const rows = await db.getAllAsync<{ state: string; count: number }>(
-    "SELECT state, COUNT(*) AS count FROM sync_queue WHERE account_id = ? GROUP BY state",
+  const rows = await db.getAllAsync<{ state: string; count: number; mobile_conflicts: number }>(
+    "SELECT state, COUNT(*) AS count, SUM(CASE WHEN last_error LIKE 'CUSTOMER_MOBILE_ALREADY_EXISTS:%' THEN 1 ELSE 0 END) AS mobile_conflicts FROM sync_queue WHERE account_id = ? GROUP BY state",
     accountId,
   );
   const counts = new Map(rows.map((row) => [row.state, row.count]));
@@ -1404,6 +1440,7 @@ export async function readSyncQueueStatus(
     pending: counts.get("pending") || 0,
     failed: counts.get("failed") || 0,
     conflicts: counts.get("conflict") || 0,
+    mobileConflicts: rows.reduce((sum, row) => sum + (row.mobile_conflicts || 0), 0),
   };
 }
 

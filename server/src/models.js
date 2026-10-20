@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { normalizeCustomerMobile } from "./utils/phone.js";
 
 const { Schema } = mongoose;
 const base = { timestamps: true, versionKey: false, autoIndex: false };
@@ -52,8 +53,13 @@ export const Customer = mongoose.model(
       name: { type: String, required: true, trim: true, maxlength: 120 },
       nameFolded: { type: String, required: true },
       phone: { type: String, default: "", maxlength: 20 },
+      phoneNormalized: { type: String, maxlength: 10 },
+      phoneActive: { type: Boolean, default: false },
       address: { type: String, default: "", maxlength: 500 },
       openingPaise: { type: Number, min: 0, max: 100000000000 },
+      openingAdvancePaise: { type: Number, min: 0, max: 100000000000, default: 0 },
+      openingDate: Date,
+      financialVersion: { type: Number, default: 1, min: 1 },
       limitPaise: { type: Number, min: 0, max: 100000000000 },
       reminder: { type: Boolean, default: true },
       serverVersion: { type: Number, required: true, default: 1, min: 1 },
@@ -66,6 +72,17 @@ export const Customer = mongoose.model(
 Customer.schema.index({ shopId: 1, clientId: 1 }, { unique: true });
 Customer.schema.index({ shopId: 1, nameFolded: 1, _id: 1 });
 Customer.schema.index({ shopId: 1, phone: 1 });
+Customer.schema.index(
+  { shopId: 1, phoneNormalized: 1 },
+  {
+    name: "active_customer_mobile_unique",
+    unique: true,
+    partialFilterExpression: {
+      phoneNormalized: { $type: "string" },
+      phoneActive: true,
+    },
+  },
+);
 export const Entry = mongoose.model(
   "LedgerEntry",
   new Schema(
@@ -73,11 +90,16 @@ export const Entry = mongoose.model(
       shopId: { type: Schema.Types.ObjectId, required: true },
       clientId: { type: String, required: true },
       customerClientId: { type: String, required: true },
-      type: { type: String, enum: ["credit", "payment"], required: true },
+      type: { type: String, enum: ["credit", "payment", "refund"], required: true },
       amountPaise: { type: Number, required: true, min: 1, max: 100000000000 },
       date: { type: String, required: true },
+      recordedAt: Date,
       note: { type: String, default: "", maxlength: 1000 },
       method: { type: String, default: "Cash", maxlength: 50 },
+      reference: { type: String, default: "", maxlength: 120 },
+      appliedToUdhariPaise: { type: Number, min: 0, default: 0 },
+      addedToAdvancePaise: { type: Number, min: 0, default: 0 },
+      advanceAppliedPaise: { type: Number, min: 0, default: 0 },
       due: { type: String, default: "" },
       serverVersion: { type: Number, required: true, default: 1, min: 1 },
       resolutionVersion: { type: Number, required: true, default: 1, min: 1 },
@@ -417,6 +439,7 @@ export const SubscriptionUsage = mongoose.model(
 );
 
 export async function ensureIndexes() {
+  await ensureCustomerMobileIndex();
   for (const model of [
     User,
     Shop,
@@ -440,4 +463,54 @@ export async function ensureIndexes() {
     SubscriptionUsage,
   ])
     await model.createIndexes();
+}
+
+/** Normalize legacy phone representations only after a read-only duplicate preflight. */
+export async function ensureCustomerMobileIndex() {
+  const rows = await Customer.find({})
+    .select("_id shopId phone phoneNormalized phoneActive deletedAt")
+    .lean();
+  const owners = new Map();
+  for (const row of rows) {
+    if (row.deletedAt !== undefined) continue;
+    const normalized = normalizeCustomerMobile(row.phoneNormalized || row.phone);
+    if (!normalized) continue;
+    const key = `${row.shopId}:${normalized}`;
+    const group = owners.get(key) || [];
+    group.push(String(row._id));
+    owners.set(key, group);
+  }
+  const duplicateIds = [...owners.values()].filter((ids) => ids.length > 1).flat();
+  if (duplicateIds.length) {
+    throw Object.assign(new Error("Duplicate active customer mobile numbers must be reconciled before creating the unique index"), {
+      code: "CUSTOMER_MOBILE_DUPLICATES_EXIST",
+      duplicateCustomerIds: duplicateIds,
+    });
+  }
+  const operations = [];
+  for (const row of rows) {
+    const normalized = normalizeCustomerMobile(row.phoneNormalized || row.phone);
+    const active = Boolean(normalized && row.deletedAt === undefined);
+    const set = {};
+    const unset = {};
+    if (normalized) {
+      if (row.phone !== normalized) set.phone = normalized;
+      if (row.phoneNormalized !== normalized) set.phoneNormalized = normalized;
+    } else if (row.phoneNormalized) unset.phoneNormalized = 1;
+    if (row.phoneActive !== active) set.phoneActive = active;
+    if (Object.keys(set).length || Object.keys(unset).length)
+      operations.push({ updateOne: { filter: { _id: row._id }, update: { ...(Object.keys(set).length ? { $set: set } : {}), ...(Object.keys(unset).length ? { $unset: unset } : {}) } } });
+  }
+  if (operations.length) await Customer.bulkWrite(operations, { ordered: true });
+  await Customer.collection.createIndex(
+    { shopId: 1, phoneNormalized: 1 },
+    {
+      name: "active_customer_mobile_unique",
+      unique: true,
+      partialFilterExpression: {
+        phoneNormalized: { $type: "string" },
+        phoneActive: true,
+      },
+    },
+  );
 }

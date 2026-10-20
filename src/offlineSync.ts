@@ -60,6 +60,19 @@ async function runOnce(accountId: string, pullRemote: boolean) {
         if (
           error instanceof api.ApiError &&
           error.status === 409 &&
+          error.payload?.code === "CUSTOMER_MOBILE_ALREADY_EXISTS" &&
+          pending.change.customers.some((item) => item.operation === "create" || item.operation === "update")
+        ) {
+          // Keep the local customer/ledger intact, stop automatic retries, and
+          // surface a dedicated resolution-required state in sync settings.
+          await noteSyncFailure(pending.id, error);
+          await markSyncFailurePermanent(pending.id);
+          pending = await readNextChange(accountId);
+          continue;
+        }
+        if (
+          error instanceof api.ApiError &&
+          error.status === 409 &&
           error.payload?.type === "transaction_conflict" &&
           pending.change.entries.some((item) => item.operation === "update" || item.operation === "delete")
         ) {

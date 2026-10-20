@@ -10,6 +10,88 @@ function serviceError(message, status, details = {}) {
   return Object.assign(new Error(message), { status, ...details });
 }
 
+const entrySignedPaise = (entry) =>
+  entry.type === "payment" ? -entry.amountPaise : entry.amountPaise;
+
+async function lockCustomerFinancials(shopId, clientId, session) {
+  const result = await Customer.updateOne(
+    { shopId, clientId, deletedAt: { $exists: false } },
+    { $inc: { financialVersion: 1 } },
+    { session },
+  );
+  if (!result.matchedCount)
+    throw serviceError("Customer not found", 404);
+}
+
+async function currentNetBalancePaise(shopId, clientId, session) {
+  const customer = await Customer.findOne({
+    shopId,
+    clientId,
+    deletedAt: { $exists: false },
+  }).session(session).lean();
+  if (!customer) throw serviceError("Customer not found", 404);
+  const entries = await Entry.find({ shopId, customerClientId: clientId, deletedAt: { $exists: false } })
+    .session(session)
+    .select("type amountPaise")
+    .lean();
+  return (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) +
+    entries.reduce((sum, entry) => sum + entrySignedPaise(entry), 0);
+}
+
+/** Rebuild receipt and purchase allocations after any financial edit. */
+export async function reconcileCustomerAllocations(shopId, clientId, session) {
+  const customer = await Customer.findOne({
+    shopId,
+    clientId,
+    deletedAt: { $exists: false },
+  }).session(session).lean();
+  if (!customer) throw serviceError("Customer not found", 404);
+  const entries = await Entry.find({ shopId, customerClientId: clientId, deletedAt: { $exists: false } })
+    .session(session)
+    .sort({ date: 1, recordedAt: 1, createdAt: 1, _id: 1 });
+  const openingDate = customer.openingDate?.toISOString?.().slice(0, 10) ||
+    customer.createdAt?.toISOString?.().slice(0, 10);
+  const openingNetPaise = (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0);
+  let netPaise = openingDate ? 0 : openingNetPaise;
+  let openingApplied = !openingDate;
+  const writes = [];
+  for (const entry of entries) {
+    if (!openingApplied && entry.date >= openingDate) {
+      netPaise += openingNetPaise;
+      openingApplied = true;
+    }
+    let appliedToUdhariPaise = 0;
+    let addedToAdvancePaise = 0;
+    let advanceAppliedPaise = 0;
+    if (entry.type === "payment") {
+      appliedToUdhariPaise = Math.min(Math.max(0, netPaise), entry.amountPaise);
+      addedToAdvancePaise = entry.amountPaise - appliedToUdhariPaise;
+      netPaise -= entry.amountPaise;
+    } else if (entry.type === "credit") {
+      advanceAppliedPaise = Math.min(Math.max(0, -netPaise), entry.amountPaise);
+      netPaise += entry.amountPaise;
+    } else {
+      if (netPaise >= 0 || entry.amountPaise > -netPaise)
+        throw serviceError("Advance refund exceeds the available customer advance", 409, {
+          current: entryOut(entry),
+        });
+      netPaise += entry.amountPaise;
+    }
+    if (
+      entry.appliedToUdhariPaise !== appliedToUdhariPaise ||
+      entry.addedToAdvancePaise !== addedToAdvancePaise ||
+      entry.advanceAppliedPaise !== advanceAppliedPaise
+    ) {
+      entry.appliedToUdhariPaise = appliedToUdhariPaise;
+      entry.addedToAdvancePaise = addedToAdvancePaise;
+      entry.advanceAppliedPaise = advanceAppliedPaise;
+      writes.push(entry);
+    }
+  }
+  if (!openingApplied) netPaise += openingNetPaise;
+  for (const entry of writes) await entry.save({ session });
+}
+
 export async function listLedger({ shopId, customerId, month, cursorId, limit }) {
   const filter = { shopId, deletedAt: { $exists: false } };
   if (customerId) filter.customerClientId = String(customerId).slice(0, 80);
@@ -38,12 +120,6 @@ export async function listLedger({ shopId, customerId, month, cursorId, limit })
 }
 
 export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) {
-  const customer = await Customer.findOne({
-    shopId,
-    clientId: entry.customerId,
-    deletedAt: { $exists: false },
-  }).lean();
-  if (!customer) throw serviceError("Customer not found", 404);
   if (key && key.length > 128)
     throw serviceError("Invalid idempotency key", 400);
   const requestHash = digest(JSON.stringify(entry));
@@ -57,6 +133,7 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
   }
   const session = await mongoose.startSession();
   let response;
+  let duplicate = false;
   try {
     await session.withTransaction(async () => {
       let doc = await Entry.findOne({
@@ -66,25 +143,37 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
       if (doc) {
         if (doc.deletedAt || !sameEntryValues(entryOut(doc), entry))
           throw serviceError("Transaction identifier already exists", 409);
-      } else {
-        doc = await Entry.findOneAndUpdate(
-          { shopId, clientId: entry.id },
-          {
-            $set: {
-              shopId,
-              clientId: entry.id,
-              customerClientId: entry.customerId,
-              type: entry.type,
-              amountPaise: paise(entry.amount),
-              date: entry.date,
-              note: entry.note,
-              method: entry.method,
-              due: entry.due,
-            },
-          },
-          { upsert: true, new: true, runValidators: true, session },
-        );
+        response = entryOut(doc);
+        duplicate = true;
+        return;
       }
+      await lockCustomerFinancials(shopId, entry.customerId, session);
+      if (entry.type === "refund") {
+        const netPaise = await currentNetBalancePaise(shopId, entry.customerId, session);
+        if (netPaise >= 0 || paise(entry.amount) > -netPaise)
+          throw serviceError("Advance refund exceeds the available customer advance", 409);
+      }
+      doc = await Entry.findOneAndUpdate(
+        { shopId, clientId: entry.id },
+        {
+          $set: {
+            shopId,
+            clientId: entry.id,
+            customerClientId: entry.customerId,
+            type: entry.type,
+            amountPaise: paise(entry.amount),
+            date: entry.date,
+            recordedAt: entry.recordedAt ? new Date(entry.recordedAt) : new Date(),
+            note: entry.note,
+            method: entry.method,
+            reference: entry.reference || "",
+            due: entry.due,
+          },
+        },
+        { upsert: true, new: true, runValidators: true, session },
+      );
+      await reconcileCustomerAllocations(shopId, entry.customerId, session);
+      doc = await Entry.findOne({ shopId, clientId: entry.id }).session(session);
       if (audit)
         await saveAudit({ shopId, actorId, session }, audit);
       response = entryOut(doc);
@@ -107,7 +196,7 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
   } finally {
     await session.endSession();
   }
-  return { status: 201, response };
+  return { status: duplicate ? 200 : 201, response };
 }
 
 export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion, baseResolutionVersion, audit }) {
@@ -120,6 +209,7 @@ export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion
       }).session(session);
       if (!entry) throw serviceError("Transaction not found", 404);
       if (entry.deletedAt) return;
+      await lockCustomerFinancials(shopId, entry.customerClientId, session);
       if (
         ((base?.success && !sameEntryValues(entryOut(entry), base.data)) ||
           (baseVersion && (entry.serverVersion || 1) !== baseVersion) ||
@@ -134,6 +224,7 @@ export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion
       entry.serverVersion = (entry.serverVersion || 1) + 1;
       entry.resolutionVersion = (entry.resolutionVersion || 1) + 1;
       await entry.save({ session });
+      await reconcileCustomerAllocations(shopId, entry.customerClientId, session);
       if (audit)
         await saveAudit({ shopId, actorId, session }, audit);
     });
@@ -151,12 +242,6 @@ export async function updateLedgerEntry({
   baseResolutionVersion,
   audit,
 }) {
-  const customer = await Customer.findOne({
-    shopId,
-    clientId: value.customerId,
-    deletedAt: { $exists: false },
-  }).lean();
-  if (!customer) throw serviceError("Customer not found", 404);
   const session = await mongoose.startSession();
   let response;
   try {
@@ -166,6 +251,9 @@ export async function updateLedgerEntry({
         clientId: value.id,
       }).session(session);
       if (!doc) throw serviceError("Transaction not found", 404);
+      const affectedCustomers = [...new Set([doc.customerClientId, value.customerId])].sort();
+      for (const customerId of affectedCustomers)
+        await lockCustomerFinancials(shopId, customerId, session);
       const current = entryOut(doc);
       if (doc.deletedAt)
         throw serviceError("Transaction was deleted on another device", 409, {
@@ -186,6 +274,7 @@ export async function updateLedgerEntry({
           type: value.type,
           amountPaise: paise(value.amount),
           date: value.date,
+          reference: value.reference || "",
           note: value.note,
           method: value.method,
           due: value.due,
@@ -194,9 +283,12 @@ export async function updateLedgerEntry({
         doc.resolutionVersion = (doc.resolutionVersion || 1) + 1;
         await doc.save({ session });
       }
+      for (const customerId of affectedCustomers)
+        await reconcileCustomerAllocations(shopId, customerId, session);
       if (audit)
         await saveAudit({ shopId, actorId, session }, audit);
-      response = entryOut(doc);
+      const refreshed = await Entry.findOne({ shopId, clientId: value.id }).session(session);
+      response = entryOut(refreshed);
     });
   } finally {
     await session.endSession();
@@ -251,6 +343,13 @@ export async function resolveFinancialConflict({
       const doc = await Entry.findOne({ shopId, clientId: transactionId }).session(
         session,
       );
+      if (doc) {
+        const affected = new Set([doc.customerClientId]);
+        if (input.choice === "keep_local" && !input.localDeleted)
+          affected.add(input.proposed.customerId);
+        for (const customerId of [...affected].sort())
+          await lockCustomerFinancials(shopId, customerId, session);
+      }
       const actualVersion = doc?.serverVersion || 1;
       const actualResolutionVersion = doc?.resolutionVersion || 1;
       const current = doc && !doc.deletedAt ? entryOut(doc) : null;
@@ -315,6 +414,7 @@ export async function resolveFinancialConflict({
             type: proposal.type,
             amountPaise: paise(proposal.amount),
             date: proposal.date,
+            reference: proposal.reference || "",
             note: proposal.note,
             method: proposal.method,
             due: proposal.due,
@@ -327,9 +427,14 @@ export async function resolveFinancialConflict({
       } else if (doc.deletedAt) selected = null;
       doc.resolutionVersion = actualResolutionVersion + 1;
       await doc.save({ session });
-      if (selected) selected = entryOut(doc);
-      const resultingVersion = doc.serverVersion || 1;
-      const resultingResolutionVersion = doc.resolutionVersion || actualResolutionVersion;
+      const affectedCustomers = new Set([previous.customerId]);
+      if (selected?.customerId) affectedCustomers.add(selected.customerId);
+      for (const customerId of affectedCustomers)
+        await reconcileCustomerAllocations(shopId, customerId, session);
+      const updatedEntry = await Entry.findOne({ shopId, clientId: transactionId }).session(session);
+      selected = input.localDeleted || updatedEntry.deletedAt ? null : entryOut(updatedEntry);
+      const resultingVersion = updatedEntry.serverVersion || 1;
+      const resultingResolutionVersion = updatedEntry.resolutionVersion || actualResolutionVersion;
       const serverAt = new Date();
       const customer = await Customer.findOne({
         shopId,

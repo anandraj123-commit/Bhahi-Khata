@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizeCustomerMobile } from "../utils/phone.js";
 
 export const phoneSchema = z.string().regex(/^\+[1-9]\d{7,14}$/);
 export const idSchema = z
@@ -16,23 +17,25 @@ export const daySchema = z
       parsed.toISOString().slice(0, 10) === value
     );
   });
+const moneySchema = (minimum = 0) =>
+  z.number().finite().min(minimum).max(1e9).refine(
+    (value) => Math.abs(value * 100 - Math.round(value * 100)) < 0.000001,
+    "Amount must have no more than two decimal places",
+  );
 export const customerSchema = z
   .object({
     id: idSchema,
     name: z.string().trim().min(1).max(120),
-    phone: z
-      .string()
-      .max(20)
-      .refine(
-        (value) =>
-          !value ||
-          /^[6-9]\d{9}$/.test(value) ||
-          /^\+[1-9]\d{7,14}$/.test(value),
-      )
+    phone: z.string().max(32)
+      .refine((value) => !value.trim() || normalizeCustomerMobile(value) !== null,
+        "Enter a valid 10-digit Indian mobile number")
+      .transform((value) => normalizeCustomerMobile(value) || "")
       .default(""),
     address: z.string().max(500).default(""),
-    opening: z.number().finite().min(0).max(1e9),
-    limit: z.number().finite().min(0).max(1e9),
+    opening: moneySchema(),
+    openingAdvance: moneySchema().default(0),
+    openingDate: daySchema.optional(),
+    limit: moneySchema(),
     reminder: z.boolean(),
   })
   .strict();
@@ -49,11 +52,16 @@ export const entrySchema = z
   .object({
     id: idSchema,
     customerId: idSchema,
-    type: z.enum(["credit", "payment"]),
-    amount: z.number().finite().min(0.01).max(1e9),
+    type: z.enum(["credit", "payment", "refund"]),
+    amount: moneySchema(0.01),
     date: daySchema,
+    recordedAt: z.string().datetime().optional(),
     note: z.string().max(1000).default(""),
     method: z.string().max(50).default("Cash"),
+    reference: z.string().max(120).default(""),
+    appliedToUdhari: z.number().finite().min(0).optional(),
+    addedToAdvance: z.number().finite().min(0).optional(),
+    advanceApplied: z.number().finite().min(0).optional(),
     due: z.union([z.literal(""), daySchema]).default(""),
   })
   .strict();
@@ -68,7 +76,10 @@ export const backupSchema = z
     }),
     customers: z
       .array(
-        customerSchema.extend({ createdAt: z.string().datetime().optional() }),
+        customerSchema.extend({
+          createdAt: z.string().datetime().optional(),
+          openingDate: daySchema.optional(),
+        }),
       )
       .max(5000),
     entries: z.array(entrySchema).max(50000),

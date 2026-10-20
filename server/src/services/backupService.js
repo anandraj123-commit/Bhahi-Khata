@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import { Audit, Customer, Entry, Idempotency, Notification, Shop, SubscriptionUsage } from "../models.js";
 import { paise } from "../utils/money.js";
+import { reconcileCustomerAllocations } from "./ledgerService.js";
 
 export async function restoreBackup({ shopId, user, data }) {
   const session = await mongoose.startSession();
@@ -37,18 +38,28 @@ export async function restoreBackup({ shopId, user, data }) {
       await shop.save({ session });
       if (data.customers.length)
         await Customer.insertMany(
-          data.customers.map((customer) => ({
-            shopId,
-            clientId: customer.id,
-            name: customer.name,
-            nameFolded: customer.name.toLocaleLowerCase("en"),
-            phone: customer.phone,
-            address: customer.address,
-            openingPaise: paise(customer.opening),
-            limitPaise: paise(customer.limit),
-            reminder: customer.reminder,
-            ...(customer.createdAt ? { createdAt: new Date(customer.createdAt) } : {}),
-          })),
+          data.customers.map((customer) => {
+            return {
+              shopId,
+              clientId: customer.id,
+              name: customer.name,
+              nameFolded: customer.name.toLocaleLowerCase("en"),
+              phone: customer.phone,
+              ...(customer.phone ? { phoneNormalized: customer.phone } : {}),
+              phoneActive: Boolean(customer.phone),
+              address: customer.address,
+              openingPaise: paise(customer.opening),
+              openingAdvancePaise: paise(customer.openingAdvance || 0),
+              openingDate: customer.openingDate
+                ? new Date(`${customer.openingDate}T00:00:00.000Z`)
+                : customer.createdAt
+                  ? new Date(customer.createdAt)
+                  : undefined,
+              limitPaise: paise(customer.limit),
+              reminder: customer.reminder,
+              ...(customer.createdAt ? { createdAt: new Date(customer.createdAt) } : {}),
+            };
+          }),
           { session, ordered: true },
         );
       await SubscriptionUsage.updateOne(
@@ -65,12 +76,16 @@ export async function restoreBackup({ shopId, user, data }) {
             type: entry.type,
             amountPaise: paise(entry.amount),
             date: entry.date,
+            ...(entry.recordedAt ? { recordedAt: new Date(entry.recordedAt) } : {}),
             note: entry.note,
             method: entry.method,
+            reference: entry.reference || "",
             due: entry.due,
           })),
           { session, ordered: true },
         );
+      for (const customer of data.customers)
+        await reconcileCustomerAllocations(shopId, customer.id, session);
       if (data.audit.length)
         await Audit.insertMany(
           data.audit.map((item) => ({
