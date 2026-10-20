@@ -1322,6 +1322,23 @@ function AppContent() {
   type FinancialTone = keyof typeof financialPalette;
   const toneForBalance = (amount: number): FinancialTone =>
     amount > 0 ? "red" : amount < 0 ? "green" : "neutral";
+  const khataBalanceText = (signedBalance: number) =>
+    signedBalance > 0
+      ? `${money(signedBalance)} Outstanding`
+      : signedBalance < 0
+        ? `${money(Math.abs(signedBalance))} Advance`
+        : `${money(0)} Settled`;
+  const khataBalanceCard = (label: string, signedBalance: number) => {
+    const palette = financialPalette[toneForBalance(signedBalance)];
+    return (
+      <Card style={{ backgroundColor: palette.background, borderColor: palette.border }}>
+        <Hint style={{ color: palette.text }}>{label}</Hint>
+        <Text style={[s.stat, { color: palette.text }]}>
+          {khataBalanceText(signedBalance)}
+        </Text>
+      </Card>
+    );
+  };
   const stat = (label: string, value: string, tone: FinancialTone = "neutral") => {
     const palette = financialPalette[tone];
     return (
@@ -2580,15 +2597,11 @@ function AppContent() {
                 >
                   <Card>
                     <Title>{c.name}</Title>
-                    <Row title="Opening Balance" value={money(m.opening)} />
-                    <Row title="Udhari" value={money(m.credit)} />
-                    <Row title="Payment" value={money(m.payment)} />
-                    {m.refund > 0 && <Row title="Advance Refund" value={money(m.refund)} />}
-                    <Row
-                      title="Closing Balance"
-                      value={money(m.closing)}
-                      color={financialPalette[toneForBalance(m.closing)].text}
-                    />
+                    {khataBalanceCard("Opening Balance", m.opening)}
+                    <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
+                    <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
+                    {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
+                    {khataBalanceCard("Closing Balance", m.closing)}
                   </Card>
                 </Pressable>
               );
@@ -2615,7 +2628,7 @@ function AppContent() {
               <Title>{data.shop.name}</Title>
               <Hint>{data.shop.address}</Hint>
               <Text style={s.rowTitle}>{customer.name}</Text>
-              <Row title="Opening Balance" value={money(m.opening)} color={colors.blue} />
+              {khataBalanceCard("Opening Balance", m.opening)}
               {m.entries.map((e) => (
                 <Row
                   key={e.id}
@@ -2626,11 +2639,19 @@ function AppContent() {
                   onPress={() => go("transaction", e.id)}
                 />
               ))}
-              <Row title="Total Udhari" value={money(m.credit)} color={colors.blue} />
-              <Row title="Total Payment" value={money(m.payment)} color={colors.green} />
-              {m.refund > 0 && <Row title="Advance Refund" value={money(m.refund)} color={colors.orange} />}
-              <Hint>Outstanding</Hint>
-              <Text style={[s.amount, { color: financialPalette[toneForBalance(m.closing)].text }]}>{money(m.closing)}</Text>
+              <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
+              <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
+              {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
+              {khataBalanceCard("Closing Balance", m.closing)}
+              <Hint>
+                Opening Balance = Previous Period’s Closing Balance. For the first recorded period, the original opening position is Opening Outstanding − Opening Advance; those amounts are included in that period’s activity.
+              </Hint>
+              <Hint>
+                Closing Balance = Opening Balance + Udhari Given − Payment Received + Advance Refunded ± Other Adjustments (if supported). Positive = Outstanding; negative = Advance; zero = Settled.
+              </Hint>
+              <Hint>
+                Current Outstanding = MAX(0, Closing Balance). Available Advance = MAX(0, −Closing Balance).
+              </Hint>
             </Card>
             <Button
               title="WhatsApp / SMS Share"
