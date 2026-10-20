@@ -80,4 +80,5 @@ export type SubscriptionSnapshot = {
   notificationsGranted?: boolean;
   localNotificationIds?: string[];
   paymentsNextCursor?: string | null;
+  historyNextCursor?: string | null;
 };

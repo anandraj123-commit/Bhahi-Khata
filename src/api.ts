@@ -417,13 +417,14 @@ export async function getSubscriptionSnapshot(): Promise<SubscriptionSnapshot> {
   const [plans, current, history, payments] = await Promise.all([
     request("/subscription/plans"),
     request("/subscription/current"),
-    request("/subscription/history?limit=100"),
-    request("/subscription/payments?limit=100"),
+    request("/subscription/history?limit=15"),
+    request("/subscription/payments?limit=15"),
   ]);
   return {
     plans: plans.items,
     current,
     history: history.items,
+    historyNextCursor: history.nextCursor,
     payments: payments.items,
     paymentsNextCursor: payments.nextCursor,
     checkoutEnabled: plans.checkoutEnabled === true,
@@ -431,7 +432,15 @@ export async function getSubscriptionSnapshot(): Promise<SubscriptionSnapshot> {
   };
 }
 
-export async function getSubscriptionPayments(cursor: string, limit = 100) {
+export async function getSubscriptionHistory(cursor: string, limit = 15) {
+  const query = new URLSearchParams({ limit: String(limit), cursor });
+  return request(`/subscription/history?${query.toString()}`) as Promise<{
+    items: SubscriptionSnapshot["history"];
+    nextCursor: string | null;
+  }>;
+}
+
+export async function getSubscriptionPayments(cursor: string, limit = 15) {
   const query = new URLSearchParams({ limit: String(limit), cursor });
   return request(`/subscription/payments?${query.toString()}`) as Promise<{
     items: any[];

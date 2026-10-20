@@ -1,10 +1,11 @@
 import { LanguageContext, Text } from "./src/i18n";
 import ErrorBoundary from "./src/ErrorBoundary";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   BackHandler,
+  FlatList,
   KeyboardAvoidingView,
   Linking,
   Modal,
@@ -38,6 +39,7 @@ import {
   validBackup,
 } from "./src/model";
 import { normalizeCustomerMobile } from "./src/customerPhone";
+import { PAGE_SIZE, UserScrollPageGate, nextVisibleCount, visiblePage } from "./src/pagination";
 import {
   customerBalanceDisplay,
   formatCustomerCreatedOn,
@@ -299,6 +301,107 @@ function AppContent() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
   const [month, setMonth] = useState(today().slice(0, 7));
+  const matchingCustomers = useMemo(() => {
+    if (route.screen === "customers")
+      return data.customers.filter((c) =>
+        (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search)) &&
+        (filter === "All" || (filter === "Due" && balance(data, c.id) > 0) || (filter === "Paid" && balance(data, c.id) <= 0)),
+      );
+    if (["credit", "payment", "refund"].includes(route.screen))
+      return data.customers.filter((c) => c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search));
+    return [];
+  }, [data, route.screen, search, filter]);
+  const khataRows = useMemo(() => {
+    if (route.screen !== "khata") return [];
+    return data.customers
+      .filter((customer) => khataCustomerMatchesSearch(customer.name, search))
+      .flatMap((customer) => {
+        const summary = monthly(data, customer.id, month);
+        return khataEntriesForTab(summary.entries, filter, month).map((entry) => ({ customer, summary, entry }));
+      });
+  }, [data, route.screen, search, filter, month]);
+  const [listPage, setListPage] = useState({ key: "", count: PAGE_SIZE, loading: false });
+  const listPageRef = useRef({ key: "", count: PAGE_SIZE, total: 0, loading: false });
+  const listPageCounts = useRef(new Map<string, number>());
+  const listScrollOffsets = useRef(new Map<string, number>());
+  const restoredListKey = useRef("");
+  const virtualListRef = useRef<FlatList<any> | null>(null);
+  const listHasScrolled = useRef(false);
+  const customerScrollGate = useRef(new UserScrollPageGate());
+  const customerScrollStartedForKey = useRef("");
+  const customerDragStartOffset = useRef(0);
+  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${month}`;
+  const listPageKeyRef = useRef(listPageKey);
+  listPageKeyRef.current = listPageKey;
+  const rememberPageCount = (key: string, count: number) => {
+    listPageCounts.current.delete(key);
+    listPageCounts.current.set(key, count);
+    while (listPageCounts.current.size > 32)
+      listPageCounts.current.delete(listPageCounts.current.keys().next().value!);
+  };
+  useEffect(() => {
+    // Customer lists begin at page one on every visit. Programmatic restoration of
+    // an old scroll offset must not silently restore an expanded customer list.
+    const count = route.screen === "customers"
+      ? PAGE_SIZE
+      : listPageCounts.current.get(listPageKey) || PAGE_SIZE;
+    listPageRef.current = { key: listPageKey, count, total: 0, loading: false };
+    listHasScrolled.current = false;
+    customerScrollGate.current.reset();
+    customerScrollStartedForKey.current = "";
+    customerDragStartOffset.current = 0;
+    setListPage({ key: listPageKey, count, loading: false });
+  }, [listPageKey, route.screen]);
+  const pageRecords = <T,>(items: T[]) => {
+    const count = listPage.key === listPageKey ? listPage.count : PAGE_SIZE;
+    listPageRef.current = {
+      key: listPageKey,
+      count,
+      total: items.length,
+      loading: listPage.key === listPageKey && listPage.loading,
+    };
+    return visiblePage(items, count);
+  };
+  const listFooter = (hasMore: boolean, loadingLabel = "Loading more...") =>
+    hasMore && (
+      (listPage.key === listPageKey && listPage.loading) ||
+      ((route.screen === "subscription" || route.screen === "subscriptionPayments") && subscriptionPageLoading)
+    ) ? (
+      <View style={{ paddingVertical: 12, alignItems: "center" }}>
+        <ActivityIndicator size="small" color={colors.green} />
+        <Hint>{loadingLabel}</Hint>
+      </View>
+    ) : null;
+  const handleListScroll = (event: any) => {
+    const { layoutMeasurement, contentOffset, contentSize } = event.nativeEvent;
+    listScrollOffsets.current.set(listPageKeyRef.current, contentOffset.y);
+    while (listScrollOffsets.current.size > 32)
+      listScrollOffsets.current.delete(listScrollOffsets.current.keys().next().value!);
+    if (
+      route.screen === "customers" &&
+      contentOffset.y > customerDragStartOffset.current + 1
+    ) customerScrollGate.current.markUserMovement();
+    if (contentOffset.y > 1) listHasScrolled.current = true;
+    const current = listPageRef.current;
+    const nearBottom = layoutMeasurement.height + contentOffset.y >= contentSize.height - 180;
+    if (listHasScrolled.current && nearBottom && route.screen === "subscription" && subscriptionSnapshot?.historyNextCursor)
+      void loadMoreSubscriptionHistory();
+    if (listHasScrolled.current && nearBottom && route.screen === "subscriptionPayments" && subscriptionSnapshot?.paymentsNextCursor)
+      void loadMoreSubscriptionPayments();
+    if (route.screen === "customers" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    requestNextVisiblePage();
+  };
+  const requestNextVisiblePage = () => {
+    const current = listPageRef.current;
+    if (!listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    const nextCount = nextVisibleCount(current.count, current.total);
+    rememberPageCount(current.key, nextCount);
+    // Local pagination only reveals already-loaded rows; update atomically instead
+    // of delaying the page with a timer just to flash a loading indicator.
+    const next = { ...current, count: nextCount, loading: false };
+    listPageRef.current = next;
+    setListPage({ key: current.key, count: nextCount, loading: false });
+  };
   const [form, setForm] = useState<Record<string, string>>({});
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
@@ -348,6 +451,8 @@ function AppContent() {
   const subscriptionSnapshotRef = useRef<SubscriptionSnapshot | null>(null);
   const [subscriptionLoading, setSubscriptionLoading] = useState(false);
   const [subscriptionPageLoading, setSubscriptionPageLoading] = useState(false);
+  const subscriptionPageLock = useRef(false);
+  const subscriptionHistoryLock = useRef(false);
   const [subscriptionLoadError, setSubscriptionLoadError] = useState("");
   const [subscriptionDuration, setSubscriptionDuration] = useState("1");
   async function refreshSyncStatus(accountId = offlineAccountRef.current) {
@@ -372,6 +477,20 @@ function AppContent() {
       if ((await checkConnectivity()) !== "online")
         throw new api.ApiTransportError("network");
       const snapshot = await api.getSubscriptionSnapshot();
+      try {
+        const cached = await readSubscriptionSnapshot(accountId);
+        if (cached && typeof cached === "object" && "history" in cached && "payments" in cached) {
+          const previous = cached as SubscriptionSnapshot;
+          snapshot.history = [
+            ...snapshot.history,
+            ...previous.history.filter((item) => !snapshot.history.some((current) => current.id === item.id)),
+          ];
+          snapshot.payments = [
+            ...snapshot.payments,
+            ...previous.payments.filter((item) => !snapshot.payments.some((current) => current.id === item.id)),
+          ];
+        }
+      } catch { /* Retain the fresh server page if the optional cache read fails. */ }
       snapshot.cachedAt = Date.now();
       setSubscriptionSnapshot(snapshot);
       setSubscriptionLoadError("");
@@ -413,7 +532,8 @@ function AppContent() {
   async function loadMoreSubscriptionPayments() {
     const accountId = offlineAccountRef.current;
     const cursor = subscriptionSnapshot?.paymentsNextCursor;
-    if (!accountId || !cursor || subscriptionPageLoading) return;
+    if (!accountId || !cursor || subscriptionPageLock.current) return;
+    subscriptionPageLock.current = true;
     setSubscriptionPageLoading(true);
     try {
       const page = await api.getSubscriptionPayments(cursor);
@@ -427,9 +547,51 @@ function AppContent() {
       };
       setSubscriptionSnapshot(next);
       if (offlineStorageAvailable()) await cacheSubscriptionSnapshot(accountId, next);
+      const currentPage = listPageRef.current;
+      if (currentPage.key === listPageKeyRef.current) {
+        const count = Math.min(currentPage.count + PAGE_SIZE, next.payments.length);
+        rememberPageCount(currentPage.key, count);
+        listPageRef.current = { ...currentPage, count, total: next.payments.length };
+        setListPage({ key: currentPage.key, count, loading: false });
+      }
     } catch (problem) {
       Alert.alert("Unable to load payment history", errorMessage(problem, "Please try again when you are online."));
-    } finally { setSubscriptionPageLoading(false); }
+    } finally {
+      subscriptionPageLock.current = false;
+      setSubscriptionPageLoading(false);
+    }
+  }
+  async function loadMoreSubscriptionHistory() {
+    const accountId = offlineAccountRef.current;
+    const cursor = subscriptionSnapshot?.historyNextCursor;
+    if (!accountId || !cursor || subscriptionHistoryLock.current) return;
+    subscriptionHistoryLock.current = true;
+    setSubscriptionPageLoading(true);
+    try {
+      const page = await api.getSubscriptionHistory(cursor);
+      const next = {
+        ...subscriptionSnapshot!,
+        history: [
+          ...subscriptionSnapshot!.history,
+          ...page.items.filter((item) => !subscriptionSnapshot!.history.some((old) => old.id === item.id)),
+        ],
+        historyNextCursor: page.nextCursor,
+      };
+      setSubscriptionSnapshot(next);
+      if (offlineStorageAvailable()) await cacheSubscriptionSnapshot(accountId, next);
+      const currentPage = listPageRef.current;
+      if (currentPage.key === listPageKeyRef.current) {
+        const count = Math.min(currentPage.count + PAGE_SIZE, next.history.length);
+        rememberPageCount(currentPage.key, count);
+        listPageRef.current = { ...currentPage, count, total: next.history.length };
+        setListPage({ key: currentPage.key, count, loading: false });
+      }
+    } catch (problem) {
+      Alert.alert("Unable to load subscription history", errorMessage(problem, "Please try again when you are online."));
+    } finally {
+      subscriptionHistoryLock.current = false;
+      setSubscriptionPageLoading(false);
+    }
   }
   async function showSyncFailure(problem: unknown) {
     const key =
@@ -1821,6 +1983,14 @@ function AppContent() {
     }
   }
   let content: React.ReactNode = null;
+  let virtualizedRows: {
+    data: any[];
+    keyExtractor: (item: any) => string;
+    renderItem: (item: any) => React.ReactElement;
+    header?: React.ReactNode;
+    footer?: React.ReactNode;
+    empty?: React.ReactNode;
+  } | null = null;
   switch (route.screen) {
     case "welcome":
       content = (
@@ -2176,16 +2346,13 @@ function AppContent() {
       );
       break;
     case "customers": {
-      const list = data.customers.filter(
-        (c) =>
-          (c.name.toLowerCase().includes(search.toLowerCase()) ||
-            c.phone.includes(search)) &&
-          (filter === "All" ||
-            (filter === "Due" && balance(data, c.id) > 0) ||
-            (filter === "Paid" && balance(data, c.id) <= 0)),
-      );
-      content = (
-        <>
+      const list = matchingCustomers;
+      const page = pageRecords(list);
+      virtualizedRows = {
+        data: page.items,
+        keyExtractor: (customer) => customer.id,
+        renderItem: (customer) => customerRow(customer),
+        header: <>
           <Field
             label="Search customers"
             placeholder="Search name or phone"
@@ -2197,16 +2364,13 @@ function AppContent() {
             value={filter}
             onChange={setFilter}
           />
-          {list.map(customerRow)}
-          {!list.length && (
-            <Empty
-              title="No customers found"
-              description="Add a customer or try a different search."
-            />
-          )}
+        </>,
+        footer: <>
+          {listFooter(page.hasMore, "Loading more customers...")}
           <Button title="+ Add Customer" onPress={() => go("customerForm")} />
-        </>
-      );
+        </>,
+        empty: !list.length ? <Empty title="No customers found" description="Add a customer or try a different search." /> : null,
+      };
       break;
     }
     case "customerForm":
@@ -2264,14 +2428,27 @@ function AppContent() {
       break;
     case "customer":
       if (customer) {
-        const entries = data.entries.filter(
-          (e) => e.customerId === customer.id,
-        );
+        const entries = data.entries
+          .filter((e) => e.customerId === customer.id)
+          .slice()
+          .sort((a, b) => b.date.localeCompare(a.date));
+        const historyItems: { id: string; element: React.ReactElement }[] = [];
+        if (customer.opening > 0)
+          historyItems.push({ id: "opening-udhari", element: <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.opening))} color={colors.red} /> });
+        if ((customer.openingAdvance || 0) > 0)
+          historyItems.push({ id: "opening-advance", element: <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} /> });
+        if (customer.opening > 0 && (customer.openingAdvance || 0) > 0)
+          historyItems.push({ id: "opening-adjustment", element: <Row title="Opening Advance Adjusted Against Udhari" subtitle={`Remaining advance: ${money(Math.max(0, customer.openingAdvance! - customer.opening))}`} value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} /> });
+        historyItems.push(...entries.map((entry) => ({ id: entry.id, element: entryRow(entry) })));
+        const transactionPage = pageRecords(historyItems);
         const customerFinancial = financialSummary(data, customer.id);
         const currentOutstandingPaise = customerFinancial.outstandingPaise;
         const availableAdvancePaise = customerFinancial.availableAdvancePaise;
-        content = (
-          <>
+        virtualizedRows = {
+          data: transactionPage.items,
+          keyExtractor: (item) => item.id,
+          renderItem: (item) => item.element,
+          header: <>
             <Hint>
               {customer.phone || "No phone number"} •{" "}
               {customer.address || "No address"}
@@ -2328,32 +2505,10 @@ function AppContent() {
               </View>
             </View>
             <Title>Transaction History</Title>
-            {customer.opening > 0 && (
-              <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.opening))} color={colors.red} />
-            )}
-            {(customer.openingAdvance || 0) > 0 && (
-              <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} />
-            )}
-            {customer.opening > 0 && (customer.openingAdvance || 0) > 0 && (
-              <Row
-                title="Opening Advance Adjusted Against Udhari"
-                subtitle={`Remaining advance: ${money(Math.max(0, customer.openingAdvance! - customer.opening))}`}
-                value={money(Math.min(customer.opening, customer.openingAdvance || 0))}
-                color={colors.green}
-              />
-            )}
-            {entries
-              .slice()
-              .sort((a, b) => b.date.localeCompare(a.date))
-              .map(entryRow)}
-            {!entries.length && !customer.opening && !customer.openingAdvance && (
-              <Empty
-                title="No transactions yet"
-                description="Opening outstanding is included in the outstanding amount."
-              />
-            )}
-          </>
-        );
+          </>,
+          footer: listFooter(transactionPage.hasMore),
+          empty: !historyItems.length ? <Empty title="No transactions yet" description="Opening outstanding is included in the outstanding amount." /> : null,
+        };
       }
       break;
     case "viewCustomer":
@@ -2424,14 +2579,13 @@ function AppContent() {
                   paddingHorizontal: 12,
                 }}
                 nestedScrollEnabled
+                onScroll={handleListScroll}
+                scrollEventThrottle={16}
               >
-                {data.customers
-                  .filter(
-                    (c) =>
-                      c.name.toLowerCase().includes(search.toLowerCase()) ||
-                      c.phone.includes(search),
-                  )
-                  .map((c) => {
+                {(() => {
+                  const selectionPage = pageRecords(matchingCustomers);
+                  return <>
+                  {selectionPage.items.map((c) => {
                     const signedBalance = balance(data, c.id);
                     const { tone, label } = customerBalanceDisplay(signedBalance, money);
                     const balancePalette = financialPalette[tone];
@@ -2507,6 +2661,9 @@ function AppContent() {
                       </Pressable>
                     );
                   })}
+                  {listFooter(selectionPage.hasMore)}
+                  </>;
+                })()}
               </ScrollView>
             </>
           ) : null}
@@ -2616,14 +2773,39 @@ function AppContent() {
       }
       break;
     case "khata": {
-      const searchedCustomers = data.customers.filter((customer) =>
-        khataCustomerMatchesSearch(customer.name, search),
-      );
-      const hasMatchingTransactions = searchedCustomers.some((customer) =>
-        khataEntriesForTab(data.entries.filter((entry) => entry.customerId === customer.id), filter, month).length > 0,
-      );
-      content = (
-        <>
+      const transactionPage = pageRecords(khataRows);
+      const groups = new Map<string, { customer: Customer; summary: ReturnType<typeof monthly>; entries: Entry[] }>();
+      for (const row of transactionPage.items) {
+        const group = groups.get(row.customer.id);
+        if (group) group.entries.push(row.entry);
+        else groups.set(row.customer.id, { customer: row.customer, summary: row.summary, entries: [row.entry] });
+      }
+      virtualizedRows = {
+        data: [...groups.values()],
+        keyExtractor: (group) => group.customer.id,
+        renderItem: ({ customer: c, summary: m, entries }) => (
+          <Pressable accessibilityRole="button" onPress={() => go("statement", c.id)}>
+            <Card>
+              <Title>{c.name}</Title>
+              {khataBalanceCard("Opening Balance", m.opening)}
+              <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
+              <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
+              {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
+              {khataBalanceCard("Closing Balance", m.closing)}
+              {entries.map((entry: Entry) => (
+                <Row
+                  key={entry.id}
+                  title={entry.note || entryLabel(entry.type)}
+                  subtitle={entry.date}
+                  value={transactionAmountText(entry, money)}
+                  color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
+                  onPress={() => go("transaction", entry.id)}
+                />
+              ))}
+            </Card>
+          </Pressable>
+        ),
+        header: <>
           {monthPicker()}
           <Field
             label="Search customer"
@@ -2636,58 +2818,31 @@ function AppContent() {
             value={filter}
             onChange={setFilter}
           />
-          {searchedCustomers
-            .map((c) => {
-              const m = monthly(data, c.id, month);
-              const visibleEntries = khataEntriesForTab(m.entries, filter, month);
-              return (
-                <Pressable
-                  accessibilityRole="button"
-                  key={c.id}
-                  onPress={() => go("statement", c.id)}
-                >
-                  <Card>
-                    <Title>{c.name}</Title>
-                    {khataBalanceCard("Opening Balance", m.opening)}
-                    <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
-                    <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
-                    {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
-                    {khataBalanceCard("Closing Balance", m.closing)}
-                    {visibleEntries.map((entry) => (
-                      <Row
-                        key={entry.id}
-                        title={entry.note || entryLabel(entry.type)}
-                        subtitle={entry.date}
-                        value={transactionAmountText(entry, money)}
-                        color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
-                        onPress={() => go("transaction", entry.id)}
-                      />
-                    ))}
-                  </Card>
-                </Pressable>
-              );
-            })}
-          {!searchedCustomers.length && (
-            <Empty
-              title={data.customers.length ? "No matching customers" : "Your monthly khata"}
-              description={data.customers.length ? "Try a different customer search." : "Customer balances will appear here after you add customers."}
-            />
-          )}
-          {searchedCustomers.length > 0 && !hasMatchingTransactions && (
-            <Empty
-              title="No matching transactions"
-              description={`No ${filter === "All" ? "transactions" : filter === "Udhari" ? "Udhari transactions" : "payments"} for this customer search and month.`}
-            />
-          )}
-        </>
-      );
+        </>,
+        footer: listFooter(transactionPage.hasMore),
+        empty: !data.customers.some((customer) => khataCustomerMatchesSearch(customer.name, search))
+          ? <Empty title={data.customers.length ? "No matching customers" : "Your monthly khata"} description={data.customers.length ? "Try a different customer search." : "Customer balances will appear here after you add customers."} />
+          : <Empty title="No matching transactions" description={`No ${filter === "All" ? "transactions" : filter === "Udhari" ? "Udhari transactions" : "payments"} for this customer search and month.`} />,
+      };
       break;
     }
     case "statement":
       if (customer) {
         const m = monthly(data, customer.id, month);
-        content = (
-          <>
+        const statementPage = pageRecords(m.entries);
+        virtualizedRows = {
+          data: statementPage.items,
+          keyExtractor: (entry) => entry.id,
+          renderItem: (e) => (
+            <Row
+              title={e.note || entryLabel(e.type)}
+              subtitle={e.date}
+              value={transactionAmountText(e, money)}
+              color={financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text}
+              onPress={() => go("transaction", e.id)}
+            />
+          ),
+          header: <>
             {monthPicker(
               customer.createdAt ? monthForDate(customer.createdAt) : undefined,
               today().slice(0, 7),
@@ -2697,16 +2852,11 @@ function AppContent() {
               <Hint>{data.shop.address}</Hint>
               <Text style={s.rowTitle}>{customer.name}</Text>
               {khataBalanceCard("Opening Balance", m.opening)}
-              {m.entries.map((e) => (
-                <Row
-                  key={e.id}
-                  title={e.note || entryLabel(e.type)}
-                  subtitle={e.date}
-                  value={transactionAmountText(e, money)}
-                  color={financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text}
-                  onPress={() => go("transaction", e.id)}
-                />
-              ))}
+            </Card>
+          </>,
+          footer: <>
+            {listFooter(statementPage.hasMore)}
+            <Card>
               <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
               <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
               {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
@@ -2734,8 +2884,9 @@ function AppContent() {
                 );
               }}
             />
-          </>
-        );
+          </>,
+          empty: !statementPage.items.length ? <Empty title="No transactions in this period" description="The opening and closing balances still reflect the full selected period." /> : null,
+        };
       }
       break;
     case "share":
@@ -2767,10 +2918,13 @@ function AppContent() {
         );
       break;
     case "notifications":
+      {
+      const noticesPage = pageRecords(notices);
+      const recentActivityPage = pageRecords(data.audit.slice(0, 30));
       content = (
         <>
           <Hint>Account updates and delivery activity</Hint>
-          {notices.map((notice) => (
+          {noticesPage.items.map((notice) => (
             <Card key={notice.id} style={{ backgroundColor: notice.read ? "white" : colors.pale }}>
               <Row title={notice.title} subtitle={`${notice.body}\n${new Date(notice.date).toLocaleString("en-IN")}`} value={notice.read ? "Read" : "New"} onPress={() => {
                 if (notice.read) return;
@@ -2778,6 +2932,7 @@ function AppContent() {
               }} />
             </Card>
           ))}
+          {listFooter(noticesPage.hasMore)}
           <Hint>Recent activity</Hint>
           {data.audit.length === 0 && (
             <Empty
@@ -2785,7 +2940,7 @@ function AppContent() {
               description="New customers and transaction confirmations appear here."
             />
           )}
-          {data.audit.slice(0, 30).map((a) => (
+          {recentActivityPage.items.map((a) => (
             <Card
               key={a.id}
               style={{
@@ -2804,6 +2959,7 @@ function AppContent() {
               />
             </Card>
           ))}
+          {listFooter(recentActivityPage.hasMore)}
           {outstanding > 0 && (
             <Row
               title="Monthly statements available"
@@ -2814,6 +2970,7 @@ function AppContent() {
         </>
       );
       break;
+      }
     case "reports": {
       const trend = Array.from({ length: 6 }, (_, i) => {
         const d = new Date(`${month}-01T12:00:00`);
@@ -3161,6 +3318,7 @@ function AppContent() {
     case "subscription": {
       const current = subscriptionSnapshot?.current;
       const plans = subscriptionSnapshot?.plans || [];
+      const historyPage = pageRecords(subscriptionSnapshot?.history || []);
       const selected = plans.find((item) => item.name === plan || item.code === plan.toLowerCase());
       const duration = Number(subscriptionDuration);
       const price = selected?.durations.find((item) => item.months === duration);
@@ -3200,7 +3358,7 @@ function AppContent() {
           {(subscriptionSnapshot?.history || []).length > 0 && (
             <>
               <Title>Subscription History</Title>
-              {subscriptionSnapshot!.history.map((item) => {
+              {historyPage.items.map((item) => {
                 const timeRemaining = item.remainingMilliseconds;
                 const remaining = timeRemaining !== null && timeRemaining < 86400000
                   ? `${Math.floor(timeRemaining / 3600000)} hours ${Math.floor((timeRemaining % 3600000) / 60000)} minutes remaining`
@@ -3221,6 +3379,7 @@ function AppContent() {
                   </Card>
                 );
               })}
+              {listFooter(historyPage.hasMore || !!subscriptionSnapshot?.historyNextCursor)}
             </>
           )}
           {subscriptionLoading && <ActivityIndicator color={colors.green} />}
@@ -3274,33 +3433,35 @@ function AppContent() {
       break;
     }
     case "subscriptionPayments":
-      content = (
-        <>
-          <Hint>
-            {subscriptionSnapshot?.cachedAt
-              ? `Cached history • Last synchronized ${new Date(subscriptionSnapshot.cachedAt).toLocaleString("en-IN")}`
-              : "Payment history is unavailable offline until it has been synchronized."}
-          </Hint>
-          {(subscriptionSnapshot?.payments || []).length === 0 && !subscriptionLoading ? (
-            <Empty title="No payments yet" description="Verified subscription payments will appear here." />
-          ) : null}
-          {(subscriptionSnapshot?.payments || []).map((payment: any) => (
-            <Card key={payment.id}>
-              <Title>{String(payment.planCode || "").toUpperCase()} • {payment.durationMonths} months</Title>
-              <Row title="Original amount" value={money((payment.pricing?.originalAmountMinor || 0) / 100)} />
-              <Row title="Discount" value={money((payment.pricing?.discountAmountMinor || 0) / 100)} />
-              <Row title="Tax" value={money((payment.pricing?.taxAmountMinor || 0) / 100)} />
-              <Row title="Amount paid" value={money((payment.amountMinor || 0) / 100)} />
-              <Row title="Date" value={new Date(payment.createdAt).toLocaleString("en-IN")} />
-              <Row title="Status" value={payment.status} />
-              {payment.gatewayPaymentId && <Row title="Payment reference" value={payment.gatewayPaymentId} />}
-              {payment.gatewayOrderId && <Row title="Order reference" value={payment.gatewayOrderId} />}
-              {payment.method && <Row title="Payment method" value={payment.method} />}
-              {payment.currency && <Row title="Currency" value={payment.currency} />}
-              {payment.refunded && <Row title="Refund status" value={`${payment.status} • ${money((payment.refundedAmountMinor || 0) / 100)} refunded`} />}
-              <Hint>Tax invoice availability depends on the merchant's configured invoicing service.</Hint>
-            </Card>
-          ))}
+      {
+      const paymentsPage = pageRecords(subscriptionSnapshot?.payments || []);
+      virtualizedRows = {
+        data: paymentsPage.items,
+        keyExtractor: (payment) => payment.id,
+        renderItem: (payment) => (
+          <Card>
+            <Title>{String(payment.planCode || "").toUpperCase()} • {payment.durationMonths} months</Title>
+            <Row title="Original amount" value={money((payment.pricing?.originalAmountMinor || 0) / 100)} />
+            <Row title="Discount" value={money((payment.pricing?.discountAmountMinor || 0) / 100)} />
+            <Row title="Tax" value={money((payment.pricing?.taxAmountMinor || 0) / 100)} />
+            <Row title="Amount paid" value={money((payment.amountMinor || 0) / 100)} />
+            <Row title="Date" value={new Date(payment.createdAt).toLocaleString("en-IN")} />
+            <Row title="Status" value={payment.status} />
+            {payment.gatewayPaymentId && <Row title="Payment reference" value={payment.gatewayPaymentId} />}
+            {payment.gatewayOrderId && <Row title="Order reference" value={payment.gatewayOrderId} />}
+            {payment.method && <Row title="Payment method" value={payment.method} />}
+            {payment.currency && <Row title="Currency" value={payment.currency} />}
+            {payment.refunded && <Row title="Refund status" value={`${payment.status} • ${money((payment.refundedAmountMinor || 0) / 100)} refunded`} />}
+            <Hint>Tax invoice availability depends on the merchant's configured invoicing service.</Hint>
+          </Card>
+        ),
+        header: <Hint>
+          {subscriptionSnapshot?.cachedAt
+            ? `Cached history • Last synchronized ${new Date(subscriptionSnapshot.cachedAt).toLocaleString("en-IN")}`
+            : "Payment history is unavailable offline until it has been synchronized."}
+        </Hint>,
+        footer: <>
+          {listFooter(paymentsPage.hasMore || !!subscriptionSnapshot?.paymentsNextCursor)}
           {subscriptionSnapshot?.paymentsNextCursor ? (
             <Button
               title={subscriptionPageLoading ? "Loading…" : "Load more payments"}
@@ -3312,9 +3473,13 @@ function AppContent() {
           {subscriptionLoadError ? <Hint>{subscriptionLoadError}</Hint> : null}
           {subscriptionLoading && <ActivityIndicator color={colors.green} />}
           <Button title="Refresh" secondary onPress={() => void refreshSubscriptionInfo()} />
-        </>
-      );
+        </>,
+        empty: (subscriptionSnapshot?.payments || []).length === 0 && !subscriptionLoading
+          ? <Empty title="No payments yet" description="Verified subscription payments will appear here." />
+          : null,
+      };
       break;
+      }
     case "account":
       content = (
         <>
@@ -3370,13 +3535,14 @@ function AppContent() {
       );
       break;
     case "audit":
-      content = (
-        <>
-          <Hint>
-            Server-recorded customer and transaction activity for this shop.
-          </Hint>
-          {data.audit.map((a) => (
-            <Card key={a.id}>
+      {
+      const activityPage = pageRecords(data.audit);
+      virtualizedRows = {
+        data: activityPage.items,
+        keyExtractor: (activity) => activity.id,
+        header: <Hint>Server-recorded customer and transaction activity for this shop.</Hint>,
+        renderItem: (a) => (
+          <Card>
               <Title>{a.action}</Title>
               <Hint>{new Date(a.date).toLocaleString("en-IN")}</Hint>
               {a.before && (
@@ -3400,17 +3566,13 @@ function AppContent() {
                   <Hint>{a.resolution.decision} • Resolved by: {a.resolution.resolvedBy}</Hint>
                 </>
               )}
-            </Card>
-          ))}
-          {!data.audit.length && (
-            <Empty
-              title="No activity yet"
-              description="Changes you make to this khata will appear here."
-            />
-          )}
-        </>
-      );
+          </Card>
+        ),
+        footer: listFooter(activityPage.hasMore),
+        empty: !data.audit.length ? <Empty title="No activity yet" description="Changes you make to this khata will appear here." /> : null,
+      };
       break;
+      }
   }
   if (loadError)
     return (
@@ -3482,13 +3644,63 @@ function AppContent() {
           style={{ flex: 1 }}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
-          <ScrollView
-            key={`${route.screen}-${route.id || ""}`}
-            keyboardShouldPersistTaps="handled"
-            contentContainerStyle={s.content}
-          >
-            {content}
-          </ScrollView>
+          {virtualizedRows ? (
+            <FlatList
+              key={`${route.screen}-${route.id || ""}`}
+              ref={virtualListRef}
+              data={virtualizedRows.data}
+              renderItem={({ item }) => virtualizedRows!.renderItem(item)}
+              keyExtractor={(item) => virtualizedRows!.keyExtractor(item)}
+              ListHeaderComponent={virtualizedRows.header ? <>{virtualizedRows.header}</> : null}
+              ListFooterComponent={virtualizedRows.footer ? <>{virtualizedRows.footer}</> : null}
+              ListEmptyComponent={virtualizedRows.empty ? <>{virtualizedRows.empty}</> : null}
+              contentContainerStyle={s.content}
+              keyboardShouldPersistTaps="handled"
+              nestedScrollEnabled
+              initialNumToRender={PAGE_SIZE}
+              maxToRenderPerBatch={10}
+              windowSize={7}
+              removeClippedSubviews={Platform.OS === "android"}
+              onScroll={handleListScroll}
+              onScrollBeginDrag={(event) => {
+                if (route.screen === "customers") {
+                  customerScrollStartedForKey.current = listPageKeyRef.current;
+                  customerDragStartOffset.current = event.nativeEvent.contentOffset.y;
+                  customerScrollGate.current.beginUserScroll();
+                }
+              }}
+              onContentSizeChange={() => {
+                if (restoredListKey.current === listPageKey) return;
+                restoredListKey.current = listPageKey;
+                const offset = listScrollOffsets.current.get(listPageKey) || 0;
+                if (offset > 0)
+                  requestAnimationFrame(() => virtualListRef.current?.scrollToOffset({ offset, animated: false }));
+              }}
+              onEndReached={() => {
+                if (route.screen === "customers") {
+                  if (
+                    customerScrollStartedForKey.current === listPageKeyRef.current &&
+                    customerScrollGate.current.claimPage()
+                  ) {
+                    listHasScrolled.current = true;
+                    requestNextVisiblePage();
+                  }
+                } else if (listHasScrolled.current) requestNextVisiblePage();
+              }}
+              onEndReachedThreshold={0.35}
+              scrollEventThrottle={16}
+            />
+          ) : (
+            <ScrollView
+              key={`${route.screen}-${route.id || ""}`}
+              keyboardShouldPersistTaps="handled"
+              contentContainerStyle={s.content}
+              onScroll={handleListScroll}
+              scrollEventThrottle={16}
+            >
+              {content}
+            </ScrollView>
+          )}
         </KeyboardAvoidingView>
         {showNav && (
           <View style={s.nav}>
