@@ -4,13 +4,20 @@ import * as FileSystem from "expo-file-system/legacy";
 import Constants, { ExecutionEnvironment } from "expo-constants";
 import type * as SQLiteTypes from "expo-sqlite";
 import type { Audit, Customer, Data, Entry } from "./model";
-import { createSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
+import { createSyncDelta, normalizeSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
+import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import { normalizeCustomerMobile } from "./customerPhone";
 
 const DATABASE = "digital-khata-offline.db";
 const KEY_NAME = "khata.sqlite.key.v1";
 const OFFLINE_SESSION = "khata.offline-session.v1";
 const OFFLINE_SESSION_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
+const parseQueuedChange = (raw: string) => normalizeSyncDelta(JSON.parse(raw) as SyncDelta);
+const normalizeLegacyConflict = (conflict: PendingConflict): PendingConflict => ({
+  ...conflict,
+  local: withoutLegacyDue(conflict.local) as Entry,
+  server: conflict.server ? withoutLegacyDue(conflict.server) as Entry : null,
+});
 let database: Promise<SQLiteTypes.SQLiteDatabase | null> | null = null;
 let databaseEncryptionKey: string | null = null;
 let nativeDatabaseUnavailable = false;
@@ -420,14 +427,14 @@ async function writeData(db: SQLiteTypes.SQLiteDatabase, accountId: string, data
       accountId,
       entry.id,
       entry.customerId,
-      JSON.stringify(entry),
+      JSON.stringify(withoutLegacyDue(entry)),
     );
   for (const audit of [...data.audit].reverse())
     await db.runAsync(
       "INSERT INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)",
       accountId,
       audit.id,
-      JSON.stringify(audit),
+      JSON.stringify(withoutLegacyDueFromAudit(audit)),
     );
 }
 
@@ -480,7 +487,7 @@ async function writeChange(
         accountId,
         record.id,
         record.customerId,
-        JSON.stringify(record),
+        JSON.stringify(withoutLegacyDue(record)),
       );
   }
   for (const audit of change.audit)
@@ -488,7 +495,7 @@ async function writeChange(
       "INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)",
       accountId,
       audit.id,
-      JSON.stringify(audit),
+      JSON.stringify(withoutLegacyDueFromAudit(audit)),
     );
 }
 
@@ -549,7 +556,7 @@ export async function saveLocalChange(
   if (!db) return null;
   let queueId: number | null = null;
   await withEncryptedTransaction(db, async (transaction) => {
-    const change = createSyncDelta(previous, next);
+    const change = normalizeSyncDelta(createSyncDelta(previous, next));
     const changedCustomerIds = new Set(change.customers.map((item) => (item.after || item.before)?.id).filter(Boolean));
     const seenMobiles = new Map<string, string>();
     for (const customer of next.customers) {
@@ -570,7 +577,7 @@ export async function saveLocalChange(
         accountId, changedCustomer.after.id,
       );
       if (failedCreate) {
-        const original = JSON.parse(failedCreate.change_json) as SyncDelta;
+        const original = parseQueuedChange(failedCreate.change_json);
         const originalCustomer = original.customers.find((item) => (item.after || item.before)?.id === changedCustomer.after!.id);
         if (originalCustomer) {
           originalCustomer.after = { ...changedCustomer.after };
@@ -600,7 +607,7 @@ export async function saveLocalChange(
       accountId,
       "{}",
       "{}",
-      JSON.stringify(change),
+      JSON.stringify(normalizeSyncDelta(change)),
       Date.now(),
       Crypto.randomUUID(),
       entityType,
@@ -638,8 +645,8 @@ export async function readCachedAccount(accountId: string): Promise<Data | null>
   return {
     shop: JSON.parse(account.shop_json),
     customers: customers.map((row) => JSON.parse(row.record_json)),
-    entries: entries.map((row) => JSON.parse(row.record_json)),
-    audit: audit.map((row) => JSON.parse(row.record_json)),
+    entries: entries.map((row) => withoutLegacyDue(JSON.parse(row.record_json)) as Entry),
+    audit: audit.map((row) => withoutLegacyDueFromAudit(JSON.parse(row.record_json))),
     ...preferences,
   } as Data;
 }
@@ -730,7 +737,7 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
       continue;
     }
     try {
-      const failed = JSON.parse(row.change_json) as SyncDelta;
+      const failed = parseQueuedChange(row.change_json);
       blockedSettings ||= !!failed.settings;
       for (const item of failed.customers) {
         const customer = item.after || item.before;
@@ -756,7 +763,7 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
   );
   for (let index = 0; index < pending.length; index += 1) {
     const item = pending[index];
-    const change = JSON.parse(item.change_json) as SyncDelta;
+    const change = parseQueuedChange(item.change_json);
     if (item.next_attempt_at > Date.now()) {
       blockedSettings ||= !!change.settings;
       for (const customerChange of change.customers) {
@@ -792,13 +799,13 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
       const hasLedgerDependency = laterRows.some((later) => {
         if (later.id === item.id) return false;
         try {
-          const laterChange = JSON.parse(later.change_json) as SyncDelta;
+          const laterChange = parseQueuedChange(later.change_json);
           return laterChange.entries.some((entry) => (entry.after || entry.before)?.customerId === deletedCustomer);
         } catch { return true; }
       });
       if (hasLedgerDependency) continue;
     }
-    return { id: item.id, change };
+    return { id: item.id, change: normalizeSyncDelta(change) };
   }
   return null;
 }
@@ -876,7 +883,7 @@ export async function readPendingConflicts(accountId: string): Promise<PendingCo
     "SELECT conflict_json FROM sync_queue WHERE account_id = ? AND state = 'conflict' AND conflict_json IS NOT NULL ORDER BY id",
     accountId,
   );
-  return rows.flatMap((row) => { try { const value = JSON.parse(row.conflict_json) as unknown as { kind?: string }; return value.kind === "customer" || value.kind === "settings" ? [] : [value as PendingConflict]; } catch { return []; } });
+  return rows.flatMap((row) => { try { const value = JSON.parse(row.conflict_json) as unknown as { kind?: string }; return value.kind === "customer" || value.kind === "settings" ? [] : [normalizeLegacyConflict(value as PendingConflict)]; } catch { return []; } });
 }
 
 export async function readPendingCustomerConflicts(accountId: string): Promise<PendingCustomerConflict[]> {
@@ -987,7 +994,7 @@ export async function completeSettingsConflict(accountId: string, conflict: Pend
     let rebase = authoritative;
     let dependent = false;
     for (const row of later) {
-      const change = JSON.parse(row.change_json) as SyncDelta;
+      const change = parseQueuedChange(row.change_json);
       if (!change.settings) continue;
       dependent = true;
       change.settings.before = rebase;
@@ -1019,7 +1026,7 @@ export async function completeSettingsConflict(accountId: string, conflict: Pend
       );
     }
     await transaction.runAsync("INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)", accountId, audit.id, JSON.stringify(audit));
-    const remaining = JSON.parse(conflicted.change_json) as SyncDelta;
+    const remaining = parseQueuedChange(conflicted.change_json);
     delete remaining.settings;
     const hasRemaining = remaining.customers.length > 0 || remaining.entries.length > 0 || remaining.audit.length > 0 || remaining.read.length > 0;
     if (hasRemaining)
@@ -1078,7 +1085,7 @@ export async function completeCustomerConflict(
     let hasDependent = false;
     let rebase = authoritative;
     for (const row of later) {
-      const change = JSON.parse(row.change_json) as SyncDelta;
+      const change = parseQueuedChange(row.change_json);
       const item = change.customers.find((candidate) => (candidate.after || candidate.before)?.id === conflict.customerId);
       if (!item) continue;
       hasDependent = true;
@@ -1124,7 +1131,7 @@ export async function completeCustomerConflict(
       await transaction.runAsync("DELETE FROM local_customers WHERE account_id = ? AND customer_id = ?", accountId, conflict.customerId);
     }
     await transaction.runAsync("INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)", accountId, audit.id, JSON.stringify(audit));
-    const original = JSON.parse(conflicted.change_json) as SyncDelta;
+    const original = parseQueuedChange(conflicted.change_json);
     original.customers = original.customers.filter((item) => (item.after || item.before)?.id !== conflict.customerId);
     original.audit = original.audit.filter((item) => !item.action.toLowerCase().includes("customer"));
     const remains = !!original.settings || original.customers.length > 0 || original.entries.length > 0 || original.audit.length > 0 || original.read.length > 0;
@@ -1142,7 +1149,7 @@ export async function refreshConflict(id: number, server: PendingConflict["serve
   if (!db) return;
   const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
   if (!row) return;
-  const conflict = JSON.parse(row.conflict_json) as PendingConflict;
+  const conflict = normalizeLegacyConflict(JSON.parse(row.conflict_json) as PendingConflict);
   conflict.server = server;
   conflict.chosen = undefined;
   conflict.expectedVersion = server?.serverVersion || serverVersion || conflict.expectedVersion;
@@ -1155,7 +1162,7 @@ export async function chooseConflictResolution(id: number, choice: "keep_local" 
   if (!db) throw new Error("Encrypted offline storage is unavailable");
   const row = await db.getFirstAsync<{ conflict_json: string }>("SELECT conflict_json FROM sync_queue WHERE id = ? AND state = 'conflict'", id);
   if (!row) throw new Error("The pending transaction conflict is unavailable");
-  const conflict = JSON.parse(row.conflict_json) as PendingConflict;
+  const conflict = normalizeLegacyConflict(JSON.parse(row.conflict_json) as PendingConflict);
   conflict.chosen = choice;
   await db.runAsync("UPDATE sync_queue SET conflict_json = ? WHERE id = ?", JSON.stringify(conflict), id);
   return conflict;
@@ -1177,7 +1184,7 @@ export async function completeConflict(accountId: string, conflict: PendingConfl
     let base = authoritative;
     let dependent = false;
     for (const row of later) {
-      const change = JSON.parse(row.change_json) as SyncDelta;
+      const change = parseQueuedChange(row.change_json);
       const item = change.entries.find((entry) => (entry.after || entry.before)?.id === conflict.entryId);
       if (!item) continue;
       dependent = true;
@@ -1237,7 +1244,7 @@ export async function completeConflict(accountId: string, conflict: PendingConfl
       "INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)",
       accountId, audit.id, JSON.stringify(audit),
     );
-    const remaining = JSON.parse(conflictedRow.change_json) as SyncDelta;
+    const remaining = parseQueuedChange(conflictedRow.change_json);
     remaining.entries = remaining.entries.filter((item) => (item.after || item.before)?.id !== conflict.entryId);
     remaining.audit = remaining.audit.filter((item) => item.before?.id !== conflict.entryId && item.after?.id !== conflict.entryId);
     const hasRemaining = !!remaining.settings || remaining.customers.length > 0 || remaining.entries.length > 0 || remaining.audit.length > 0 || remaining.read.length > 0;
@@ -1313,7 +1320,7 @@ export async function acknowledgeChange(
       );
       let hasDependent = false;
       for (const nextRow of later) {
-        const next = JSON.parse(nextRow.change_json) as SyncDelta;
+        const next = parseQueuedChange(nextRow.change_json);
         if (!next.settings) continue;
         next.settings.before = authoritative;
         next.settings.after.shop.serverVersion = authoritative.shop.serverVersion;
@@ -1357,7 +1364,7 @@ export async function acknowledgeChange(
         );
         let rebasedNext = false;
         for (const nextRow of nextRows) {
-          const next = JSON.parse(nextRow.change_json) as SyncDelta;
+          const next = parseQueuedChange(nextRow.change_json);
           const list = kind === "customer" ? next.customers : next.entries;
           const item = list.find((candidate) => (candidate.after || candidate.before)?.id === entityId);
           if (!item) continue;

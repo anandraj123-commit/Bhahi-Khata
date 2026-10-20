@@ -1,4 +1,5 @@
 import type { Audit, Customer, Data, Entry } from "./model";
+import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 
 export type RecordChange<T> = {
   operation: "create" | "update" | "delete";
@@ -16,6 +17,19 @@ export type SyncDelta = {
   audit: Audit[];
   read: string[];
 };
+
+/** Normalize durable queue records written by app versions that had Due Date. */
+export function normalizeSyncDelta(change: SyncDelta): SyncDelta {
+  return {
+    ...change,
+    entries: change.entries.map((item) => ({
+      ...item,
+      ...(item.before ? { before: withoutLegacyDue(item.before) as Entry } : {}),
+      ...(item.after ? { after: withoutLegacyDue(item.after) as Entry } : {}),
+    })),
+    audit: change.audit.map((item) => withoutLegacyDueFromAudit(item)),
+  };
+}
 
 const equal = (left: unknown, right: unknown) =>
   JSON.stringify(left) === JSON.stringify(right);
@@ -48,11 +62,14 @@ export function createSyncDelta(previous: Data, next: Data): SyncDelta {
   const before = settingsOf(previous);
   const after = settingsOf(next);
   const priorAuditIds = new Set(previous.audit.map((item) => item.id));
-  return {
+  return normalizeSyncDelta({
     ...(equal(before, after) ? {} : { settings: { before, after } }),
     customers: changes(previous.customers, next.customers),
-    entries: changes(previous.entries, next.entries),
+    entries: changes(
+      previous.entries.map((entry) => withoutLegacyDue(entry) as Entry),
+      next.entries.map((entry) => withoutLegacyDue(entry) as Entry),
+    ),
     audit: next.audit.filter((item) => !priorAuditIds.has(item.id)),
     read: next.read.filter((id) => !previous.read.includes(id)),
-  };
+  });
 }

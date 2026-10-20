@@ -167,7 +167,6 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
             note: entry.note,
             method: entry.method,
             reference: entry.reference || "",
-            due: entry.due,
           },
         },
         { upsert: true, new: true, runValidators: true, session },
@@ -277,7 +276,6 @@ export async function updateLedgerEntry({
           reference: value.reference || "",
           note: value.note,
           method: value.method,
-          due: value.due,
         });
         doc.serverVersion = (doc.serverVersion || 1) + 1;
         doc.resolutionVersion = (doc.resolutionVersion || 1) + 1;
@@ -417,7 +415,6 @@ export async function resolveFinancialConflict({
             reference: proposal.reference || "",
             note: proposal.note,
             method: proposal.method,
-            due: proposal.due,
             deletedAt: input.localDeleted ? new Date() : undefined,
             serverVersion: actualVersion + 1,
             resolutionVersion: actualResolutionVersion + 1,

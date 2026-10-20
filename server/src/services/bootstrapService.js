@@ -1,6 +1,6 @@
 import mongoose from "mongoose";
 import { Audit, Customer, Entry, Shop, User } from "../models.js";
-import { customerOut, entryOut, shopOut } from "../utils/serializers.js";
+import { auditEntryOut, customerOut, entryOut, shopOut } from "../utils/serializers.js";
 import { phoneLookupVariants } from "../utils/phone.js";
 import { normalizePhone } from "../utils/phone.js";
 import { hasShopScopedData } from "./shopService.js";
@@ -95,8 +95,8 @@ export async function getBootstrap(user, shopId) {
       id: item.clientId,
       action: item.action,
       date: item.occurredAt.toISOString(),
-      ...(item.before ? { before: item.before } : {}),
-      ...(item.after ? { after: item.after } : {}),
+      ...(item.before ? { before: auditEntryOut(item.before) } : {}),
+      ...(item.after ? { after: auditEntryOut(item.after) } : {}),
     })),
     signedIn: true,
     language: shop.language || "English",

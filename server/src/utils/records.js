@@ -3,7 +3,7 @@ export const sameCustomerValues = (left, right) =>
     (key) => left[key] === right[key],
   );
 export const sameEntryValues = (left, right) =>
-  ["id", "customerId", "type", "amount", "date", "note", "method", "reference", "due"].every(
+  ["id", "customerId", "type", "amount", "date", "note", "method", "reference"].every(
     (key) => left[key] === right[key],
   );
 export const sameShopValues = (left, right) =>

@@ -5,7 +5,8 @@ import {
 } from "./offlineStore";
 import type { Data } from "./model";
 import type { PendingConflict, PendingSettingsConflict } from "./offlineStore";
-import { createSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
+import { createSyncDelta, normalizeSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
+import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import type { SubscriptionSnapshot } from "./subscription";
 
 const configuredBase = process.env.EXPO_PUBLIC_API_URL || "http://10.0.2.2:4000/api/v1";
@@ -128,8 +129,9 @@ export async function probeBackendReachability(): Promise<BackendProbeResult> {
 const ACCESS = "khata.access.v1";
 const REFRESH = "khata.refresh.v1";
 const auditInput = (audit: Data["audit"][number]) => {
-  const before = audit.before ? { ...audit.before } : undefined;
-  const after = audit.after ? { ...audit.after } : undefined;
+  const normalized = withoutLegacyDueFromAudit(audit);
+  const before = normalized.before ? { ...normalized.before } : undefined;
+  const after = normalized.after ? { ...normalized.after } : undefined;
   if (before) delete before.serverVersion;
   if (after) delete after.serverVersion;
   return { ...audit, ...(before ? { before } : {}), ...(after ? { after } : {}) };
@@ -316,6 +318,8 @@ export function normalizeData(value: Data): Data {
     shopExists: value.shopExists ?? true,
     shopComplete: value.shopComplete ?? Boolean(value.shop.name.trim() && value.shop.owner.trim()),
     shop: { ...value.shop, phone: value.shop.phone.replace(/^\+91/, "") },
+    entries: value.entries.map((entry) => withoutLegacyDue(entry) as Data["entries"][number]),
+    audit: value.audit.map((item) => withoutLegacyDueFromAudit(item)),
   };
 }
 export async function startOtp(phone: string) {
@@ -371,7 +375,7 @@ export async function restoreBackup(data: Data) {
   await request("/backup/restore", {
     method: "POST",
     body: JSON.stringify({
-      ...data,
+      ...normalizeData(data),
       shop: {
         ...data.shop,
         phone: data.shop.phone.startsWith("+")
@@ -459,6 +463,7 @@ export async function getSubscriptionPaymentStatus(orderId: string) {
   return request(`/payments/${encodeURIComponent(orderId)}/status`);
 }
 export async function syncQueuedChange(change: SyncDelta) {
+  change = normalizeSyncDelta(change);
   const acknowledged: { customers: Data["customers"]; entries: Data["entries"]; settings?: SyncSettings } = {
     customers: [],
     entries: [],
@@ -555,7 +560,7 @@ export async function syncQueuedChange(change: SyncDelta) {
     const baseResolutionVersion = baseRecord?.resolutionVersion;
     if (baseRecord) delete baseRecord.serverVersion;
     if (baseRecord) delete baseRecord.resolutionVersion;
-    const payload = { ...entry };
+    const payload = { ...withoutLegacyDue(entry) };
     delete payload.serverVersion;
     delete payload.resolutionVersion;
     const saved = await request(old ? `/ledger/${encodeURIComponent(entry.id)}` : "/ledger", {

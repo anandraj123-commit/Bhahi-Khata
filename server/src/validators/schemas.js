@@ -62,9 +62,11 @@ export const entrySchema = z
     appliedToUdhari: z.number().finite().min(0).optional(),
     addedToAdvance: z.number().finite().min(0).optional(),
     advanceApplied: z.number().finite().min(0).optional(),
-    due: z.union([z.literal(""), daySchema]).default(""),
+    // Accept and discard this retired property from requests by older clients.
+    due: z.unknown().optional(),
   })
-  .strict();
+  .strict()
+  .transform(({ due: _legacyDue, ...entry }) => entry);
 export const backupSchema = z
   .object({
     shop: z.object({

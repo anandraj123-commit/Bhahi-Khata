@@ -1220,7 +1220,6 @@ function AppContent() {
         note: e?.note || "",
         method: e?.method || data.defaultMethod,
         reference: e?.reference || "",
-        due: e?.due || "",
       });
     }
     if (screen === "setup") setForm({
@@ -1262,15 +1261,6 @@ function AppContent() {
   const monthEntries = data.entries.filter((e) => e.date.startsWith(month));
   const totalCredit = periodUdhari(data, month);
   const totalPayment = periodReceived(data, month);
-  const isOverdue = (c: Customer) =>
-    balance(data, c.id) > 0 &&
-    data.entries.some(
-      (e) =>
-        e.customerId === c.id &&
-        e.type === "credit" &&
-        e.due &&
-        e.due < today(),
-    );
   function statementText(id: string) {
     const c = data.customers.find((c) => c.id === id);
     const m = monthly(data, id, month);
@@ -1379,11 +1369,11 @@ function AppContent() {
           <View style={{ flex: 1 }}>
             <Text style={s.rowTitle}>{c.name}</Text>
             <Text style={s.small}>
-              {isOverdue(c) ? "Overdue • " : ""}
               {c.phone || "No phone added"}
             </Text>
+            {c.address ? <Text style={s.small}>{c.address}</Text> : null}
           </View>
-          <Text style={{ color: financialPalette[isOverdue(c) ? "red" : toneForBalance(balance(data, c.id))].text, fontWeight: "700" }}>
+          <Text style={{ color: financialPalette[toneForBalance(balance(data, c.id))].text, fontWeight: "700" }}>
             {balance(data, c.id) < 0
               ? `Advance ${money(-balance(data, c.id))}`
               : money(balance(data, c.id))}
@@ -1547,15 +1537,10 @@ function AppContent() {
         "Invalid amount",
         "Enter an amount from ₹0.01 to ₹100 crore, with no more than two decimal places.",
       );
-    if (!validDate(form.date) || (form.due && !validDate(form.due)))
+    if (!validDate(form.date))
       return Alert.alert(
         "Invalid date",
         "Use a valid date in YYYY-MM-DD format.",
-      );
-    if (form.due && form.due < form.date)
-      return Alert.alert(
-        "Invalid due date",
-        "Due date cannot be before the transaction date.",
       );
     const amountPaise = Math.round(amount * 100);
     const oldSignedPaise = old
@@ -1586,7 +1571,6 @@ function AppContent() {
       note: form.note.trim(),
       method: form.method,
       reference: form.reference?.trim() || "",
-      due: type === "credit" ? form.due : "",
       appliedToUdhari: appliedToUdhariPaise / 100,
       addedToAdvance: addedToAdvancePaise / 100,
       advanceApplied: advanceAppliedPaise / 100,
@@ -1710,7 +1694,7 @@ function AppContent() {
         Paths.cache,
         backup ? "digital-khata-backup.json" : "digital-khata-ledger.csv",
       );
-      file.write(backup ? JSON.stringify(data, null, 2) : csv);
+      file.write(backup ? JSON.stringify(api.normalizeData(data), null, 2) : csv);
       await Sharing.shareAsync(file.uri, {
         mimeType: backup ? "application/json" : "text/csv",
         dialogTitle: backup ? "Save your khata backup" : "Export ledger",
@@ -2189,8 +2173,7 @@ function AppContent() {
             c.phone.includes(search)) &&
           (filter === "All" ||
             (filter === "Due" && balance(data, c.id) > 0) ||
-            (filter === "Paid" && balance(data, c.id) <= 0) ||
-            (filter === "Overdue" && isOverdue(c))),
+            (filter === "Paid" && balance(data, c.id) <= 0)),
       );
       content = (
         <>
@@ -2201,7 +2184,7 @@ function AppContent() {
             onChangeText={setSearch}
           />
           <Chips
-            items={["All", "Due", "Paid", "Overdue"]}
+            items={["All", "Due", "Paid"]}
             value={filter}
             onChange={setFilter}
           />
@@ -2321,10 +2304,10 @@ function AppContent() {
             </View>
             <Title>Transaction History</Title>
             {customer.opening > 0 && (
-              <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`+${money(customer.opening)}`} color={colors.blue} />
+              <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.opening))} color={colors.red} />
             )}
             {(customer.openingAdvance || 0) > 0 && (
-              <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={`−${money(customer.openingAdvance || 0)}`} color={colors.blue} />
+              <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} />
             )}
             {customer.opening > 0 && (customer.openingAdvance || 0) > 0 && (
               <Row
@@ -2389,66 +2372,93 @@ function AppContent() {
                       c.name.toLowerCase().includes(search.toLowerCase()) ||
                       c.phone.includes(search),
                   )
-                  .map((c) => (
-                    <Pressable
-                      key={c.id}
-                      accessibilityRole="button"
-                      accessibilityState={{
-                        selected: form.customerId === c.id,
-                      }}
-                      onPress={() => f("customerId", c.id)}
-                      style={({ pressed }) => ({
-                        flexDirection: "row",
-                        alignItems: "center",
-                        gap: 10,
-                        padding: 12,
-                        marginVertical: 4,
-                        borderRadius: 8,
-                        borderWidth: 1,
-                        borderColor:
-                          form.customerId === c.id
-                            ? colors.green
-                            : colors.border,
-                        backgroundColor:
-                          form.customerId === c.id ? colors.green : "white",
-                        opacity: pressed ? 0.8 : 1,
-                      })}
-                    >
-                      <View style={{ flex: 1 }}>
+                  .map((c) => {
+                    const signedBalance = balance(data, c.id);
+                    const balanceTone: FinancialTone =
+                      signedBalance < 0
+                        ? "green"
+                        : signedBalance > 0
+                          ? "red"
+                          : "neutral";
+                    const balancePalette = financialPalette[balanceTone];
+                    const balanceLabel =
+                      signedBalance < 0
+                        ? `${money(Math.abs(signedBalance))} Advance`
+                        : signedBalance > 0
+                          ? `${money(Math.abs(signedBalance))} Due`
+                          : `${money(0)} Settled`;
+                    return (
+                      <Pressable
+                        key={c.id}
+                        accessibilityRole="button"
+                        accessibilityState={{
+                          selected: form.customerId === c.id,
+                        }}
+                        onPress={() => f("customerId", c.id)}
+                        style={({ pressed }) => ({
+                          flexDirection: "row",
+                          alignItems: "center",
+                          gap: 10,
+                          padding: 12,
+                          marginVertical: 4,
+                          borderRadius: 8,
+                          borderWidth: 1,
+                          borderColor:
+                            form.customerId === c.id
+                              ? colors.green
+                              : colors.border,
+                          backgroundColor:
+                            form.customerId === c.id ? colors.green : "white",
+                          opacity: pressed ? 0.8 : 1,
+                        })}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text
+                            style={{
+                              color:
+                                form.customerId === c.id ? "white" : colors.dark,
+                              fontSize: 15,
+                              fontWeight: "600",
+                            }}
+                          >
+                            {c.name}
+                          </Text>
+                          <Text
+                            style={{
+                              color:
+                                form.customerId === c.id
+                                  ? "#E7FFF0"
+                                  : colors.muted,
+                              fontSize: 12,
+                              marginTop: 5,
+                            }}
+                          >
+                            {[c.phone, c.address]
+                              .filter(Boolean)
+                              .join(" • ")}
+                          </Text>
+                        </View>
                         <Text
                           style={{
-                            color:
-                              form.customerId === c.id ? "white" : colors.dark,
-                            fontSize: 15,
+                            color: balancePalette.text,
+                            backgroundColor: balancePalette.background,
+                            borderColor: balancePalette.border,
+                            borderWidth: 1,
+                            borderRadius: 5,
+                            paddingHorizontal: 6,
+                            paddingVertical: 2,
+                            fontSize: 12,
                             fontWeight: "600",
                           }}
                         >
-                          {c.name}
+                          {balanceLabel}
                         </Text>
-                        <Text
-                          style={{
-                            color:
-                              form.customerId === c.id
-                                ? "#E7FFF0"
-                                : colors.muted,
-                            fontSize: 12,
-                            marginTop: 5,
-                          }}
-                        >
-                          {[
-                            c.phone,
-                            c.address,
-                            `Balance ${money(balance(data, c.id))}`,
-                          ]
-                            .filter(Boolean)
-                            .join(" • ")}
-                        </Text>
-                      </View>
-                      {form.customerId === c.id && (
-                        <Icon name="checkmark-circle" color="white" size={20} />
-                      )}
-                    </Pressable>
-                  ))}
+                        {form.customerId === c.id && (
+                          <Icon name="checkmark-circle" color="white" size={20} />
+                        )}
+                      </Pressable>
+                    );
+                  })}
               </ScrollView>
             </>
           ) : null}
@@ -2474,11 +2484,7 @@ function AppContent() {
               {field("Date (YYYY-MM-DD) *", "date", {
                 placeholder: "2026-10-13",
               })}
-              {route.screen === "credit" || entry?.type === "credit" ? (
-                field("Due date (optional, YYYY-MM-DD)", "due", {
-                  placeholder: "YYYY-MM-DD",
-                })
-              ) : (
+              {route.screen !== "credit" && entry?.type !== "credit" ? (
                 <>
                   <Title>Payment Method</Title>
                   <Chips
@@ -2487,7 +2493,7 @@ function AppContent() {
                     onChange={(v) => f("method", v)}
                   />
                 </>
-              )}
+              ) : null}
               {field("Description / Note", "note", {
                 placeholder: route.screen === "credit"
                   ? "Grocery Items"
@@ -2552,7 +2558,6 @@ function AppContent() {
             {entry.type === "credit" && (entry.advanceApplied || 0) > 0 && (
               <Row title="Adjusted From Advance" value={money(entry.advanceApplied || 0)} />
             )}
-            {entry.due && <Row title="Due Date" value={entry.due} color={colors.orange} />}
             <Button
               title="Edit"
               onPress={() => go("editTransaction", entry.id)}
@@ -2828,15 +2833,8 @@ function AppContent() {
             <Row
               title="Pending"
               value={String(
-                data.customers.filter(
-                  (c) => balance(data, c.id) > 0 && !isOverdue(c),
-                ).length,
+                data.customers.filter((c) => balance(data, c.id) > 0).length,
               )}
-              color={colors.red}
-            />
-            <Row
-              title="Overdue"
-              value={String(data.customers.filter(isOverdue).length)}
               color={colors.red}
             />
           </Card>

@@ -68,9 +68,9 @@ export async function sendCustomerSms({ shopId, customerId }) {
       },
     },
   ]);
-  const due = Math.max(0, (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) + total) / 100;
+  const outstanding = Math.max(0, (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) + total) / 100;
   await sendSms(
     phone.length === 10 ? `+91${phone}` : `+${phone}`,
-    { customer: customer.name, shop: shop.name, amount: due },
+    { customer: customer.name, shop: shop.name, amount: outstanding },
   );
 }

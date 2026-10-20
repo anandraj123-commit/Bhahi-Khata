@@ -80,7 +80,6 @@ export async function restoreBackup({ shopId, user, data }) {
             note: entry.note,
             method: entry.method,
             reference: entry.reference || "",
-            due: entry.due,
           })),
           { session, ordered: true },
         );

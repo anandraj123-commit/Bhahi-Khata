@@ -103,13 +103,13 @@ export function startReminderWorker(log) {
           ]);
           const totals = new Map(balances.map((x) => [x._id, x.paise]));
           for (const customer of customers) {
-            const due =
+            const outstanding =
               Math.max(
                 0,
                 (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) +
                   (totals.get(customer.clientId) || 0),
               ) / 100;
-            if (due <= 0 || due < Number(shop.reminders.minimum || 0)) continue;
+            if (outstanding <= 0 || outstanding < Number(shop.reminders.minimum || 0)) continue;
             for (const channel of ["whatsapp", "sms"]) {
               if (!shop.reminders[channel]) continue;
               if (
@@ -144,12 +144,12 @@ export function startReminderWorker(log) {
                   await sendWhatsApp(
                     phone,
                     process.env.WHATSAPP_TEMPLATE_NAME,
-                    [customer.name, `₹${due.toFixed(2)}`, shop.name],
+                    [customer.name, `₹${outstanding.toFixed(2)}`, shop.name],
                   );
                 else
                   await sendSms(
                     phone,
-                    { customer: customer.name, shop: shop.name, amount: due },
+                    { customer: customer.name, shop: shop.name, amount: outstanding },
                   );
                 await ReminderDelivery.updateOne(
                   { _id: claim._id },

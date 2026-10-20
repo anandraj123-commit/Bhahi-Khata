@@ -29,8 +29,12 @@ export const entryOut = (d) => ({
   appliedToUdhari: (d.appliedToUdhariPaise || 0) / 100,
   addedToAdvance: (d.addedToAdvancePaise || 0) / 100,
   advanceApplied: (d.advanceAppliedPaise || 0) / 100,
-  due: d.due,
 });
+export const auditEntryOut = (entry) => {
+  if (!entry || typeof entry !== "object") return entry;
+  const { due: _legacyDue, ...active } = entry;
+  return active;
+};
 export const financialAuditOut = (record) => ({
   id: `resolution:${record.resolutionId}`,
   action: "Transaction Conflict Resolved",

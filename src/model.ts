@@ -29,7 +29,6 @@ export type Entry = {
   note: string;
   method: string;
   reference?: string;
-  due: string;
   /** Server-reconciled receipt allocation, in rupees. */
   appliedToUdhari?: number;
   addedToAdvance?: number;
@@ -366,9 +365,7 @@ export function validBackup(value: unknown): value is Data {
         e.amount <= 1e9 &&
         isDate(e.date) &&
         typeof e.note === "string" &&
-        typeof e.method === "string" &&
-        typeof e.due === "string" &&
-        (!e.due || isDate(e.due)),
+        typeof e.method === "string",
     ) &&
     new Set(d.entries.map((e) => e.id)).size === d.entries.length &&
     Array.isArray(d.audit) &&

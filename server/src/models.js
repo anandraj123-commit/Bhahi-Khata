@@ -100,7 +100,6 @@ export const Entry = mongoose.model(
       appliedToUdhariPaise: { type: Number, min: 0, default: 0 },
       addedToAdvancePaise: { type: Number, min: 0, default: 0 },
       advanceAppliedPaise: { type: Number, min: 0, default: 0 },
-      due: { type: String, default: "" },
       serverVersion: { type: Number, required: true, default: 1, min: 1 },
       resolutionVersion: { type: Number, required: true, default: 1, min: 1 },
       deletedAt: Date,
