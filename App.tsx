@@ -38,6 +38,12 @@ import {
   validBackup,
 } from "./src/model";
 import { normalizeCustomerMobile } from "./src/customerPhone";
+import {
+  khataBalanceDisplay,
+  khataCustomerMatchesSearch,
+  khataEntriesForTab,
+  transactionAmountText,
+} from "./src/khataPresentation";
 import * as api from "./src/api";
 import {
   cacheAuthenticatedAccount,
@@ -198,7 +204,6 @@ const titles: Partial<Record<Screen, string>> = {
 };
 const entryLabel = (type: Entry["type"]) =>
   type === "credit" ? "Udhari Given" : type === "refund" ? "Advance Refund" : "Payment Received";
-const entrySign = (type: Entry["type"]) => type === "payment" ? "−" : "+";
 
 async function scheduleSubscriptionNotifications(
   snapshot: SubscriptionSnapshot,
@@ -1322,19 +1327,14 @@ function AppContent() {
   type FinancialTone = keyof typeof financialPalette;
   const toneForBalance = (amount: number): FinancialTone =>
     amount > 0 ? "red" : amount < 0 ? "green" : "neutral";
-  const khataBalanceText = (signedBalance: number) =>
-    signedBalance > 0
-      ? `${money(signedBalance)} Outstanding`
-      : signedBalance < 0
-        ? `${money(Math.abs(signedBalance))} Advance`
-        : `${money(0)} Settled`;
   const khataBalanceCard = (label: string, signedBalance: number) => {
-    const palette = financialPalette[toneForBalance(signedBalance)];
+    const balanceDisplay = khataBalanceDisplay(signedBalance);
+    const palette = financialPalette[balanceDisplay.tone];
     return (
       <Card style={{ backgroundColor: palette.background, borderColor: palette.border }}>
         <Hint style={{ color: palette.text }}>{label}</Hint>
         <Text style={[s.stat, { color: palette.text }]}>
-          {khataBalanceText(signedBalance)}
+          {`${money(balanceDisplay.amount)} ${balanceDisplay.position}`}
         </Text>
       </Card>
     );
@@ -1424,8 +1424,7 @@ function AppContent() {
               color: financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text,
             }}
           >
-            {entrySign(e.type)}
-            {money(e.amount)}
+            {transactionAmountText(e, money)}
           </Text>
         </View>
       </Card>
@@ -2527,7 +2526,7 @@ function AppContent() {
         content = (
           <>
             <Card style={{ alignItems: "center", paddingVertical: 30 }}>
-              <Text style={[s.amount, { color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text }]}>{money(entry.amount)}</Text>
+              <Text style={[s.amount, { color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text }]}>{transactionAmountText(entry, money)}</Text>
               <View style={[s.badge, { backgroundColor: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].background }]}>
                 <Text style={{ color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text, fontWeight: "700" }}>
                   {entryLabel(entry.type).toUpperCase()}
@@ -2563,7 +2562,13 @@ function AppContent() {
         );
       }
       break;
-    case "khata":
+    case "khata": {
+      const searchedCustomers = data.customers.filter((customer) =>
+        khataCustomerMatchesSearch(customer.name, search),
+      );
+      const hasMatchingTransactions = searchedCustomers.some((customer) =>
+        khataEntriesForTab(data.entries.filter((entry) => entry.customerId === customer.id), filter, month).length > 0,
+      );
       content = (
         <>
           {monthPicker()}
@@ -2578,17 +2583,10 @@ function AppContent() {
             value={filter}
             onChange={setFilter}
           />
-          {data.customers
-            .filter((c) => c.name.toLowerCase().includes(search.toLowerCase()))
-            .filter(
-              (c) =>
-                filter === "All" ||
-                monthly(data, c.id, month)[
-                  filter === "Udhari" ? "credit" : "payment"
-                ] > 0,
-            )
+          {searchedCustomers
             .map((c) => {
               const m = monthly(data, c.id, month);
+              const visibleEntries = khataEntriesForTab(m.entries, filter, month);
               return (
                 <Pressable
                   accessibilityRole="button"
@@ -2602,19 +2600,36 @@ function AppContent() {
                     <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
                     {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
                     {khataBalanceCard("Closing Balance", m.closing)}
+                    {visibleEntries.map((entry) => (
+                      <Row
+                        key={entry.id}
+                        title={entry.note || entryLabel(entry.type)}
+                        subtitle={entry.date}
+                        value={transactionAmountText(entry, money)}
+                        color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
+                        onPress={() => go("transaction", entry.id)}
+                      />
+                    ))}
                   </Card>
                 </Pressable>
               );
             })}
-          {!data.customers.length && (
+          {!searchedCustomers.length && (
             <Empty
-              title="Your monthly khata"
-              description="Customer balances will appear here after you add customers."
+              title={data.customers.length ? "No matching customers" : "Your monthly khata"}
+              description={data.customers.length ? "Try a different customer search." : "Customer balances will appear here after you add customers."}
+            />
+          )}
+          {searchedCustomers.length > 0 && !hasMatchingTransactions && (
+            <Empty
+              title="No matching transactions"
+              description={`No ${filter === "All" ? "transactions" : filter === "Udhari" ? "Udhari transactions" : "payments"} for this customer search and month.`}
             />
           )}
         </>
       );
       break;
+    }
     case "statement":
       if (customer) {
         const m = monthly(data, customer.id, month);
@@ -2634,7 +2649,7 @@ function AppContent() {
                   key={e.id}
                   title={e.note || entryLabel(e.type)}
                   subtitle={e.date}
-                  value={`${entrySign(e.type)}${money(e.amount)}`}
+                  value={transactionAmountText(e, money)}
                   color={financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text}
                   onPress={() => go("transaction", e.id)}
                 />
