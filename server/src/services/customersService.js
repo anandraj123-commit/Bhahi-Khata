@@ -83,6 +83,7 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
       } else {
         await assertCustomerMobileAvailable({ shopId, phone: customer.phone, excludeClientId: customer.id, session });
         await reserveCustomerCapacity({ shopId, session });
+        const now = new Date();
         doc = await Customer.findOneAndUpdate(
             { shopId, clientId: customer.id },
           {
@@ -103,9 +104,13 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
               limitPaise: paise(customer.limit),
               reminder: customer.reminder,
             },
+            $setOnInsert: {
+              createdAt: customer.createdAt ? new Date(customer.createdAt) : now,
+              updatedAt: now,
+            },
             ...(customer.phone ? {} : { $unset: { phoneNormalized: 1 } }),
           },
-          { upsert: true, new: true, runValidators: true, session },
+          { upsert: true, new: true, runValidators: true, session, timestamps: false },
         );
       }
       if (audit)

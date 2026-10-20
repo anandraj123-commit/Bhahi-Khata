@@ -39,6 +39,10 @@ import {
 } from "./src/model";
 import { normalizeCustomerMobile } from "./src/customerPhone";
 import {
+  customerBalanceDisplay,
+  formatCustomerCreatedOn,
+} from "./src/customerPresentation";
+import {
   khataBalanceDisplay,
   khataCustomerMatchesSearch,
   khataEntriesForTab,
@@ -111,6 +115,7 @@ type Screen =
   | "customers"
   | "customerForm"
   | "customer"
+  | "viewCustomer"
   | "credit"
   | "payment"
   | "refund"
@@ -182,6 +187,7 @@ const titles: Partial<Record<Screen, string>> = {
   setup: "Set Up Your Shop",
   customers: "Customers",
   customerForm: "Add Customer",
+  viewCustomer: "View Customer",
   credit: "Add Udhari",
   payment: "Receive Money / Add Advance",
   refund: "Refund Advance",
@@ -1353,35 +1359,38 @@ function AppContent() {
       )}
     </>
   );
-  const customerRow = (c: Customer) => (
-    <Pressable
-      key={c.id}
-      onPress={() => go("customer", c.id)}
-      accessibilityRole="button"
-    >
-      <Card>
-        <View style={[s.split, { alignItems: "center" }]}>
-          <View style={s.avatar}>
-            <Text style={{ color: colors.green, fontWeight: "700" }}>
-              {c.name[0]?.toUpperCase()}
+  const customerRow = (c: Customer) => {
+    const signedBalance = balance(data, c.id);
+    const { tone, label } = customerBalanceDisplay(signedBalance, money);
+    return (
+      <Pressable
+        key={c.id}
+        onPress={() => go("customer", c.id)}
+        accessibilityRole="button"
+      >
+        <Card>
+          <View style={[s.split, { alignItems: "center" }]}>
+            <View style={s.avatar}>
+              <Text style={{ color: colors.green, fontWeight: "700" }}>
+                {c.name[0]?.toUpperCase()}
+              </Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={s.rowTitle}>{c.name}</Text>
+              <Text style={s.small}>{c.phone || "No phone added"}</Text>
+              {c.address ? <Text style={s.small}>{c.address}</Text> : null}
+              <Text style={s.small}>
+                Created On: {formatCustomerCreatedOn(c.createdAt)}
+              </Text>
+            </View>
+            <Text style={{ color: financialPalette[tone].text, fontWeight: "700" }}>
+              {label}
             </Text>
           </View>
-          <View style={{ flex: 1 }}>
-            <Text style={s.rowTitle}>{c.name}</Text>
-            <Text style={s.small}>
-              {c.phone || "No phone added"}
-            </Text>
-            {c.address ? <Text style={s.small}>{c.address}</Text> : null}
-          </View>
-          <Text style={{ color: financialPalette[toneForBalance(balance(data, c.id))].text, fontWeight: "700" }}>
-            {balance(data, c.id) < 0
-              ? `Advance ${money(-balance(data, c.id))}`
-              : money(balance(data, c.id))}
-          </Text>
-        </View>
-      </Card>
-    </Pressable>
-  );
+        </Card>
+      </Pressable>
+    );
+  };
   const entryRow = (e: Entry) => (
     <Pressable
       key={e.id}
@@ -2209,7 +2218,14 @@ function AppContent() {
             maxLength: 32,
             placeholder: "98XXXXXXXX",
           })}
-          {field("Address", "address", { placeholder: "Delhi" })}
+          {field("Address", "address", { placeholder: "Delhi", multiline: true })}
+          {route.id && customer ? (
+            <Field
+              label="Created On"
+              value={formatCustomerCreatedOn(customer.createdAt)}
+              editable={false}
+            />
+          ) : null}
           {field("Opening Outstanding (₹)", "opening", {
             keyboardType: "decimal-pad",
             editable: !route.id,
@@ -2289,6 +2305,15 @@ function AppContent() {
             <View style={s.split}>
               <View style={{ flex: 1 }}>
                 <Button
+                  title="View Customer"
+                  secondary
+                  onPress={() => go("viewCustomer", customer.id)}
+                />
+              </View>
+            </View>
+            <View style={s.split}>
+              <View style={{ flex: 1 }}>
+                <Button
                   title="Statement"
                   secondary
                   onPress={() => go("statement", customer.id)}
@@ -2329,6 +2354,40 @@ function AppContent() {
             )}
           </>
         );
+      }
+      break;
+    case "viewCustomer":
+      if (customer) {
+        const customerFinancial = financialSummary(data, customer.id);
+        const outstandingTone = customerFinancial.outstandingPaise > 0 ? "red" : "neutral";
+        const advanceTone = customerFinancial.availableAdvancePaise > 0 ? "green" : "neutral";
+        content = (
+          <>
+            <Title>Personal Information</Title>
+            <Card>
+              <Row title="Customer Name" value={customer.name} />
+              <Row title="Mobile Number" value={customer.phone || "Not provided"} />
+              <View style={s.row}>
+                <View style={{ flex: 1 }}>
+                  <Text style={s.rowTitle}>Address</Text>
+                  <Text style={s.small}>{customer.address || "Not provided"}</Text>
+                </View>
+              </View>
+              <Row title="Created On" value={formatCustomerCreatedOn(customer.createdAt)} />
+              <Row title="Credit Limit" value={money(Math.abs(customer.limit || 0))} />
+              <Row title="Reminders" value={customer.reminder ? "Allowed" : "Off"} />
+            </Card>
+            <Title>Financial Information</Title>
+            <Card>
+              <Row title="Opening Udhari" value={money(Math.abs(customer.opening))} color={colors.red} />
+              <Row title="Opening Advance" value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} />
+              <Row title="Current Outstanding" value={money(customerFinancial.outstandingPaise / 100)} color={financialPalette[outstandingTone].text} />
+              <Row title="Available Advance" value={money(customerFinancial.availableAdvancePaise / 100)} color={financialPalette[advanceTone].text} />
+            </Card>
+          </>
+        );
+      } else {
+        content = <Empty title="Customer unavailable" description="This customer is not available in the current shop data." />;
       }
       break;
     case "credit":
@@ -2374,19 +2433,8 @@ function AppContent() {
                   )
                   .map((c) => {
                     const signedBalance = balance(data, c.id);
-                    const balanceTone: FinancialTone =
-                      signedBalance < 0
-                        ? "green"
-                        : signedBalance > 0
-                          ? "red"
-                          : "neutral";
-                    const balancePalette = financialPalette[balanceTone];
-                    const balanceLabel =
-                      signedBalance < 0
-                        ? `${money(Math.abs(signedBalance))} Advance`
-                        : signedBalance > 0
-                          ? `${money(Math.abs(signedBalance))} Due`
-                          : `${money(0)} Settled`;
+                    const { tone, label } = customerBalanceDisplay(signedBalance, money);
+                    const balancePalette = financialPalette[tone];
                     return (
                       <Pressable
                         key={c.id}
@@ -2451,7 +2499,7 @@ function AppContent() {
                             fontWeight: "600",
                           }}
                         >
-                          {balanceLabel}
+                          {label}
                         </Text>
                         {form.customerId === c.id && (
                           <Icon name="checkmark-circle" color="white" size={20} />

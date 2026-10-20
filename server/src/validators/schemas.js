@@ -39,6 +39,9 @@ export const customerSchema = z
     reminder: z.boolean(),
   })
   .strict();
+export const customerCreateSchema = customerSchema.extend({
+  createdAt: z.string().datetime().optional(),
+});
 export const customerConflictSchema = z.object({
   resolutionId: idSchema,
   expectedVersion: z.number().int().min(1),

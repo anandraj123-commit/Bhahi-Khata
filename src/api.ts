@@ -518,7 +518,7 @@ export async function syncQueuedChange(change: SyncDelta) {
     }
     const customerInput = { ...customer };
     customerInput.openingDate ??= customer.createdAt?.slice(0, 10);
-    delete customerInput.createdAt;
+    if (old) delete customerInput.createdAt;
     delete customerInput.serverVersion;
     delete customerInput.resolutionVersion;
     const baseRecord = old ? { ...old } : undefined;

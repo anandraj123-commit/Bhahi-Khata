@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { customerConflictSchema, customerSchema } from "../validators/schemas.js";
+import { customerConflictSchema, customerCreateSchema, customerSchema } from "../validators/schemas.js";
 import { customerOut } from "../utils/serializers.js";
 import { digest } from "../utils/hashing.js";
 import { error } from "../utils/http.js";
@@ -39,7 +39,7 @@ export const handle_get_customers = async (req, res, next) => {
 export const handle_post_customers = async (req, res, next) => {
   try {
     const { audit, ...input } = req.body || {};
-    const parsed = customerSchema.safeParse(input);
+    const parsed = customerCreateSchema.safeParse(input);
     if (!parsed.success) return error(res, 400, "Invalid customer");
     const doc = await createCustomer({
       shopId: req.shopId,
