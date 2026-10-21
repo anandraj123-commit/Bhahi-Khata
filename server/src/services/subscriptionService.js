@@ -198,7 +198,7 @@ export async function getCurrentSubscription(shopId, now = new Date()) {
   const [{ active, scheduled }, fallback, customers] = await Promise.all([
     currentRows(shopId, now),
     freePlan(),
-    Customer.countDocuments({ shopId, deletedAt: { $exists: false } }),
+    Customer.countDocuments({ shopId, deletedAt: { $exists: false }, status: { $ne: false }, disabled: { $ne: true }, removed: { $ne: true } }),
   ]);
   const effective = active || {
     _id: null,
@@ -424,7 +424,7 @@ export async function reserveCustomerCapacity({ shopId, session }) {
 export async function ensureCustomerUsage(shopId) {
   const existing = await SubscriptionUsage.findOne({ shopId }).lean();
   if (existing) return existing;
-  const activeCustomers = await Customer.countDocuments({ shopId, deletedAt: { $exists: false } });
+  const activeCustomers = await Customer.countDocuments({ shopId, deletedAt: { $exists: false }, status: { $ne: false }, disabled: { $ne: true }, removed: { $ne: true } });
   try {
     const [created] = await SubscriptionUsage.create([{ shopId, activeCustomers }]);
     return created.toObject();

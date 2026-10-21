@@ -37,11 +37,29 @@ export const customerSchema = z
     openingDate: daySchema.optional(),
     limit: moneySchema(),
     reminder: z.boolean(),
+    status: z.boolean().optional(),
+    disabled: z.boolean().optional(),
+    removed: z.boolean().optional(),
   })
-  .strict();
-export const customerCreateSchema = customerSchema.extend({
+  .strict()
+  .refine((value) => {
+    const values = [value.status, value.disabled, value.removed];
+    return values.every((item) => item === undefined) ||
+      (values.every((item) => typeof item === "boolean") && values.filter(Boolean).length === 1);
+  }, { message: "Customer lifecycle flags are invalid", path: ["status"] });
+export const customerCreateSchema = customerSchema.safeExtend({
   createdAt: z.string().datetime().optional(),
-});
+}).refine((value) =>
+  (value.status === undefined && value.disabled === undefined && value.removed === undefined) ||
+  (value.status === true && value.disabled === false && value.removed === false),
+{ message: "New customers must start active", path: ["status"] });
+export const customerLifecycleSchema = z.object({
+  target: z.enum(["active", "disabled", "removed"]),
+  operationId: idSchema,
+  baseVersion: z.number().int().min(1),
+  baseResolutionVersion: z.number().int().min(1),
+  reason: z.string().max(300).optional(),
+}).strict();
 export const customerConflictSchema = z.object({
   resolutionId: idSchema,
   expectedVersion: z.number().int().min(1),
@@ -49,6 +67,7 @@ export const customerConflictSchema = z.object({
   choice: z.enum(["keep_local", "keep_server"]),
   proposed: customerSchema,
   localDeleted: z.boolean().default(false),
+  lifecycleChange: z.boolean().default(false),
   localAt: z.string().datetime().optional(),
 });
 export const entrySchema = z
@@ -81,7 +100,7 @@ export const backupSchema = z
     }),
     customers: z
       .array(
-        customerSchema.extend({
+        customerSchema.safeExtend({
           createdAt: z.string().datetime().optional(),
           openingDate: daySchema.optional(),
         }),

@@ -1,5 +1,5 @@
 import { Audit, FinancialResolution, Shop } from "../models.js";
-import { auditEntryOut, financialAuditOut } from "../utils/serializers.js";
+import { auditOut, financialAuditOut } from "../utils/serializers.js";
 
 export async function listActivity({ shopId, limit, token }) {
   let cursor = null;
@@ -67,13 +67,7 @@ export async function listActivity({ shopId, limit, token }) {
   const page = merged.slice(0, limit);
   const items = page.map((item) =>
     item.kind === "audit"
-      ? {
-          id: item.row.clientId,
-          action: item.row.action,
-          date: item.row.occurredAt.toISOString(),
-          ...(item.row.before ? { before: auditEntryOut(item.row.before) } : {}),
-          ...(item.row.after ? { after: auditEntryOut(item.row.after) } : {}),
-        }
+      ? auditOut(item.row)
       : financialAuditOut(item.row),
   );
   const last = page.at(-1);

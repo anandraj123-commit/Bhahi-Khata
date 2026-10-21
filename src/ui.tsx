@@ -1,6 +1,7 @@
 import { LanguageContext, Text, localeDirection, t, translate } from "./i18n";
 import React, { useMemo, useState } from "react";
 import {
+  ActivityIndicator,
   FlatList,
   Modal,
   View,
@@ -51,6 +52,7 @@ export function Button({
   orange = false,
   danger = false,
   disabled = false,
+  loading = false,
 }: {
   title: string;
   onPress: () => void;
@@ -58,22 +60,25 @@ export function Button({
   orange?: boolean;
   danger?: boolean;
   disabled?: boolean;
+  loading?: boolean;
 }) {
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityState={{ disabled }}
+      accessibilityState={{ disabled: disabled || loading, busy: loading }}
       onPress={onPress}
-      disabled={disabled}
+      disabled={disabled || loading}
       style={({ pressed }) => [
         s.button,
         secondary && s.secondary,
         orange && { backgroundColor: colors.orange, borderColor: colors.orange },
         danger && { backgroundColor: colors.red },
-        (pressed || disabled) && { opacity: 0.55 },
+        loading && { flexDirection: "row", gap: 8 },
+        (pressed || disabled || loading) && { opacity: 0.55 },
       ]}
     >
-      <Text style={[s.buttonText, secondary && !orange && !danger && { color: colors.green }]}>
+      {loading && <ActivityIndicator size="small" color={secondary && !orange && !danger ? colors.green : "white"} />}
+      <Text style={[s.buttonText, { flexShrink: 1 }, secondary && !orange && !danger && { color: colors.green }]}>
         {title}
       </Text>
     </Pressable>
@@ -253,10 +258,12 @@ export function Toggle({
   label,
   value,
   onChange,
+  disabled = false,
 }: {
   label: string;
   value: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }) {
   return (
     <View style={s.row}>
@@ -265,6 +272,7 @@ export function Toggle({
         accessibilityLabel={label}
         value={value}
         onValueChange={onChange}
+        disabled={disabled}
         trackColor={{ false: colors.neutralBorder, true: colors.greenBorder }}
         thumbColor={value ? colors.green : "#fff"}
       />

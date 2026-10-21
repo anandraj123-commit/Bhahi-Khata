@@ -2,6 +2,7 @@ import React, { createContext, useContext } from "react";
 import { Alert, AlertButton, AlertOptions, Text as NativeText, TextProps } from "react-native";
 import { localeId } from "./locales";
 import { localeDictionaries } from "./translations";
+import { customerLifecycleTranslations } from "./customerLifecycleTranslations";
 import { APP_RUNTIME_TRANSLATION_KEYS, APP_STATIC_TRANSLATION_KEYS } from "./translationInventory";
 import {
   formatCurrency,
@@ -183,9 +184,11 @@ const hindi: Record<string, string> = {
 export function translate(value: string, language: string): string {
   const id = localeId(language);
   if (id === "en") return value;
-  const dictionary = id === "hi"
-    ? { ...hindi, ...localeDictionaries.hi }
-    : localeDictionaries[id] || {};
+  const dictionary = {
+    ...(id === "hi" ? hindi : {}),
+    ...localeDictionaries[id],
+    ...customerLifecycleTranslations[id],
+  };
   return resolveLocaleText(value, dictionary);
 }
 
@@ -232,7 +235,7 @@ export function translationCoverageStats(language: string) {
   const id = localeId(language);
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
-  const dictionary = id === "hi" ? { ...hindi, ...localeDictionaries.hi } : localeDictionaries[id] || {};
+  const dictionary = { ...(id === "hi" ? hindi : {}), ...localeDictionaries[id], ...customerLifecycleTranslations[id] };
   return measureTranslationCoverage(required, dictionary, id, untranslatedButLocaleInvariant);
 }
 

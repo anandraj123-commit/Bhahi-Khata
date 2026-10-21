@@ -6,6 +6,7 @@ import { customerOut } from "../utils/serializers.js";
 import { sameCustomerValues } from "../utils/records.js";
 import { normalizeCustomerMobile } from "../utils/phone.js";
 import { saveAudit } from "./auditService.js";
+import { canTransitionCustomerStatus, customerStatusName, lifecycleTarget } from "../utils/customerLifecycle.js";
 import {
   ensureCustomerUsage,
   releaseCustomerCapacity,
@@ -103,6 +104,9 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
                 : new Date(),
               limitPaise: paise(customer.limit),
               reminder: customer.reminder,
+              status: true,
+              disabled: false,
+              removed: false,
             },
             $setOnInsert: {
               createdAt: customer.createdAt ? new Date(customer.createdAt) : now,
@@ -159,6 +163,12 @@ export async function updateCustomer({ shopId, actorId, customer, base, baseVers
           resolutionVersion: doc.resolutionVersion || 1,
         });
       const current = customerOut(doc);
+      if (customerStatusName(current) !== "active")
+        throw Object.assign(new Error("Disabled or removed customers cannot be edited"), {
+          status: 409, code: "CUSTOMER_NOT_ACTIVE", current,
+          serverVersion: doc.serverVersion || 1,
+          resolutionVersion: doc.resolutionVersion || 1,
+        });
       const actualVersion = doc.serverVersion || 1;
       if (
         ((base?.success && !sameCustomerValues(current, base.data)) ||
@@ -196,6 +206,86 @@ export async function updateCustomer({ shopId, actorId, customer, base, baseVers
     await session.endSession();
   }
   return doc;
+}
+
+/** Apply one explicit, version-checked lifecycle transition. The customer and
+ * all ledger records remain present; mobile-number reservation is unchanged. */
+export async function transitionCustomer({ shopId, actorId, customerId, target, operationId, baseVersion, baseResolutionVersion, reason }) {
+  await ensureCustomerUsage(shopId);
+  const targetFlags = lifecycleTarget(target);
+  if (!targetFlags)
+    throw Object.assign(new Error("Invalid customer lifecycle target"), { status: 400, code: "CUSTOMER_STATUS_INVALID" });
+  const key = `customer-lifecycle:${operationId}`;
+  const requestHash = digest(JSON.stringify({ customerId, target, baseVersion, baseResolutionVersion, reason: reason || "" }));
+  const prior = await Idempotency.findOne({ shopId, key }).lean();
+  if (prior) {
+    if (prior.requestHash !== requestHash)
+      throw Object.assign(new Error("Lifecycle operation identifier was already used"), { status: 409, code: "CUSTOMER_STATUS_CONFLICT" });
+    return prior.response;
+  }
+  const session = await mongoose.startSession();
+  let response;
+  try {
+    await session.withTransaction(async () => {
+      const repeated = await Idempotency.findOne({ shopId, key }).session(session).lean();
+      if (repeated) {
+        if (repeated.requestHash !== requestHash)
+          throw Object.assign(new Error("Lifecycle operation identifier was already used"), { status: 409, code: "CUSTOMER_STATUS_CONFLICT" });
+        response = repeated.response;
+        return;
+      }
+      const doc = await Customer.findOne({ shopId, clientId: customerId, deletedAt: { $exists: false } }).session(session);
+      if (!doc) throw Object.assign(new Error("Customer not found"), { status: 404, code: "CUSTOMER_NOT_FOUND" });
+      const current = customerOut(doc);
+      const from = customerStatusName(current);
+      if (from === "invalid" || !canTransitionCustomerStatus(from, target))
+        throw Object.assign(new Error("This customer status change is not allowed"), {
+          status: 409, code: "CUSTOMER_STATUS_TRANSITION_INVALID", current,
+          serverVersion: doc.serverVersion || 1, resolutionVersion: doc.resolutionVersion || 1,
+        });
+      const actualVersion = doc.serverVersion || 1;
+      const actualResolutionVersion = doc.resolutionVersion || 1;
+      if (actualVersion !== baseVersion || actualResolutionVersion !== baseResolutionVersion) {
+        // An identical already-applied transition is harmless and idempotent,
+        // even if the response to the first request was lost.
+        if (from !== target)
+          throw Object.assign(new Error("Customer status changed on another device"), {
+            status: 409, code: "CUSTOMER_STATUS_CONFLICT", current,
+            serverVersion: actualVersion, resolutionVersion: actualResolutionVersion,
+          });
+      }
+      if (from !== target) {
+        if (from === "active" && target !== "active") await releaseCustomerCapacity({ shopId, session });
+        if (from !== "active" && target === "active") await reserveCustomerCapacity({ shopId, session });
+        doc.set({ ...targetFlags, serverVersion: actualVersion + 1, resolutionVersion: actualResolutionVersion + 1 });
+        await doc.save({ session });
+      }
+      if (from !== target) {
+        const action = target === "disabled" ? "CUSTOMER_DISABLED" : target === "removed" ? "CUSTOMER_REMOVED" : from === "removed" ? "CUSTOMER_RESTORED" : "CUSTOMER_ENABLED";
+        await Audit.updateOne(
+          { shopId, clientId: operationId },
+          { $setOnInsert: {
+            shopId, actorId, clientId: operationId, action,
+            before: { customerId, status: from },
+            after: { customerId, status: target, ...(reason ? { reason } : {}) },
+            resolutionId: operationId, requestHash, occurredAt: new Date(),
+          } },
+          { upsert: true, session },
+        );
+      }
+      response = customerOut(doc);
+      await Idempotency.create([{ shopId, key, requestHash, response }], { session });
+    });
+  } catch (error) {
+    if (error.code === 11000) {
+      const found = await Idempotency.findOne({ shopId, key }).lean();
+      if (found?.requestHash === requestHash) return found.response;
+    }
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+  return response;
 }
 
 export async function deleteCustomer({ shopId, actorId, id, base, baseVersion, baseResolutionVersion, audit }) {
@@ -243,6 +333,7 @@ export async function resolveCustomerConflict({
   requestHash,
   conflictId,
 }) {
+  await ensureCustomerUsage(shopId);
   const previousRequest = await Idempotency.findOne({ shopId, key }).lean();
   if (previousRequest) {
     if (previousRequest.requestHash !== requestHash)
@@ -301,12 +392,26 @@ export async function resolveCustomerConflict({
           selected = null;
         } else {
           const proposed = input.proposed;
+          const currentStatus = customerStatusName(customerOut(customer));
+          const proposedStatus = input.lifecycleChange ? customerStatusName(proposed) : currentStatus;
+          if (proposedStatus === "invalid" || !canTransitionCustomerStatus(currentStatus, proposedStatus))
+            throw Object.assign(new Error("Customer status changed and needs a valid resolution"), {
+              status: 409, code: "CUSTOMER_STATUS_CONFLICT", current,
+              serverVersion: actualVersion, resolutionVersion: actualResolutionVersion,
+            });
+          if (currentStatus !== "active" && currentStatus === proposedStatus && !sameCustomerValues(customerOut(customer), proposed))
+            throw Object.assign(new Error("Disabled or removed customers cannot be edited"), {
+              status: 409, code: "CUSTOMER_NOT_ACTIVE", current,
+              serverVersion: actualVersion, resolutionVersion: actualResolutionVersion,
+            });
           await assertCustomerMobileAvailable({ shopId, phone: proposed.phone, excludeClientId: customerId, session });
           const openingPaise = paise(proposed.opening);
           const openingAdvancePaise = paise(proposed.openingAdvance || 0);
-          const changed = wasDeleted || !sameCustomerValues(customerOut(customer), proposed);
+          const changed = wasDeleted || currentStatus !== proposedStatus || !sameCustomerValues(customerOut(customer), proposed);
           if (changed) {
             if (wasDeleted) await reserveCustomerCapacity({ shopId, session });
+            else if (input.lifecycleChange && currentStatus === "active" && proposedStatus !== "active") await releaseCustomerCapacity({ shopId, session });
+            else if (input.lifecycleChange && currentStatus !== "active" && proposedStatus === "active") await reserveCustomerCapacity({ shopId, session });
             customer.set({
               name: proposed.name,
               nameFolded: proposed.name.toLocaleLowerCase("en"),
@@ -321,11 +426,33 @@ export async function resolveCustomerConflict({
                 : customer.openingDate || customer.createdAt,
               limitPaise: paise(proposed.limit),
               reminder: proposed.reminder,
+              ...lifecycleTarget(proposedStatus),
               deletedAt: undefined,
               serverVersion: actualVersion + 1,
               resolutionVersion: actualResolutionVersion + 1,
             });
             if (!proposed.phone) customer.phoneNormalized = undefined;
+            if (input.lifecycleChange && currentStatus !== proposedStatus) {
+              const lifecycleAction = proposedStatus === "disabled"
+                ? "CUSTOMER_DISABLED"
+                : proposedStatus === "removed"
+                  ? "CUSTOMER_REMOVED"
+                  : currentStatus === "removed" ? "CUSTOMER_RESTORED" : "CUSTOMER_ENABLED";
+              await Audit.updateOne(
+                { shopId, clientId: `customer-lifecycle-resolution-${input.resolutionId}` },
+                { $setOnInsert: {
+                  shopId, actorId,
+                  clientId: `customer-lifecycle-resolution-${input.resolutionId}`,
+                  action: lifecycleAction,
+                  before: { customerId, status: currentStatus },
+                  after: { customerId, status: proposedStatus },
+                  resolutionId: input.resolutionId,
+                  requestHash,
+                  occurredAt: new Date(),
+                } },
+                { upsert: true, session },
+              );
+            }
           }
           selected = customerOut(customer);
         }

@@ -44,9 +44,7 @@ export const Shop = mongoose.model(
     base,
   ),
 );
-export const Customer = mongoose.model(
-  "Customer",
-  new Schema(
+const customerSchema = new Schema(
     {
       shopId: { type: Schema.Types.ObjectId, required: true },
       clientId: { type: String, required: true },
@@ -62,13 +60,22 @@ export const Customer = mongoose.model(
       financialVersion: { type: Number, default: 1, min: 1 },
       limitPaise: { type: Number, min: 0, max: 100000000000 },
       reminder: { type: Boolean, default: true },
+      // Lifecycle flags are distinct from deletedAt, the legacy sync tombstone.
+      status: { type: Boolean, default: true },
+      disabled: { type: Boolean, default: false },
+      removed: { type: Boolean, default: false },
       serverVersion: { type: Number, required: true, default: 1, min: 1 },
       resolutionVersion: { type: Number, required: true, default: 1, min: 1 },
       deletedAt: Date,
     },
     base,
-  ),
-);
+  );
+customerSchema.pre("validate", function validateCustomerLifecycle() {
+  const values = [this.status, this.disabled, this.removed];
+  if (values.some((value) => typeof value !== "boolean") || values.filter(Boolean).length !== 1)
+    this.invalidate("status", "Customer lifecycle flags must describe exactly one state");
+});
+export const Customer = mongoose.model("Customer", customerSchema);
 Customer.schema.index({ shopId: 1, clientId: 1 }, { unique: true });
 Customer.schema.index({ shopId: 1, nameFolded: 1, _id: 1 });
 Customer.schema.index({ shopId: 1, phone: 1 });
@@ -142,6 +149,7 @@ export const FinancialResolution = mongoose.model(
       requestHash: { type: String, required: true },
       actorId: { type: Schema.Types.ObjectId, required: true },
       previous: { type: Schema.Types.Mixed, required: true },
+      previousMissing: { type: Boolean, default: false },
       proposed: { type: Schema.Types.Mixed, required: true },
       selected: Schema.Types.Mixed,
       previousVersion: { type: Number, required: true },
@@ -438,6 +446,7 @@ export const SubscriptionUsage = mongoose.model(
 );
 
 export async function ensureIndexes() {
+  await ensureCustomerLifecycleDefaults();
   await ensureCustomerMobileIndex();
   for (const model of [
     User,
@@ -462,6 +471,25 @@ export async function ensureIndexes() {
     SubscriptionUsage,
   ])
     await model.createIndexes();
+}
+
+/** Non-destructive compatibility migration for customers created before the
+ * lifecycle flags existed. Contradictory partial values stop startup for review. */
+export async function ensureCustomerLifecycleDefaults() {
+  await Customer.updateMany(
+    { status: { $exists: false }, disabled: { $exists: false }, removed: { $exists: false } },
+    { $set: { status: true, disabled: false, removed: false } },
+  );
+  const invalid = await Customer.find({ deletedAt: { $exists: false } }).select("clientId shopId status disabled removed").lean();
+  const conflicts = invalid.filter((customer) => {
+    const values = [customer.status, customer.disabled, customer.removed];
+    return values.some((value) => typeof value !== "boolean") || values.filter(Boolean).length !== 1;
+  });
+  if (conflicts.length)
+    throw Object.assign(new Error("Customer lifecycle status conflicts require reconciliation"), {
+      code: "CUSTOMER_STATUS_MIGRATION_CONFLICT",
+      customerIds: conflicts.map((item) => item.clientId),
+    });
 }
 
 /** Normalize legacy phone representations only after a read-only duplicate preflight. */

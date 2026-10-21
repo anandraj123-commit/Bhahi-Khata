@@ -4,7 +4,7 @@ import { env, subscriptionConfig } from "./config/env.js";
 import { log, safeErrorContext } from "./config/logger.js";
 import { connectDatabase, databaseErrorContext } from "./config/database.js";
 import { createApp } from "./app.js";
-import { ensureCustomerMobileIndex, ensureIndexes } from "./models.js";
+import { ensureCustomerLifecycleDefaults, ensureCustomerMobileIndex, ensureIndexes } from "./models.js";
 import { startReminderWorker } from "./reminders.js";
 import { ensureSubscriptionPlans } from "./services/subscriptionService.js";
 import { startSubscriptionReminderWorker } from "./subscriptionReminders.js";
@@ -39,9 +39,10 @@ if (process.argv.includes("--check-db")) {
 }
 
 try {
+  await ensureCustomerLifecycleDefaults();
   await ensureCustomerMobileIndex();
 } catch (error) {
-  log.fatal(safeErrorContext(error), "Customer mobile uniqueness migration failed; API was not started");
+  log.fatal(safeErrorContext(error), "Customer compatibility migration failed; API was not started");
   await mongoose.disconnect().catch(() => {});
   process.exit(1);
 }

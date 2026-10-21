@@ -13,6 +13,9 @@ export const customerOut = (d) => ({
   openingAdvance: (d.openingAdvancePaise || 0) / 100,
   limit: d.limitPaise / 100,
   reminder: d.reminder,
+  status: d.status ?? true,
+  disabled: d.disabled ?? false,
+  removed: d.removed ?? false,
 });
 export const entryOut = (d) => ({
   id: d.clientId,
@@ -43,7 +46,7 @@ export const financialAuditOut = (record) => ({
     customerName: record.customerName || "Customer",
     transactionId: record.transactionId,
     offlineAmount: record.proposed.amount,
-    previousServerAmount: record.previous.amount,
+    previousServerAmount: record.previousMissing ? 0 : record.previous.amount,
     finalAmount: record.selected?.amount ?? null,
     decision: record.action === "keep_local" ? "Phone Version Selected" : "Server Version Selected",
     resolvedBy: record.actorId ? "Shopkeeper" : "Unknown",
@@ -63,3 +66,24 @@ export const shopOut = (d) => ({
   defaultMethod: d.defaultMethod,
   reminders: d.reminders,
 });
+
+/** Lifecycle snapshots are status metadata, not financial entry snapshots. */
+export const auditOut = (item) => {
+  const lifecycle = /^CUSTOMER_(DISABLED|ENABLED|REMOVED|RESTORED)$/.test(item.action);
+  return {
+    id: item.clientId,
+    action: item.action,
+    date: item.occurredAt.toISOString(),
+    ...(lifecycle ? {
+      customerLifecycle: {
+        customerId: item.after?.customerId,
+        previousStatus: item.before?.status,
+        newStatus: item.after?.status,
+        ...(item.after?.reason ? { reason: item.after.reason } : {}),
+      },
+    } : {
+      ...(item.before ? { before: auditEntryOut(item.before) } : {}),
+      ...(item.after ? { after: auditEntryOut(item.after) } : {}),
+    }),
+  };
+};

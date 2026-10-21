@@ -57,6 +57,9 @@ export async function restoreBackup({ shopId, user, data }) {
                   : undefined,
               limitPaise: paise(customer.limit),
               reminder: customer.reminder,
+              status: customer.status ?? true,
+              disabled: customer.disabled ?? false,
+              removed: customer.removed ?? false,
               ...(customer.createdAt ? { createdAt: new Date(customer.createdAt) } : {}),
             };
           }),
@@ -64,7 +67,7 @@ export async function restoreBackup({ shopId, user, data }) {
         );
       await SubscriptionUsage.updateOne(
         { shopId },
-        { $set: { activeCustomers: data.customers.length }, $setOnInsert: { shopId } },
+        { $set: { activeCustomers: data.customers.filter((customer) => customer.status ?? true).filter((customer) => !customer.disabled && !customer.removed).length }, $setOnInsert: { shopId } },
         { session, upsert: true },
       );
       if (data.entries.length)

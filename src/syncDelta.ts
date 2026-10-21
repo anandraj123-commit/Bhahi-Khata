@@ -1,9 +1,10 @@
 import type { Audit, Customer, Data, Entry } from "./model";
+import { normalizeCustomerLifecycle } from "./customerLifecycle";
 import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import { shouldSyncShopSettings } from "./settingsSync";
 
 export type RecordChange<T> = {
-  operation: "create" | "update" | "delete";
+  operation: "create" | "update" | "delete" | "lifecycle";
   before?: T;
   after?: T;
 };
@@ -27,6 +28,11 @@ export function normalizeSyncDelta(change: SyncDelta): SyncDelta {
   return {
     ...records,
     ...(serverSettingsChanged ? { settings } : {}),
+    customers: change.customers.map((item) => ({
+      ...item,
+      ...(item.before ? { before: normalizeCustomerLifecycle(item.before) as Customer } : {}),
+      ...(item.after ? { after: normalizeCustomerLifecycle(item.after) as Customer } : {}),
+    })),
     entries: change.entries.map((item) => ({
       ...item,
       ...(item.before ? { before: withoutLegacyDue(item.before) as Entry } : {}),
@@ -46,8 +52,19 @@ function changes<T extends { id: string }>(before: T[], after: T[]) {
   for (const item of after) {
     const prior = old.get(item.id);
     if (!prior) result.push({ operation: "create", after: item });
-    else if (!equal(prior, item))
-      result.push({ operation: "update", before: prior, after: item });
+    else if (!equal(prior, item)) {
+      const oldCustomer = prior as T & Partial<Customer>;
+      const nextCustomer = item as T & Partial<Customer>;
+      const oldProfile = { ...oldCustomer } as Record<string, unknown>;
+      const nextProfile = { ...nextCustomer } as Record<string, unknown>;
+      for (const record of [oldProfile, nextProfile]) {
+        delete record.status;
+        delete record.disabled;
+        delete record.removed;
+      }
+      const lifecycleOnly = "status" in oldCustomer && "status" in nextCustomer && equal(oldProfile, nextProfile);
+      result.push({ operation: lifecycleOnly ? "lifecycle" : "update", before: prior, after: item });
+    }
   }
   for (const item of before)
     if (!next.has(item.id)) result.push({ operation: "delete", before: item });

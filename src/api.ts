@@ -6,6 +6,8 @@ import {
 import type { Data } from "./model";
 import type { PendingConflict, PendingSettingsConflict } from "./offlineStore";
 import { createSyncDelta, normalizeSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
+import { normalizeCustomerLifecycle } from "./customerLifecycle";
+import { isAuthoritativeSessionRejection } from "./startupRecovery";
 import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import type { SubscriptionSnapshot } from "./subscription";
 
@@ -136,7 +138,8 @@ const auditInput = (audit: Data["audit"][number]) => {
   if (after) delete after.serverVersion;
   return { ...audit, ...(before ? { before } : {}), ...(after ? { after } : {}) };
 };
-type RefreshResult = "refreshed" | "invalid" | "unavailable";
+type RefreshResult = "refreshed" | "invalid" | { kind: "unavailable"; status: number; code?: string };
+type RequestOrigin = "foreground" | "session_restore" | "offline_sync";
 type RefreshOutcome = RefreshResult | ApiTransportError;
 let refreshJob: Promise<RefreshOutcome> | null = null;
 
@@ -168,11 +171,35 @@ async function request(
   path: string,
   options: RequestInit = {},
   retry = true,
+  origin: RequestOrigin = "foreground",
 ): Promise<any> {
   const access = await SecureStore.getItemAsync(ACCESS);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20_000);
   let response: Response;
+  const startedAt = Date.now();
+  const method = (options.method || "GET").toUpperCase();
+  // Keep diagnostic paths useful while avoiding customer IDs and query values.
+  const endpoint = path.split("?", 1)[0]
+    .replace(/\/(customers|ledger|payments)\/[^/]+/gi, "/$1/:id")
+    .replace(/\/[a-f\d]{24}(?=\/|$)/gi, "/:id");
+  const logFailure = (details: {
+    responseReceived: boolean;
+    status?: number;
+    code?: string;
+    category: string;
+  }) => {
+    if (__DEV__) console.warn("Digital-Khata API request failed", {
+      method,
+      endpoint,
+      status: details.status,
+      code: details.code,
+      durationMs: Date.now() - startedAt,
+      responseReceived: details.responseReceived,
+      origin,
+      category: details.category,
+    });
+  };
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
@@ -185,11 +212,12 @@ async function request(
       },
     });
   } catch (error) {
+    const kind = controller.signal.aborted || (error instanceof Error && error.name === "AbortError")
+      ? "timeout"
+      : "network";
+    logFailure({ responseReceived: false, category: kind });
     throw new ApiTransportError(
-      controller.signal.aborted ||
-        (error instanceof Error && error.name === "AbortError")
-        ? "timeout"
-        : "network",
+      kind,
     );
   } finally {
     clearTimeout(timeout);
@@ -199,19 +227,37 @@ async function request(
   // mistaken for network failures.
   apiResponseObserver?.(response.status);
   if (response.status === 401 && retry && path !== "/auth/refresh") {
-    const refreshed = await refresh();
+    const refreshed = await refresh(origin);
     if (refreshed instanceof ApiTransportError) throw refreshed;
-    if (refreshed === "refreshed") return request(path, options, false);
-    if (refreshed === "unavailable")
-      throw new ApiError("Could not validate the server session", 503);
+    if (refreshed === "refreshed") return request(path, options, false, origin);
+    if (typeof refreshed === "object" && refreshed.kind === "unavailable")
+      throw new ApiError("Could not validate the server session", refreshed.status, { code: refreshed.code });
   }
   if (response.status === 204) return undefined;
-  const value = await response.json().catch(() => ({}));
-  if (!response.ok)
-    throw new ApiError(value.error || `Server error (${response.status})`, response.status, value);
+  const value = await response.json().catch(() => null);
+  if (response.ok && (!value || typeof value !== "object")) {
+    logFailure({ responseReceived: true, status: response.status, code: "INVALID_SERVER_RESPONSE", category: "invalid_response" });
+    throw new ApiError("The server returned an invalid response", 502, { code: "INVALID_SERVER_RESPONSE" });
+  }
+  if (!response.ok) {
+    const code = typeof value?.code === "string" ? value.code : undefined;
+    logFailure({
+      responseReceived: true,
+      status: response.status,
+      code,
+      category: response.status === 401 || response.status === 403 ? "authentication"
+        : response.status === 409 ? "conflict"
+          : response.status === 429 ? "rate_limit"
+            : response.status >= 500 ? "server" : "http_error",
+    });
+    const message = typeof value?.error === "string"
+      ? value.error
+      : `Server error (${response.status})`;
+    throw new ApiError(message, response.status, value ?? undefined);
+  }
   return value;
 }
-async function refresh(): Promise<RefreshOutcome> {
+async function refresh(origin: RequestOrigin = "foreground"): Promise<RefreshOutcome> {
   if (refreshJob) return refreshJob;
   refreshJob = (async () => {
     try {
@@ -219,6 +265,7 @@ async function refresh(): Promise<RefreshOutcome> {
       if (!refreshToken) return "invalid";
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20_000);
+      const startedAt = Date.now();
       let response: Response;
         try {
           response = await fetch(`${API_BASE_URL}/auth/refresh`, {
@@ -228,6 +275,11 @@ async function refresh(): Promise<RefreshOutcome> {
             signal: controller.signal,
           });
         } catch (error) {
+          if (__DEV__) console.warn("Digital-Khata API request failed", {
+            method: "POST", endpoint: "/auth/refresh", durationMs: Date.now() - startedAt,
+            responseReceived: false, origin,
+            category: controller.signal.aborted || (error instanceof Error && error.name === "AbortError") ? "timeout" : "network",
+          });
           throw new ApiTransportError(
             controller.signal.aborted ||
               (error instanceof Error && error.name === "AbortError")
@@ -239,18 +291,39 @@ async function refresh(): Promise<RefreshOutcome> {
       }
       apiResponseObserver?.(response.status);
       if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
+        const errorBody = await response.json().catch(() => ({}));
+        const code = typeof errorBody?.code === "string" ? errorBody.code : undefined;
+        if (__DEV__) console.warn("Digital-Khata API request failed", {
+          method: "POST", endpoint: "/auth/refresh", status: response.status,
+          code, durationMs: Date.now() - startedAt, responseReceived: true, origin,
+          category: response.status === 401 || response.status === 403 ? "authentication" : response.status >= 500 ? "server" : "http_error",
+        });
+        if (isAuthoritativeSessionRejection(response.status)) {
           await clearTokens();
           return "invalid";
         }
-        return "unavailable";
+        return { kind: "unavailable", status: response.status, code };
       }
       const tokens = await response.json();
       await storeTokens(tokens);
       await rotateOfflineSessionToken(refreshToken, tokens.refreshToken);
       return "refreshed";
     } catch (error) {
-      return error instanceof ApiTransportError ? error : "unavailable";
+      if (error instanceof ApiTransportError) return error;
+      // SecureStore/JSON/token persistence failures are local or unexpected,
+      // not an HTTP 503. Never invent a backend response for these failures.
+      if (__DEV__) console.error("Digital-Khata session refresh failed", {
+        origin,
+        location: "refresh_session_processing",
+        category: "local_or_unexpected",
+        code: "SESSION_PROCESSING_FAILED",
+        stack: error instanceof Error ? error.stack?.split("\n").slice(1)
+          .flatMap((line) => {
+            const frame = line.match(/[/\\]([\w.-]+\.(?:js|ts|tsx|bundle)):(\d+):(\d+)/);
+            return frame ? [`at ${frame[1]}:${frame[2]}:${frame[3]}`] : [];
+          }).slice(0, 15).join("\n") : undefined,
+      });
+      throw error;
     } finally {
       refreshJob = null;
     }
@@ -279,13 +352,20 @@ export async function clearOfflineAuthorization() {
 }
 export async function restoreSession(): Promise<Data | null> {
   if (!(await SecureStore.getItemAsync(REFRESH))) return null;
-  const refreshed = await refresh();
+  const refreshed = await refresh("session_restore");
   if (refreshed instanceof ApiTransportError) throw refreshed;
+  // A temporary auth-service/backend outage is not proof that the stored
+  // account session is invalid. Let App startup try the existing offline
+  // session and encrypted cache. Only explicit 401/403 responses clear it.
+  if (typeof refreshed === "object" && refreshed.kind === "unavailable")
+    throw new ApiError("Could not restore the online session", refreshed.status, { code: refreshed.code });
   if (refreshed !== "refreshed") return null;
-  return loadAccount();
+  return loadAccount("session_restore");
 }
-export async function loadAccount(): Promise<Data> {
-  const base = (await request("/bootstrap")) as Data;
+export async function loadAccount(origin: RequestOrigin = "foreground"): Promise<Data> {
+  const base = (await request("/bootstrap", {}, true, origin)) as Data;
+  if (!base || typeof base !== "object" || !base.shop || typeof base.shop !== "object")
+    throw new ApiError("The server returned invalid account data", 502, { code: "INVALID_SERVER_RESPONSE" });
   if (base.shopExists === false)
     return normalizeData({ ...base, customers: [], entries: [], audit: [] });
   const pages = async <T>(path: string): Promise<T[]> => {
@@ -296,10 +376,17 @@ export async function loadAccount(): Promise<Data> {
         limit: "500",
         ...(cursor ? { cursor } : {}),
       });
-      const page = (await request(`${path}?${query}`)) as {
+      const page = (await request(`${path}?${query}`, {}, true, origin)) as {
         items: T[];
         nextCursor: string | null;
       };
+      if (!page || !Array.isArray(page.items) || (page.nextCursor != null && typeof page.nextCursor !== "string")) {
+        if (__DEV__) console.warn("Digital-Khata account response invalid", {
+          method: "GET", endpoint: path, code: "INVALID_SERVER_RESPONSE",
+          responseReceived: true, origin, category: "invalid_response",
+        });
+        throw new ApiError("The server returned invalid account data", 502, { code: "INVALID_SERVER_RESPONSE" });
+      }
       rows.push(...page.items);
       cursor = page.nextCursor || "";
     } while (cursor);
@@ -310,11 +397,20 @@ export async function loadAccount(): Promise<Data> {
     pages<Data["entries"][number]>("/ledger"),
     pages<Data["audit"][number]>("/activity"),
   ]);
-  return normalizeData({ ...base, customers, entries, audit });
+  try {
+    return normalizeData({ ...base, customers, entries, audit });
+  } catch {
+    if (__DEV__) console.warn("Digital-Khata account response invalid", {
+      method: "GET", endpoint: "/account/normalize", code: "INVALID_SERVER_RESPONSE",
+      responseReceived: true, origin, category: "invalid_response",
+    });
+    throw new ApiError("The server returned invalid account data", 502, { code: "INVALID_SERVER_RESPONSE" });
+  }
 }
 export function normalizeData(value: Data): Data {
   return {
     ...value,
+    customers: value.customers.map((customer) => normalizeCustomerLifecycle(customer) as Data["customers"][number]),
     shopExists: value.shopExists ?? true,
     shopComplete: value.shopComplete ?? Boolean(value.shop.name.trim() && value.shop.owner.trim()),
     shop: { ...value.shop, phone: value.shop.phone.replace(/^\+91/, "") },
@@ -479,6 +575,8 @@ export async function syncQueuedChange(change: SyncDelta) {
   };
   if (!(await SecureStore.getItemAsync(ACCESS)))
     throw new ApiError("Sign-in is required to synchronize changes", 401);
+  const syncRequest = (path: string, options: RequestInit = {}) =>
+    request(path, options, true, "offline_sync");
   if (change.settings) {
     const settings = change.settings.after;
     const base = change.settings.before;
@@ -491,7 +589,7 @@ export async function syncQueuedChange(change: SyncDelta) {
       defaultMethod: value.defaultMethod,
       reminders: value.reminders,
     });
-    const saved = await request("/shop", {
+    const saved = await syncRequest("/shop", {
       method: "PATCH",
       body: JSON.stringify({
         ...payload(settings),
@@ -514,12 +612,29 @@ export async function syncQueuedChange(change: SyncDelta) {
   for (const item of change.customers) {
     const customer = item.after;
     const old = item.before;
+    if (item.operation === "lifecycle" && customer && old) {
+      const event = change.audit.find((record) => record.action.startsWith("CUSTOMER_"));
+      const operationId = event?.id || `lifecycle-${customer.id}-${old.serverVersion || 1}-${customer.status ? "active" : customer.disabled ? "disabled" : "removed"}`;
+      const saved = await syncRequest(`/customers/${encodeURIComponent(customer.id)}/lifecycle`, {
+        method: "PATCH",
+        headers: { "Idempotency-Key": `customer-lifecycle:${operationId}` },
+        body: JSON.stringify({
+          target: customer.status ? "active" : customer.disabled ? "disabled" : "removed",
+          operationId,
+          baseVersion: old.serverVersion || 1,
+          baseResolutionVersion: old.resolutionVersion || 1,
+          ...(event?.after && "reason" in event.after ? { reason: (event.after as any).reason } : {}),
+        }),
+      }) as Data["customers"][number];
+      acknowledged.customers.push(normalizeCustomerLifecycle(saved) as Data["customers"][number]);
+      continue;
+    }
     if (!customer) {
       const baseRecord = { ...old! };
       delete baseRecord.createdAt;
       delete baseRecord.serverVersion;
       delete baseRecord.resolutionVersion;
-      await request(`/customers/${encodeURIComponent(old!.id)}`, {
+      await syncRequest(`/customers/${encodeURIComponent(old!.id)}`, {
         method: "DELETE",
         body: JSON.stringify({ baseRecord, ...(old?.serverVersion ? { baseVersion: old.serverVersion } : {}), ...(old?.resolutionVersion ? { baseResolutionVersion: old.resolutionVersion } : {}), ...(customerAudit ? { audit: auditInput(customerAudit) } : {}) }),
       });
@@ -536,7 +651,7 @@ export async function syncQueuedChange(change: SyncDelta) {
       delete baseRecord.serverVersion;
       delete baseRecord.resolutionVersion;
     }
-    const saved = await request(
+    const saved = await syncRequest(
       old ? `/customers/${encodeURIComponent(customer.id)}` : "/customers",
       {
         method: old ? "PATCH" : "POST",
@@ -558,7 +673,7 @@ export async function syncQueuedChange(change: SyncDelta) {
       (audit) => audit.after?.id === (entry || old)?.id || audit.before?.id === (entry || old)?.id,
     );
     if (!entry) {
-      await request(`/ledger/${encodeURIComponent(old!.id)}`, {
+      await syncRequest(`/ledger/${encodeURIComponent(old!.id)}`, {
         method: "DELETE",
         body: JSON.stringify({ baseRecord: (() => { const value = { ...old! }; delete value.serverVersion; delete value.resolutionVersion; return value; })(), ...(old?.serverVersion ? { baseVersion: old.serverVersion } : {}), ...(old?.resolutionVersion ? { baseResolutionVersion: old.resolutionVersion } : {}), ...(action ? { audit: auditInput(action) } : {}) }),
       });
@@ -572,7 +687,7 @@ export async function syncQueuedChange(change: SyncDelta) {
     const payload = { ...withoutLegacyDue(entry) };
     delete payload.serverVersion;
     delete payload.resolutionVersion;
-    const saved = await request(old ? `/ledger/${encodeURIComponent(entry.id)}` : "/ledger", {
+    const saved = await syncRequest(old ? `/ledger/${encodeURIComponent(entry.id)}` : "/ledger", {
       method: old ? "PATCH" : "POST",
       headers: old ? {} : { "Idempotency-Key": entry.id },
       body: JSON.stringify({
@@ -585,7 +700,7 @@ export async function syncQueuedChange(change: SyncDelta) {
     acknowledged.entries.push(saved);
   }
   if (change.read.length)
-    await request("/activity/read", {
+    await syncRequest("/activity/read", {
       method: "PATCH",
       body: JSON.stringify({ ids: change.read }),
     });
@@ -632,6 +747,7 @@ export async function resolveCustomerConflict(
       choice,
       proposed,
       localDeleted: conflict.localDeleted,
+      lifecycleChange: conflict.lifecycleChange || false,
       localAt: conflict.localAt,
     }),
   }) as Promise<{

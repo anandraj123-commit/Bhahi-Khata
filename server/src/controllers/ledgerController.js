@@ -45,6 +45,8 @@ export const handle_post_ledger = async (req, res, next) => {
     });
     res.status(result.status).json(result.response);
   } catch (e) {
+    if (e.status === 409 && e.code === "CUSTOMER_NOT_ACTIVE")
+      return res.status(409).json({ error: e.message, code: e.code, type: "transaction_conflict", current: null, serverVersion: 1, resolutionVersion: 1 });
     if (e.status === 400 || e.status === 404 || e.status === 409)
       return error(res, e.status, e.message);
     next(e);
@@ -78,6 +80,7 @@ export const handle_delete_ledger_id = async (req, res, next) => {
     if (e.status === 409)
       return res.status(409).json({
         error: e.message,
+        ...(e.code ? { code: e.code } : {}),
         type: "transaction_conflict",
         current: e.current ?? null,
         serverVersion: e.serverVersion || e.current?.serverVersion || 1,
@@ -117,6 +120,7 @@ export const handle_patch_ledger_id = async (req, res, next) => {
     if (e.status === 409)
       return res.status(409).json({
         error: e.message,
+        ...(e.code ? { code: e.code } : {}),
         type: "transaction_conflict",
         current: e.current ?? null,
         serverVersion: e.serverVersion || e.current?.serverVersion || 1,

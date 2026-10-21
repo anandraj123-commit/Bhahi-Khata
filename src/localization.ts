@@ -53,6 +53,11 @@ export function apiErrorTranslationKey(code: unknown, status: number): string {
     CUSTOMER_MOBILE_ALREADY_EXISTS:
       "A customer with this mobile number already exists in your shop. Please open the existing customer.",
     CUSTOMER_LIMIT_REACHED: "Customer limit reached",
+    CUSTOMER_NOT_ACTIVE: "Customer is unavailable for transactions",
+    CUSTOMER_STATUS_CONFLICT: "Customer status change not allowed",
+    CUSTOMER_STATUS_TRANSITION_INVALID: "Customer status change not allowed",
+    CUSTOMER_STATUS_INVALID: "Customer status change not allowed",
+    CUSTOMER_NOT_FOUND: "Resource not found",
     CUSTOMER_CONFLICT_RESOLVED: "Customer conflict resolved",
     SHOP_CONFLICT_RESOLVED: "Settings conflict resolved",
     SHOP_SETTINGS_CONFLICT: "Settings changed again",
@@ -64,9 +69,13 @@ export function apiErrorTranslationKey(code: unknown, status: number): string {
   };
   if (typeof code === "string" && byCode[code]) return byCode[code];
 
+  if (status === 400) return "Invalid request";
   if (status === 401) return "Sign in securely with your mobile number. Your khata syncs to your account.";
+  if (status === 403) return "Access denied";
+  if (status === 404) return "Resource not found";
   if (status === 409) return "Could not sync changes";
-  if (status >= 500) return "Please try again when the service is available.";
+  if (status === 429) return "Too many requests. Try again later.";
+  if (status >= 500) return "Server unavailable";
   return "Please try again.";
 }
 

@@ -14,8 +14,17 @@ const entrySignedPaise = (entry) =>
   entry.type === "payment" ? -entry.amountPaise : entry.amountPaise;
 
 async function lockCustomerFinancials(shopId, clientId, session) {
+  const customer = await Customer.findOne({ shopId, clientId, deletedAt: { $exists: false } })
+    .session(session).lean();
+  if (!customer) throw serviceError("Customer not found", 404);
+  const active = customer.status === undefined && customer.disabled === undefined && customer.removed === undefined
+    ? true
+    : customer.status === true && customer.disabled === false && customer.removed === false;
+  if (!active) throw serviceError("This customer is disabled or removed", 409, {
+    code: "CUSTOMER_NOT_ACTIVE", current: null,
+  });
   const result = await Customer.updateOne(
-    { shopId, clientId, deletedAt: { $exists: false } },
+    { shopId, clientId, deletedAt: { $exists: false }, status: { $ne: false }, disabled: { $ne: true }, removed: { $ne: true } },
     { $inc: { financialVersion: 1 } },
     { session },
   );
@@ -338,9 +347,60 @@ export async function resolveFinancialConflict({
         response = repeated.response;
         return;
       }
-      const doc = await Entry.findOne({ shopId, clientId: transactionId }).session(
+      let doc = await Entry.findOne({ shopId, clientId: transactionId }).session(
         session,
       );
+      if (!doc) {
+        const actualVersion = 1;
+        const actualResolutionVersion = 1;
+        if (input.expectedVersion !== actualVersion || input.expectedResolutionVersion !== actualResolutionVersion)
+          throw serviceError("Transaction changed while the conflict was open", 409, { current: null, serverVersion: actualVersion, resolutionVersion: actualResolutionVersion });
+        let selected = null;
+        if (input.choice === "keep_local" && !input.localDeleted) {
+          await lockCustomerFinancials(shopId, input.proposed.customerId, session);
+          doc = await Entry.findOneAndUpdate(
+            { shopId, clientId: transactionId },
+            { $set: {
+              shopId, clientId: transactionId,
+              customerClientId: input.proposed.customerId,
+              type: input.proposed.type,
+              amountPaise: paise(input.proposed.amount),
+              date: input.proposed.date,
+              recordedAt: input.proposed.recordedAt ? new Date(input.proposed.recordedAt) : new Date(),
+              note: input.proposed.note,
+              method: input.proposed.method,
+              reference: input.proposed.reference || "",
+              serverVersion: 1,
+              resolutionVersion: 1,
+            } },
+            { upsert: true, new: true, runValidators: true, session },
+          );
+          await reconcileCustomerAllocations(shopId, input.proposed.customerId, session);
+          doc = await Entry.findOne({ shopId, clientId: transactionId }).session(session);
+          selected = entryOut(doc);
+        }
+        const serverAt = new Date();
+        const customer = await Customer.findOne({ shopId, clientId: input.proposed.customerId }).session(session).select("name").lean();
+        const [record] = await FinancialResolution.create([{
+          shopId, transactionId, customerName: customer?.name || "Customer",
+          resolutionId: input.resolutionId, conflictId, requestHash, actorId,
+          previous: input.proposed, previousMissing: true, proposed: input.proposed, selected,
+          previousVersion: actualVersion, resultingVersion: selected?.serverVersion || actualVersion,
+          previousResolutionVersion: actualResolutionVersion,
+          resultingResolutionVersion: selected?.resolutionVersion || actualResolutionVersion,
+          localAt: input.localAt ? new Date(input.localAt) : undefined,
+          action: input.choice, status: "resolved", serverAt,
+        }], { session });
+        response = {
+          entry: selected,
+          serverVersion: selected?.serverVersion || actualVersion,
+          resolutionVersion: selected?.resolutionVersion || actualResolutionVersion,
+          resolutionId: input.resolutionId, serverAt: serverAt.toISOString(),
+          audit: financialAuditOut(record),
+        };
+        await Idempotency.create([{ shopId, key, requestHash, response }], { session });
+        return;
+      }
       if (doc) {
         const affected = new Set([doc.customerClientId]);
         if (input.choice === "keep_local" && !input.localDeleted)
@@ -400,6 +460,15 @@ export async function resolveFinancialConflict({
         if (!customer)
           throw serviceError("Customer is not available for this transaction", 409, {
             current,
+            serverVersion: actualVersion,
+            resolutionVersion: actualResolutionVersion,
+          });
+        const activeCustomer = customer.status === undefined && customer.disabled === undefined && customer.removed === undefined
+          ? true
+          : customer.status === true && customer.disabled === false && customer.removed === false;
+        if (!activeCustomer)
+          throw serviceError("This customer is disabled or removed", 409, {
+            code: "CUSTOMER_NOT_ACTIVE", current,
             serverVersion: actualVersion,
             resolutionVersion: actualResolutionVersion,
           });

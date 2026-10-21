@@ -29,6 +29,7 @@ import {
   BATCH4_GROUP13_KEYS,
 } from "../src/translations.ts";
 import { APP_RUNTIME_TRANSLATION_KEYS, APP_STATIC_TRANSLATION_KEYS } from "../src/translationInventory.ts";
+import { customerLifecycleTranslations } from "../src/customerLifecycleTranslations.ts";
 import {
   formatCurrency,
   formatLocaleDate,
@@ -96,24 +97,26 @@ test("Batch 2 translations use each locale's writing system for native-script la
   for (const [locale, key] of Object.entries(samples)) assert.match(localeDictionaries[locale][key], scripts[locale]);
 });
 
-test("Batch 2 locales contain genuine translations for the complete 393-key inventory", () => {
+test("Batch 2 locales contain genuine translations for the complete tracked inventory", () => {
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
-  assert.equal(required.length, 393);
+  assert.equal(required.length, 428);
   for (const locale of ["bn", "mr", "ta", "te", "gu", "pa"]) {
-    const missing = required.filter((key) => !localeDictionaries[locale][key]?.trim() || localeDictionaries[locale][key] === key);
+    const dictionary = { ...localeDictionaries[locale], ...customerLifecycleTranslations[locale] };
+    const missing = required.filter((key) => !dictionary[key]?.trim() || dictionary[key] === key);
     assert.deepEqual(missing, [], `${locale} must not rely on English fallback`);
   }
 });
 
-test("Batch 3 locales contain genuine translations for the complete 393-key inventory", () => {
+test("Batch 3 locales contain genuine translations for the complete tracked inventory", () => {
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
   const batch3Locales = ["kn", "ml", "or", "as", "ur", "ne"];
-  assert.equal(required.length, 393);
+  assert.equal(required.length, 428);
   for (const locale of batch3Locales) {
+    const dictionary = { ...localeDictionaries[locale], ...customerLifecycleTranslations[locale] };
     const missing = required.filter((key) =>
-      !localeDictionaries[locale][key]?.trim() || localeDictionaries[locale][key] === key);
+      !dictionary[key]?.trim() || dictionary[key] === key);
     assert.deepEqual(missing, [], `${locale} must not rely on English fallback`);
   }
 });
@@ -180,10 +183,10 @@ test("Batch 4 initial translation group is unique, placeholder-safe and uses the
   for (const locale of locales) assert.match(localeDictionaries[locale].Customers, scripts[locale]);
 });
 
-test("all 23 locales cover the full 393-key inventory without relying on fallback", () => {
+test("all 23 locales cover the full 428-key inventory without relying on fallback", () => {
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
-  assert.equal(required.length, 393);
+  assert.equal(required.length, 428);
 
   // Hindi's established dictionary is split between i18n.tsx and translations.ts.
   const hindi = { ...localeDictionaries.hi };
@@ -204,10 +207,10 @@ test("all 23 locales cover the full 393-key inventory without relying on fallbac
   for (const locale of LOCALE_IDS) {
     const dictionary = locale === "en"
       ? Object.fromEntries(required.map((key) => [key, key]))
-      : locale === "hi" ? hindi : localeDictionaries[locale];
+      : { ...(locale === "hi" ? hindi : localeDictionaries[locale]), ...(customerLifecycleTranslations[locale] || {}) };
     const unchanged = locale === "en" ? new Set(required) : new Set(["SMS", "WhatsApp"]);
     const coverage = measureTranslationCoverage(required, dictionary, locale, unchanged);
-    assert.equal(coverage.translated, 393, `${locale} translated key count`);
+    assert.equal(coverage.translated, 428, `${locale} translated key count`);
     assert.deepEqual(coverage.missingKeys, [], `${locale} must not rely on English fallback`);
   }
 });
@@ -221,8 +224,12 @@ test("API errors use stable-code translations and safe localized generic fallbac
     apiErrorTranslationKey("CUSTOMER_LIMIT_REACHED", 409),
     "Customer limit reached",
   );
-  assert.equal(apiErrorTranslationKey("UNKNOWN_PRIVATE_SERVER_DETAIL", 500), "Please try again when the service is available.");
+  assert.equal(apiErrorTranslationKey("UNKNOWN_PRIVATE_SERVER_DETAIL", 500), "Server unavailable");
   assert.equal(apiErrorTranslationKey(undefined, 409), "Could not sync changes");
+  assert.equal(apiErrorTranslationKey(undefined, 400), "Invalid request");
+  assert.equal(apiErrorTranslationKey(undefined, 403), "Access denied");
+  assert.equal(apiErrorTranslationKey(undefined, 404), "Resource not found");
+  assert.equal(apiErrorTranslationKey(undefined, 429), "Too many requests. Try again later.");
 
   const errorKeys = [
     apiErrorTranslationKey("CUSTOMER_MOBILE_ALREADY_EXISTS", 409),
@@ -232,6 +239,7 @@ test("API errors use stable-code translations and safe localized generic fallbac
     apiErrorTranslationKey("ACCOUNT_PHONE_INVALID", 409),
     apiErrorTranslationKey("CHECKOUT_DISABLED", 503),
     apiErrorTranslationKey("UNRECOGNIZED", 500),
+    "Invalid request", "Access denied", "Resource not found", "Too many requests. Try again later.",
   ];
   for (const locale of ["bn", "mr", "te", "ta", "gu", "ur", "kn", "ml", "or", "pa", "as", "ne", "mai", "sat", "ks", "kok", "sd", "doi", "mni", "brx", "sa"]) {
     for (const key of errorKeys) {
@@ -244,6 +252,19 @@ test("API errors use stable-code translations and safe localized generic fallbac
   assert.match(app, /apiErrorTranslationKey\(code, error\.status\)/);
   assert.doesNotMatch(app, /error instanceof api\.ApiError\s*\?\s*error\.message/);
   assert.match(app, /activeLanguageRef\.current, \.\.\.args/);
+});
+
+test("API diagnostics classify transport versus HTTP failures without logging request data", () => {
+  const api = readFileSync("src/api.ts", "utf8");
+  const app = readFileSync("App.tsx", "utf8");
+  assert.match(api, /durationMs: Date\.now\(\) - startedAt/);
+  assert.match(api, /responseReceived: details\.responseReceived/);
+  assert.match(api, /origin,/);
+  assert.match(api, /category: details\.category/);
+  assert.match(api, /endpoint,/);
+  assert.doesNotMatch(api.match(/const logFailure = \(details:[\s\S]*?\n  \};/)?.[0] || "", /body|authorization|token|phone|address/i);
+  assert.doesNotMatch(app, /error instanceof TypeError/);
+  assert.match(app, /error instanceof api\.ApiTransportError && error\.kind === "network"/);
 });
 
 test("translation coverage counts only real dictionary translations and exposes fallback keys", () => {
@@ -318,6 +339,7 @@ test("Hindi covers every translatable static UI key; only a numeric phone placeh
   const translated = new Set([
     ...getObjectKeys("src/i18n.tsx", "hindi"),
     ...Object.keys(localeDictionaries.hi).map(normalize),
+    ...Object.keys(customerLifecycleTranslations.hi || {}).map(normalize),
   ]);
   const nonlinguistic = new Set(["98XXXXXXXX"]);
   const missing = APP_STATIC_TRANSLATION_KEYS
@@ -327,8 +349,9 @@ test("Hindi covers every translatable static UI key; only a numeric phone placeh
 });
 
 test("Hindi covers every inventoried runtime-generated UI phrase", () => {
+  const hindi = { ...localeDictionaries.hi, ...(customerLifecycleTranslations.hi || {}) };
   for (const key of APP_RUNTIME_TRANSLATION_KEYS) {
-    assert.ok(localeDictionaries.hi[key]?.trim(), `hi runtime phrase is missing: ${key}`);
+    assert.ok(hindi[key]?.trim(), `hi runtime phrase is missing: ${key}`);
   }
 });
 

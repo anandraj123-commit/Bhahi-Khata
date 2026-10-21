@@ -7,6 +7,7 @@ import type { Audit, Customer, Data, Entry } from "./model";
 import { createSyncDelta, normalizeSyncDelta, type SyncDelta, type SyncSettings } from "./syncDelta";
 import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import { normalizeCustomerMobile } from "./customerPhone";
+import { normalizeCustomerLifecycle } from "./customerLifecycle";
 
 const DATABASE = "digital-khata-offline.db";
 const KEY_NAME = "khata.sqlite.key.v1";
@@ -103,6 +104,7 @@ export type PendingCustomerConflict = {
   expectedResolutionVersion: number;
   resolutionId: string;
   localDeleted: boolean;
+  lifecycleChange?: boolean;
   localAt: string;
   chosen?: "keep_local" | "keep_server";
 };
@@ -152,7 +154,7 @@ export async function retryOfflineStorageInitialization() {
 async function runMigrations(db: SQLiteTypes.SQLiteDatabase) {
   const currentVersion =
     (await db.getFirstAsync<{ user_version: number }>("PRAGMA user_version"))?.user_version || 0;
-  if (currentVersion > 5) throw new Error("Offline database version is newer than this app");
+  if (currentVersion > 6) throw new Error("Offline database version is newer than this app");
   await db.execAsync("PRAGMA journal_mode = WAL;");
   await withEncryptedTransaction(db, async (tx) => {
     await tx.execAsync(`
@@ -213,6 +215,26 @@ async function runMigrations(db: SQLiteTypes.SQLiteDatabase) {
         await tx.runAsync("UPDATE sync_queue SET operation_id = ? WHERE id = ?", Crypto.randomUUID(), row.id);
       await tx.execAsync("CREATE UNIQUE INDEX IF NOT EXISTS sync_queue_operation_id_idx ON sync_queue (operation_id)");
       await tx.execAsync("PRAGMA user_version = 5;");
+    }
+    if (currentVersion < 6) {
+      const customerRows = await tx.getAllAsync<{ account_id: string; customer_id: string; record_json: string }>(
+        "SELECT account_id, customer_id, record_json FROM local_customers",
+      );
+      for (const row of customerRows) {
+        const normalized = normalizeCustomerLifecycle(JSON.parse(row.record_json));
+        await tx.runAsync(
+          "UPDATE local_customers SET record_json = ? WHERE account_id = ? AND customer_id = ?",
+          JSON.stringify(normalized), row.account_id, row.customer_id,
+        );
+      }
+      const queuedRows = await tx.getAllAsync<{ id: number; change_json: string }>(
+        "SELECT id, change_json FROM sync_queue WHERE change_json IS NOT NULL",
+      );
+      for (const row of queuedRows) {
+        const change = normalizeSyncDelta(JSON.parse(row.change_json) as SyncDelta);
+        await tx.runAsync("UPDATE sync_queue SET change_json = ? WHERE id = ?", JSON.stringify(change), row.id);
+      }
+      await tx.execAsync("PRAGMA user_version = 6;");
     }
   });
 }
@@ -419,7 +441,7 @@ async function writeData(db: SQLiteTypes.SQLiteDatabase, accountId: string, data
       "INSERT INTO local_customers (account_id, customer_id, record_json) VALUES (?, ?, ?)",
       accountId,
       customer.id,
-      JSON.stringify(customer),
+      JSON.stringify(normalizeCustomerLifecycle(customer)),
     );
   for (const entry of [...data.entries].reverse())
     await db.runAsync(
@@ -466,9 +488,9 @@ async function writeChange(
       await db.runAsync(
         `INSERT INTO local_customers (account_id, customer_id, record_json) VALUES (?, ?, ?)
          ON CONFLICT(account_id, customer_id) DO UPDATE SET record_json=excluded.record_json`,
-        accountId,
-        record.id,
-        JSON.stringify(record),
+      accountId,
+      record.id,
+      JSON.stringify(normalizeCustomerLifecycle(record)),
       );
   }
   for (const item of change.entries) {
@@ -644,7 +666,7 @@ export async function readCachedAccount(accountId: string): Promise<Data | null>
   const preferences = JSON.parse(account.preferences_json);
   return {
     shop: JSON.parse(account.shop_json),
-    customers: customers.map((row) => JSON.parse(row.record_json)),
+    customers: customers.map((row) => normalizeCustomerLifecycle(JSON.parse(row.record_json))),
     entries: entries.map((row) => withoutLegacyDue(JSON.parse(row.record_json)) as Entry),
     audit: audit.map((row) => withoutLegacyDueFromAudit(JSON.parse(row.record_json))),
     ...preferences,
@@ -765,7 +787,7 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
         const customer = item.after || item.before;
         if (customer) {
           blockedCustomerMutations.add(customer.id);
-          if (item.operation === "create" || item.operation === "delete")
+          if (item.operation === "create" || item.operation === "delete" || item.operation === "lifecycle")
             blockedCustomerLedger.add(customer.id);
         }
       }
@@ -792,7 +814,7 @@ export async function readNextChange(accountId: string): Promise<PendingChange |
         const customer = customerChange.after || customerChange.before;
         if (customer) {
           blockedCustomerMutations.add(customer.id);
-          if (customerChange.operation === "create") blockedCustomerLedger.add(customer.id);
+          if (customerChange.operation === "create" || customerChange.operation === "lifecycle") blockedCustomerLedger.add(customer.id);
         }
       }
       for (const entryChange of change.entries) {
@@ -841,7 +863,7 @@ export async function markConflict(
 ) {
   const db = await openDatabase();
   if (!db) return;
-  const operation = change.entries.find((item) => item.operation === "update" || item.operation === "delete");
+  const operation = change.entries.find((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete");
   if (!operation) return;
   const local = operation.after || operation.before!;
   const localAudit = change.audit.find((item) => item.after?.id === local.id || item.before?.id === local.id);
@@ -874,7 +896,7 @@ export async function markCustomerConflict(
 ) {
   const db = await openDatabase();
   if (!db) return;
-  const operation = change.customers.find((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete");
+  const operation = change.customers.find((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete" || item.operation === "lifecycle");
   if (!operation) return;
   const local = operation.after || operation.before!;
   const audit = change.audit.find((item) => item.action.toLowerCase().includes("customer"));
@@ -888,6 +910,7 @@ export async function markCustomerConflict(
     expectedResolutionVersion: server?.resolutionVersion || serverResolutionVersion || local.resolutionVersion || 1,
     resolutionId: Crypto.randomUUID(),
     localDeleted: operation.operation === "delete",
+    lifecycleChange: operation.operation === "lifecycle",
     localAt: audit?.date && Number.isFinite(Date.parse(audit.date))
       ? new Date(audit.date).toISOString()
       : new Date().toISOString(),

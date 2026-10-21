@@ -1,8 +1,9 @@
 import { formatCurrency, LanguageContext, showLocalizedAlert, t, Text } from "./src/i18n";
 import { apiErrorTranslationKey } from "./src/localization";
+import { isTemporaryBackendFailure } from "./src/startupRecovery";
 import { readLanguagePreference, saveLanguagePreference } from "./src/languagePreference";
 import ErrorBoundary from "./src/ErrorBoundary";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import {
   ActivityIndicator,
   Alert as NativeAlert,
@@ -40,6 +41,8 @@ import {
   validBackup,
 } from "./src/model";
 import { normalizeCustomerMobile } from "./src/customerPhone";
+import { customerLifecycleState, isActiveCustomer, matchesCustomerLifecycleFilter, transitionCustomerLifecycle, type CustomerLifecycleState } from "./src/customerLifecycle";
+import { CustomerActionGate } from "./src/customerActionGate";
 import { PAGE_SIZE, UserScrollPageGate, nextVisibleCount, visiblePage } from "./src/pagination";
 import {
   customerBalanceDisplay,
@@ -118,6 +121,7 @@ type Screen =
   | "setup"
   | "home"
   | "customers"
+  | "manageCustomers"
   | "customerForm"
   | "customer"
   | "viewCustomer"
@@ -157,13 +161,7 @@ const validDate = (value: string) =>
 const phoneValid = (value: string) => /^[6-9]\d{9}$/.test(value);
 const accountKey = (value: string) => value.replace(/\D/g, "");
 const isOfflineError = (error: unknown) =>
-  (error instanceof api.ApiTransportError && error.kind === "network") ||
-  error instanceof TypeError ||
-  (error instanceof Error &&
-    (error.name === "AbortError" ||
-      /network request failed|failed to fetch|network error|internet connection/i.test(
-        error.message,
-      )));
+  error instanceof api.ApiTransportError && error.kind === "network";
 const showOtpError = (title: string, error: unknown, fallback: string, language: string) => {
   const unreachable = isOfflineError(error);
   const offline = currentConnectivity() === "offline";
@@ -180,21 +178,13 @@ const showOtpError = (title: string, error: unknown, fallback: string, language:
 const errorMessage = (error: unknown, fallback: string) =>
   error instanceof api.ApiTransportError
     ? error.kind === "timeout"
-      ? "The request timed out. Check your connection and try again."
+      ? "Sync timed out"
       : currentConnectivity() === "offline"
-        ? "No active network connection. Connect to Wi-Fi or another network and try again."
-        : "Could not reach the Digital-Khata server on the current network. Try again when the server is available."
+        ? "You’re offline"
+        : "Server unavailable"
     : error instanceof api.ApiError
       ? (() => {
           const code = error.payload?.code;
-          if (__DEV__) {
-            // Server text is diagnostic only; never render it directly. Do not log response bodies.
-            console.warn("Digital-Khata API request failed", {
-              status: error.status,
-              code: typeof code === "string" ? code : undefined,
-              message: error.message.slice(0, 240),
-            });
-          }
           return apiErrorTranslationKey(code, error.status);
         })()
       : fallback;
@@ -203,6 +193,7 @@ const titles: Partial<Record<Screen, string>> = {
   otp: "Verify Mobile",
   setup: "Set Up Your Shop",
   customers: "Customers",
+  manageCustomers: "Manage Customers",
   customerForm: "Add Customer",
   viewCustomer: "View Customer",
   credit: "Add Udhari",
@@ -330,17 +321,26 @@ function AppContent() {
   const [history, setHistory] = useState<Route[]>([]);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
+  const [manageCustomerFilter, setManageCustomerFilter] = useState("All");
+  const customerActionGate = useRef(new CustomerActionGate());
+  const [savingCustomers, setSavingCustomers] = useState<Record<string, CustomerLifecycleState>>({});
+  const [customerPagePending, startCustomerPageTransition] = useTransition();
+  const customerPageRequest = useRef<{ key: string; count: number } | null>(null);
   const [month, setMonth] = useState(today().slice(0, 7));
   const matchingCustomers = useMemo(() => {
     if (route.screen === "customers")
-      return data.customers.filter((c) =>
+      return data.customers.filter((c) => isActiveCustomer(c) &&
         (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search)) &&
         (filter === "All" || (filter === "Due" && balance(data, c.id) > 0) || (filter === "Paid" && balance(data, c.id) <= 0)),
       );
     if (["credit", "payment", "refund"].includes(route.screen))
-      return data.customers.filter((c) => c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search));
+      return data.customers.filter((c) => isActiveCustomer(c) && (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search)));
     return [];
   }, [data, route.screen, search, filter]);
+  const managedCustomers = useMemo(() => data.customers.filter((c) => {
+    const tabMatches = matchesCustomerLifecycleFilter(c, manageCustomerFilter as "All" | "Disabled" | "Removed");
+    return tabMatches && (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search));
+  }), [data.customers, search, manageCustomerFilter]);
   const khataRows = useMemo(() => {
     if (route.screen !== "khata") return [];
     return data.customers
@@ -360,7 +360,7 @@ function AppContent() {
   const customerScrollGate = useRef(new UserScrollPageGate());
   const customerScrollStartedForKey = useRef("");
   const customerDragStartOffset = useRef(0);
-  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${month}`;
+  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${manageCustomerFilter}:${month}`;
   const listPageKeyRef = useRef(listPageKey);
   listPageKeyRef.current = listPageKey;
   const rememberPageCount = (key: string, count: number) => {
@@ -372,16 +372,20 @@ function AppContent() {
   useEffect(() => {
     // Customer lists begin at page one on every visit. Programmatic restoration of
     // an old scroll offset must not silently restore an expanded customer list.
-    const count = route.screen === "customers"
+    const count = route.screen === "customers" || route.screen === "manageCustomers"
       ? PAGE_SIZE
       : listPageCounts.current.get(listPageKey) || PAGE_SIZE;
     listPageRef.current = { key: listPageKey, count, total: 0, loading: false };
+    customerPageRequest.current = null;
     listHasScrolled.current = false;
     customerScrollGate.current.reset();
     customerScrollStartedForKey.current = "";
     customerDragStartOffset.current = 0;
     setListPage({ key: listPageKey, count, loading: false });
   }, [listPageKey, route.screen]);
+  useEffect(() => {
+    if (!customerPagePending) customerPageRequest.current = null;
+  }, [customerPagePending, listPage]);
   const pageRecords = <T,>(items: T[]) => {
     const count = listPage.key === listPageKey ? listPage.count : PAGE_SIZE;
     listPageRef.current = {
@@ -394,12 +398,13 @@ function AppContent() {
   };
   const listFooter = (hasMore: boolean, loadingLabel = "Loading more...") =>
     hasMore && (
+      (route.screen === "manageCustomers" && customerPagePending && customerPageRequest.current?.key === listPageKey) ||
       (listPage.key === listPageKey && listPage.loading) ||
       ((route.screen === "subscription" || route.screen === "subscriptionPayments") && subscriptionPageLoading)
     ) ? (
       <View style={{ paddingVertical: 12, alignItems: "center" }}>
         <ActivityIndicator size="small" color={colors.green} />
-        <Hint>{loadingLabel}</Hint>
+        {loadingLabel ? <Hint>{loadingLabel}</Hint> : null}
       </View>
     ) : null;
   const handleListScroll = (event: any) => {
@@ -408,7 +413,7 @@ function AppContent() {
     while (listScrollOffsets.current.size > 32)
       listScrollOffsets.current.delete(listScrollOffsets.current.keys().next().value!);
     if (
-      route.screen === "customers" &&
+      (route.screen === "customers" || route.screen === "manageCustomers") &&
       contentOffset.y > customerDragStartOffset.current + 1
     ) customerScrollGate.current.markUserMovement();
     if (contentOffset.y > 1) listHasScrolled.current = true;
@@ -418,13 +423,25 @@ function AppContent() {
       void loadMoreSubscriptionHistory();
     if (listHasScrolled.current && nearBottom && route.screen === "subscriptionPayments" && subscriptionSnapshot?.paymentsNextCursor)
       void loadMoreSubscriptionPayments();
-    if (route.screen === "customers" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "customers" || route.screen === "manageCustomers" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     requestNextVisiblePage();
   };
   const requestNextVisiblePage = () => {
     const current = listPageRef.current;
     if (!listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     const nextCount = nextVisibleCount(current.count, current.total);
+    if (route.screen === "manageCustomers") {
+      if (customerPageRequest.current?.key === current.key) return;
+      customerPageRequest.current = { key: current.key, count: nextCount };
+      // Keep the current rows visible while React renders the next fifteen.
+      // No network request or artificial timer is needed for cached records.
+      startCustomerPageTransition(() => {
+        setListPage((previous) => listPageKeyRef.current === current.key
+          ? { key: current.key, count: nextCount, loading: false }
+          : previous);
+      });
+      return;
+    }
     rememberPageCount(current.key, nextCount);
     // Local pagination only reveals already-loaded rows; update atomically instead
     // of delaying the page with a timer just to flash a loading indicator.
@@ -675,9 +692,11 @@ function AppContent() {
   useEffect(() => {
     let live = true;
     (async () => {
+      let failureLocation = "connectivity_check";
       try {
         const connectivity = await checkConnectivity();
         if (connectivity === "offline") {
+          failureLocation = "offline_session_restore";
           const offlineSession = await readOfflineSession();
           const cached = offlineSession
             ? await readCachedAccount(offlineSession.accountId)
@@ -698,13 +717,16 @@ function AppContent() {
           }
           return;
         }
+        failureLocation = "session_restore_and_account_load";
         const remote = await api.restoreSession();
         if (live && remote) {
+          failureLocation = "server_response_normalization";
           let parsed = api.normalizeData(remote);
           if (!validBackup(parsed)) throw new Error("Invalid server data");
           const id = parsed.shopExists ? accountKey(parsed.shop.phone) : "";
           offlineAccountRef.current = id || null;
           if (id && offlineStorageAvailable()) {
+            failureLocation = "pending_offline_sync";
             try {
               const synchronized = await synchronizePendingOnly(id);
               if (synchronized) parsed = synchronized;
@@ -727,6 +749,7 @@ function AppContent() {
               }
             }
             if (offlineAccountRef.current === id) {
+              failureLocation = "offline_cache_write";
               try {
                 await cacheAuthenticatedAccount(id, parsed);
               } catch {
@@ -753,9 +776,29 @@ function AppContent() {
           setRoute({ screen: "login" });
         }
       } catch (error) {
+        if (__DEV__) {
+          const stack = error instanceof Error && error.stack
+            ? error.stack.split("\n").slice(1).join("\n")
+                .replace(/https?:\/\/[^\s)]+/gi, "[URL]")
+                .replace(/\b[6-9]\d{9}\b/g, "[PHONE]")
+                .replace(/(authorization|bearer|token|password|otp|secret)\s*[:= ]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+                .slice(0, 3000)
+            : undefined;
+          console.error("Digital-Khata startup operation failed", {
+            location: failureLocation,
+            errorName: error instanceof Error ? error.name : "UnknownError",
+            category: error instanceof api.ApiTransportError
+              ? error.kind
+              : error instanceof api.ApiError
+                ? error.status === 401 ? "authentication" : error.status === 409 ? "conflict" : error.status === 429 ? "rate_limit" : error.status >= 500 ? "server" : "http_error"
+                : "local_or_unexpected",
+            ...(error instanceof api.ApiError ? { status: error.status, code: error.payload?.code } : {}),
+            ...(stack ? { stack } : {}),
+          });
+        }
         const canUseCachedSession =
           isOfflineError(error) ||
-          (error instanceof api.ApiError && error.status >= 500);
+          (error instanceof api.ApiError && isTemporaryBackendFailure(error.status));
         if (live && canUseCachedSession) {
           let offlineSession: Awaited<ReturnType<typeof readOfflineSession>> = null;
           let cached: Data | null = null;
@@ -793,7 +836,7 @@ function AppContent() {
           setLoadError(true);
           Alert.alert(
             "Could not connect to your khata",
-            errorMessage(error, "Check your internet connection and try again."),
+            errorMessage(error, "Something went wrong"),
           );
         }
       } finally {
@@ -1067,7 +1110,7 @@ function AppContent() {
         else if (error instanceof Error && /Encrypted local storage requires the installed app build/.test(error.message))
           Alert.alert("Secure storage unavailable", "No changes were saved. Install the supported Digital-Khata build with encrypted local storage and try again.");
         else
-          Alert.alert("Unable to save", errorMessage(error, "No changes were saved. Please try again."));
+          Alert.alert("Unable to save", errorMessage(error, "Please try again."));
         return false;
       }
     });
@@ -1151,7 +1194,7 @@ function AppContent() {
         setRoute({ screen: "setup" });
       }
     } catch (error) {
-      Alert.alert("Unable to set up your shop", errorMessage(error, "No shop was created. Check your connection and try again."));
+      Alert.alert("Unable to set up your shop", errorMessage(error, "Something went wrong"));
     } finally {
       lock.current = false;
       setBusy(false);
@@ -1574,6 +1617,7 @@ function AppContent() {
     );
   };
   const actions = (id?: string) => (
+    id && !isActiveCustomer(data.customers.find((item) => item.id === id) || {}) ? null :
     <>
       <View style={s.split}>
         <View style={{ flex: 1 }}>
@@ -1606,7 +1650,7 @@ function AppContent() {
             </View>
             <View style={{ flex: 1 }}>
               <Text style={s.rowTitle}>{c.name}</Text>
-              <Text style={s.small}>{c.phone || "No phone added"}</Text>
+              <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>
               {c.address ? <Text style={s.small}>{c.address}</Text> : null}
               <Text style={s.small}>
                 Created On: {formatCustomerCreatedOn(c.createdAt)}
@@ -1618,6 +1662,48 @@ function AppContent() {
           </View>
         </Card>
       </Pressable>
+    );
+  };
+  const managedCustomerRow = (c: Customer) => {
+    const state = customerLifecycleState(c);
+    const saving = savingCustomers[c.id];
+    const { tone, label } = customerBalanceDisplay(balance(data, c.id), money);
+    return (
+      <Card key={c.id}>
+        <View style={[s.split, { alignItems: "center" }]}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.rowTitle}>{c.name}</Text>
+            <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>
+            {c.address ? <Text style={s.small}>{c.address}</Text> : null}
+          </View>
+          <View style={[s.badge, { backgroundColor: state === "removed" ? colors.redBg : state === "disabled" ? colors.neutralBg : colors.greenBg }]}>
+            <Text style={{ color: state === "removed" ? colors.red : state === "disabled" ? colors.neutral : colors.green, fontWeight: "700" }}>
+              {state === "active" ? t("Active", data.language) : t(state === "disabled" ? "Disabled" : "Removed", data.language)}
+            </Text>
+          </View>
+        </View>
+        <Text style={{ color: financialPalette[tone].text, fontWeight: "700", marginTop: 8 }}>{label}</Text>
+        <View style={[s.split, { marginTop: 8 }]}>
+          <View style={{ flex: 1 }}><Button title="View Customer" secondary onPress={() => go("customer", c.id)} /></View>
+          <View style={{ flex: 1 }}><Button title="Statement" secondary onPress={() => go("statement", c.id)} /></View>
+        </View>
+        {state === "active" ? (
+          <>
+            <View style={s.split}>
+              <View style={{ flex: 1 }}><Button title="Edit Customer" disabled={Boolean(saving)} secondary onPress={() => go("customerForm", c.id)} /></View>
+              <View style={{ flex: 1 }}><Button title="Disable Customer" loading={saving === "disabled"} disabled={Boolean(saving)} secondary onPress={() => changeCustomerLifecycle(c, "disabled")} /></View>
+            </View>
+            <Button title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} />
+          </>
+        ) : state === "disabled" ? (
+          <View style={s.split}>
+            <View style={{ flex: 1 }}><Button title="Enable Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} /></View>
+            <View style={{ flex: 1 }}><Button title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} /></View>
+          </View>
+        ) : (
+          <Button title="Restore Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} />
+        )}
+      </Card>
     );
   };
   const entryRow = (e: Entry) => (
@@ -1659,6 +1745,9 @@ function AppContent() {
     </Pressable>
   );
   function saveCustomer() {
+    const editing = data.customers.find((item) => item.id === route.id);
+    if (editing && !isActiveCustomer(editing))
+      return Alert.alert("Cannot edit this customer", "Enable or restore this customer before editing.");
     const name = form.name?.trim();
     const normalizedPhone = normalizeCustomerMobile(form.phone);
     const opening = Number(form.opening || 0),
@@ -1719,6 +1808,9 @@ function AppContent() {
       openingAdvance: Math.round(openingAdvance * 100) / 100,
       limit: Math.round(limit * 100) / 100,
       reminder: form.reminder === "true",
+      status: existingCustomer?.status ?? true,
+      disabled: existingCustomer?.disabled ?? false,
+      removed: existingCustomer?.removed ?? false,
     };
     const entitlement = subscriptionSnapshot?.current?.plan;
     const localCustomerLimit = entitlement?.customerLimit ?? 50;
@@ -1726,7 +1818,7 @@ function AppContent() {
     if (
       !route.id &&
       !hasUnlimitedCustomers &&
-      data.customers.length >= localCustomerLimit
+      data.customers.filter(isActiveCustomer).length >= localCustomerLimit
     )
       return Alert.alert(
         "Customer limit reached",
@@ -1754,6 +1846,71 @@ function AppContent() {
       () => go("customer", c.id, true),
     );
   }
+  function changeCustomerLifecycle(customer: Customer, target: CustomerLifecycleState) {
+    const current = customerLifecycleState(customer);
+    if (current === target) return;
+    try { transitionCustomerLifecycle(customer, target); }
+    catch { return Alert.alert("Customer status change not allowed", "This customer cannot be moved to that status."); }
+    const signed = balance(data, customer.id);
+    const due = Math.max(0, signed);
+    const advance = Math.max(0, -signed);
+    const confirmedAt = new Date().toISOString();
+    const action = target === "disabled" ? "CUSTOMER_DISABLED" : target === "removed" ? "CUSTOMER_REMOVED" : current === "removed" ? "CUSTOMER_RESTORED" : "CUSTOMER_ENABLED";
+    const eventId = uid();
+    const event = {
+      id: eventId,
+      action,
+      date: confirmedAt,
+      customerLifecycle: {
+        customerId: customer.id,
+        previousStatus: current,
+        newStatus: target,
+      },
+    };
+    const reservation = customerActionGate.current.reserve(customer.id);
+    if (!reservation) return;
+    const confirmedAccount = offlineAccountRef.current;
+    const perform = async () => {
+      if (!customerActionGate.current.confirm(reservation)) return;
+      setSavingCustomers((pending) => ({ ...pending, [customer.id]: target }));
+      try {
+        // Confirmation may remain open while sync or another customer's save finishes.
+        const latest = dataRef.current;
+        const latestCustomer = latest.customers.find((item) => item.id === customer.id);
+        if (!latest.signedIn || offlineAccountRef.current !== confirmedAccount || !latestCustomer ||
+            customerLifecycleState(latestCustomer) !== current) {
+          Alert.alert("Customer status change not allowed", "This customer cannot be moved to that status.");
+          return;
+        }
+        const saved = await commit({
+          ...latest,
+          customers: latest.customers.map((item) => item.id === customer.id ? transitionCustomerLifecycle(item, target) : item),
+          audit: [event, ...latest.audit],
+        });
+        if (saved) Alert.alert(t(action === "CUSTOMER_DISABLED" ? "Customer disabled" : action === "CUSTOMER_ENABLED" ? "Customer enabled" : action === "CUSTOMER_REMOVED" ? "Customer removed" : "Customer restored", activeLanguageRef.current));
+      } catch (error) {
+        Alert.alert("Unable to save", errorMessage(error, "Please try again."));
+      } finally {
+        customerActionGate.current.finish(reservation);
+        setSavingCustomers((pending) => {
+          const next = { ...pending };
+          delete next[customer.id];
+          return next;
+        });
+      }
+    };
+    const removeMessage = due || advance
+      ? `${customer.name}\n${due ? `${t("Outstanding", data.language)}: ${money(due)} ${t("Due", data.language)}` : `${t("Available Advance", data.language)}: ${money(advance)}`}\n\n${t("Removing hides this customer from active lists. Their balance and transaction history remain saved and can be accessed from Removed customers.", data.language)}`
+      : t("Removing hides this customer from active lists. Their balance and transaction history remain saved and can be accessed from Removed customers.", data.language);
+    const title = target === "disabled" ? "Disable customer?" : target === "removed" ? "Remove Customer?" : target === "active" ? (current === "removed" ? "Restore Customer?" : "Enable Customer?") : "Customer status";
+    const message = target === "removed" ? removeMessage : target === "disabled"
+      ? t("This customer will not be available for new transactions until enabled.", data.language)
+      : t("This customer will be available for normal transactions again.", data.language);
+    Alert.alert(t(title, data.language), message, [
+      { text: t("Cancel", data.language), style: "cancel", onPress: () => customerActionGate.current.cancel(reservation) },
+      { text: t(target === "disabled" ? "Disable Customer" : target === "removed" ? "Remove Customer" : target === "active" && current === "removed" ? "Restore Customer" : "Enable Customer", data.language), style: target === "removed" ? "destructive" : "default", onPress: () => void perform() },
+    ], { cancelable: true, onDismiss: () => customerActionGate.current.cancel(reservation) });
+  }
   function saveEntry() {
     const old = route.screen === "editTransaction" ? entry : undefined;
     const type = old?.type ||
@@ -1765,6 +1922,8 @@ function AppContent() {
         "Select a customer",
         "Add a customer before recording a transaction.",
       );
+    if (!isActiveCustomer(c))
+      return Alert.alert("Customer is unavailable for transactions", "Enable or restore this customer before recording financial transactions.");
     if (
       !Number.isFinite(amount) ||
       amount < 0.01 ||
@@ -2260,7 +2419,7 @@ function AppContent() {
                 setOtpVerified(false);
                 if (remote.shopComplete) go("home", undefined, true);
                 else { setHistory([...history, route]); setRoute({ screen: "setup" }); setForm({ name: remote.shop.name, owner: remote.shop.owner, address: remote.shop.address, phone, whatsapp: remote.shop.whatsapp }); }
-              } catch (error) { showOtpError(otpVerified ? "Could not load your account" : "Could not verify OTP", error, "Check your connection and try again.", activeLanguageRef.current); }
+              } catch (error) { showOtpError(otpVerified ? "Could not load your account" : "Could not verify OTP", error, "Something went wrong", activeLanguageRef.current); }
               finally { setBusy(false); }
             }}
           />
@@ -2365,7 +2524,7 @@ function AppContent() {
           </View>
           <View style={s.split}>
             {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100), "amber")}
-            {stat("Customers", String(data.customers.length))}
+            {stat("Customers", String(data.customers.filter(isActiveCustomer).length))}
           </View>
           <Hint>Current outstanding and advances are balances. The other totals show recorded activity.</Hint>
           {actions()}
@@ -2396,7 +2555,7 @@ function AppContent() {
           )}
           <Title>Customers With Pending Balance</Title>
           {data.customers
-            .filter((c) => balance(data, c.id) > 0)
+            .filter((c) => isActiveCustomer(c) && balance(data, c.id) > 0)
             .slice(0, 4)
             .map(customerRow)}
           <Button
@@ -2435,16 +2594,33 @@ function AppContent() {
       };
       break;
     }
+    case "manageCustomers": {
+      const page = pageRecords(managedCustomers);
+      virtualizedRows = {
+        data: page.items,
+        keyExtractor: (item) => item.id,
+        renderItem: (item) => managedCustomerRow(item),
+        header: <>
+          <Field label="Search customers" placeholder="Search name or phone" value={search} onChangeText={setSearch} />
+          <Chips items={["All", "Disabled", "Removed"]} value={manageCustomerFilter} onChange={setManageCustomerFilter} />
+        </>,
+        footer: listFooter(page.hasMore, ""),
+        empty: !loaded ? <View style={{ paddingVertical: 12, alignItems: "center" }}><ActivityIndicator size="small" color={colors.green} /></View> : <Empty title={manageCustomerFilter === "All" ? "No customers found" : manageCustomerFilter === "Disabled" ? "No disabled customers" : "No removed customers"} description="Try another search or customer status." />,
+      };
+      break;
+    }
     case "customerForm":
       content = (
         <>
-          {field("Name *", "name", { placeholder: "Rahul Kumar" })}
+          {route.id && customer && !isActiveCustomer(customer) ? <Hint>{t("Cannot edit this customer", data.language)}. {t("Enable or restore this customer before editing.", data.language)}</Hint> : null}
+          {field("Name *", "name", { placeholder: "Rahul Kumar", editable: !route.id || isActiveCustomer(customer || {}) })}
           {field("Phone Number", "phone", {
             keyboardType: "phone-pad",
             maxLength: 32,
             placeholder: "98XXXXXXXX",
+            editable: !route.id || isActiveCustomer(customer || {}),
           })}
-          {field("Address", "address", { placeholder: "Delhi", multiline: true })}
+          {field("Address", "address", { placeholder: "Delhi", multiline: true, editable: !route.id || isActiveCustomer(customer || {}) })}
           {route.id && customer ? (
             <Field
               label="Created On"
@@ -2474,15 +2650,17 @@ function AppContent() {
           )}
           {field("Credit Limit (₹, 0 = no limit)", "limit", {
             keyboardType: "decimal-pad",
+            editable: !route.id || isActiveCustomer(customer || {}),
           })}
           <Toggle
             label="Allow WhatsApp / SMS reminders"
             value={form.reminder === "true"}
             onChange={(v) => f("reminder", String(v))}
+            disabled={!!route.id && !isActiveCustomer(customer || {})}
           />
           <Button
             title="Save Customer"
-            disabled={busy}
+            disabled={busy || (!!route.id && !isActiveCustomer(customer || {}))}
             onPress={saveCustomer}
           />
         </>
@@ -2520,7 +2698,11 @@ function AppContent() {
               <Text style={[s.amount, { color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }]}>{money(currentOutstandingPaise / 100)}</Text>
               <Hint style={{ color: financialPalette[availableAdvancePaise > 0 ? "green" : "neutral"].text }}>Available Advance: {money(availableAdvancePaise / 100)}</Hint>
             </Card>
-            {actions(customer.id)}
+            {customerLifecycleState(customer) === "active" ? actions(customer.id) : (
+              <View style={[s.badge, { backgroundColor: customerLifecycleState(customer) === "removed" ? colors.redBg : colors.neutralBg }]}>
+                <Text style={{ color: customerLifecycleState(customer) === "removed" ? colors.red : colors.neutral, fontWeight: "700" }}>{t(customerLifecycleState(customer) === "removed" ? "Removed" : "Disabled", data.language)}</Text>
+              </View>
+            )}
             <View style={s.split}>
               {stat(
                 "Total Udhari",
@@ -2542,13 +2724,13 @@ function AppContent() {
               {stat("Available Advance", money(availableAdvancePaise / 100), availableAdvancePaise > 0 ? "green" : "neutral")}
             </View>
             <View style={s.split}>
-              <View style={{ flex: 1 }}>
+              {customerLifecycleState(customer) === "active" ? <View style={{ flex: 1 }}>
                 <Button
                   title="View Customer"
                   secondary
                   onPress={() => go("viewCustomer", customer.id)}
                 />
-              </View>
+              </View> : null}
             </View>
             <View style={s.split}>
               <View style={{ flex: 1 }}>
@@ -2558,13 +2740,9 @@ function AppContent() {
                   onPress={() => go("statement", customer.id)}
                 />
               </View>
-              <View style={{ flex: 1 }}>
-                <Button
-                  title="Edit Customer"
-                  secondary
-                  onPress={() => go("customerForm", customer.id)}
-                />
-              </View>
+              {customerLifecycleState(customer) === "active" ? <View style={{ flex: 1 }}>
+                <Button title="Edit Customer" secondary onPress={() => go("customerForm", customer.id)} />
+              </View> : null}
             </View>
             <Title>Transaction History</Title>
           </>,
@@ -2613,6 +2791,7 @@ function AppContent() {
     case "editTransaction":
       content = (
         <>
+          {route.id && !isActiveCustomer(data.customers.find((item) => item.id === route.id) || {}) ? <Hint>{t("Customer is unavailable for transactions", data.language)}. {t("Enable or restore this customer before recording financial transactions.", data.language)}</Hint> : null}
           {(route.screen === "credit" || route.screen === "refund") && route.id ? (
             <>
               <Field
@@ -2825,11 +3004,11 @@ function AppContent() {
             {entry.type === "credit" && (entry.advanceApplied || 0) > 0 && (
               <Row title="Adjusted From Advance" value={money(entry.advanceApplied || 0)} />
             )}
-            <Button
+            {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button
               title="Edit"
               onPress={() => go("editTransaction", entry.id)}
-            />
-            <Button title="Delete" danger onPress={() => deleteEntry(entry)} />
+            /> : <Hint>{t("Historical transactions are read-only.", data.language)}</Hint>}
+            {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button title="Delete" danger onPress={() => deleteEntry(entry)} /> : null}
           </>
         );
       }
@@ -3055,7 +3234,7 @@ function AppContent() {
             {stat("Outstanding (all time)", money(outstanding), outstanding > 0 ? "red" : "neutral")}
             {stat(
               "Active customers",
-              String(new Set(monthEntries.map((e) => e.customerId)).size),
+              String(new Set(monthEntries.filter((entry) => isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {})).map((e) => e.customerId)).size),
             )}
           </View>
           <Card>
@@ -3120,6 +3299,7 @@ function AppContent() {
           {(
             [
               "profile",
+              "manageCustomers",
               "reports",
               "notifications",
               "settings",
@@ -3595,24 +3775,35 @@ function AppContent() {
     case "audit":
       {
       const activityPage = pageRecords(data.audit);
+      const lifecycleActivityLabels: Record<string, string> = {
+        CUSTOMER_DISABLED: "Customer disabled",
+        CUSTOMER_ENABLED: "Customer enabled",
+        CUSTOMER_REMOVED: "Customer removed",
+        CUSTOMER_RESTORED: "Customer restored",
+      };
       virtualizedRows = {
         data: activityPage.items,
         keyExtractor: (activity) => activity.id,
         header: <Hint>Server-recorded customer and transaction activity for this shop.</Hint>,
         renderItem: (a) => (
           <Card>
-              <Title>{a.action}</Title>
+              <Title>{t(lifecycleActivityLabels[a.action] || a.action, data.language)}</Title>
               <Hint>{new Date(a.date).toLocaleString("en-IN")}</Hint>
-              {a.before && (
+              {a.before && typeof a.before.amount === "number" && (
                 <Hint>
                   Before: {money(a.before.amount)} • {a.before.date} •{" "}
                   {a.before.note}
                 </Hint>
               )}
-              {a.after && (
+              {a.after && typeof a.after.amount === "number" && (
                 <Hint>
                   After: {money(a.after.amount)} • {a.after.date} •{" "}
                   {a.after.note}
+                </Hint>
+              )}
+              {a.customerLifecycle && (
+                <Hint>
+                  {t("Customer status", data.language)}: {t(a.customerLifecycle.previousStatus[0].toUpperCase() + a.customerLifecycle.previousStatus.slice(1), data.language)} → {t(a.customerLifecycle.newStatus[0].toUpperCase() + a.customerLifecycle.newStatus.slice(1), data.language)}
                 </Hint>
               )}
               {a.resolution && (
@@ -3643,7 +3834,7 @@ function AppContent() {
         </Hint>
       </SafeAreaView>
     );
-  if (!loaded)
+  if (!loaded && !data.signedIn)
     return (
       <SafeAreaView
         style={[
@@ -3721,7 +3912,7 @@ function AppContent() {
               removeClippedSubviews={Platform.OS === "android"}
               onScroll={handleListScroll}
               onScrollBeginDrag={(event) => {
-                if (route.screen === "customers") {
+                if (route.screen === "customers" || route.screen === "manageCustomers") {
                   customerScrollStartedForKey.current = listPageKeyRef.current;
                   customerDragStartOffset.current = event.nativeEvent.contentOffset.y;
                   customerScrollGate.current.beginUserScroll();
@@ -3730,12 +3921,15 @@ function AppContent() {
               onContentSizeChange={() => {
                 if (restoredListKey.current === listPageKey) return;
                 restoredListKey.current = listPageKey;
-                const offset = listScrollOffsets.current.get(listPageKey) || 0;
-                if (offset > 0)
-                  requestAnimationFrame(() => virtualListRef.current?.scrollToOffset({ offset, animated: false }));
+                const offset = route.screen === "manageCustomers" ? 0 : listScrollOffsets.current.get(listPageKey) || 0;
+                if (offset > 0 || route.screen === "manageCustomers")
+                  requestAnimationFrame(() => {
+                    if (listPageKeyRef.current === listPageKey)
+                      virtualListRef.current?.scrollToOffset({ offset, animated: false });
+                  });
               }}
               onEndReached={() => {
-                if (route.screen === "customers") {
+                if (route.screen === "customers" || route.screen === "manageCustomers") {
                   if (
                     customerScrollStartedForKey.current === listPageKeyRef.current &&
                     customerScrollGate.current.claimPage()

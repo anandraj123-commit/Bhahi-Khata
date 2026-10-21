@@ -2,6 +2,10 @@ import * as Crypto from "expo-crypto";
 
 export type Customer = {
   id: string;
+  /** Mutually exclusive lifecycle flags; old cached records normalize to Active. */
+  status: boolean;
+  disabled: boolean;
+  removed: boolean;
   /** Authoritative server revision; absent for local-only records. */
   serverVersion?: number;
   resolutionVersion?: number;
@@ -49,6 +53,12 @@ export type Audit = {
   date: string;
   before?: Entry;
   after?: Entry;
+  customerLifecycle?: {
+    customerId: string;
+    previousStatus: "active" | "disabled" | "removed";
+    newStatus: "active" | "disabled" | "removed";
+    reason?: string;
+  };
   resolution?: {
     customerName: string;
     transactionId: string;
@@ -382,6 +392,11 @@ export function validBackup(value: unknown): value is Data {
           (Number.isFinite(a.after.amount) &&
             typeof a.after.date === "string" &&
             typeof a.after.note === "string")) &&
+        (!a.customerLifecycle ||
+          (typeof a.customerLifecycle.customerId === "string" &&
+            ["active", "disabled", "removed"].includes(a.customerLifecycle.previousStatus) &&
+            ["active", "disabled", "removed"].includes(a.customerLifecycle.newStatus) &&
+            (a.customerLifecycle.reason === undefined || typeof a.customerLifecycle.reason === "string"))) &&
         (!a.resolution ||
           (typeof a.resolution.customerName === "string" &&
             typeof a.resolution.transactionId === "string" &&

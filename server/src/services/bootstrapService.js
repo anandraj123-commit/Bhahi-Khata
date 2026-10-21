@@ -1,6 +1,6 @@
 import mongoose from "mongoose";
 import { Audit, Customer, Entry, Shop, User } from "../models.js";
-import { auditEntryOut, customerOut, entryOut, shopOut } from "../utils/serializers.js";
+import { auditOut, customerOut, entryOut, shopOut } from "../utils/serializers.js";
 import { phoneLookupVariants } from "../utils/phone.js";
 import { normalizePhone } from "../utils/phone.js";
 import { hasShopScopedData } from "./shopService.js";
@@ -91,13 +91,7 @@ export async function getBootstrap(user, shopId) {
     shopComplete: Boolean(shop.name?.trim() && shop.owner?.trim()),
     customers: customers.map(customerOut),
     entries: entries.map(entryOut),
-    audit: audits.map((item) => ({
-      id: item.clientId,
-      action: item.action,
-      date: item.occurredAt.toISOString(),
-      ...(item.before ? { before: auditEntryOut(item.before) } : {}),
-      ...(item.after ? { after: auditEntryOut(item.after) } : {}),
-    })),
+    audit: audits.map(auditOut),
     signedIn: true,
     language: shop.language || "English",
     reminders: shop.reminders,

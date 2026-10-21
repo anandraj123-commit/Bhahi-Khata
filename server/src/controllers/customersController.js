@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { customerConflictSchema, customerCreateSchema, customerSchema } from "../validators/schemas.js";
+import { customerConflictSchema, customerCreateSchema, customerLifecycleSchema, customerSchema } from "../validators/schemas.js";
 import { customerOut } from "../utils/serializers.js";
 import { digest } from "../utils/hashing.js";
 import { error } from "../utils/http.js";
@@ -9,6 +9,7 @@ import {
   updateCustomer,
   deleteCustomer,
   resolveCustomerConflict,
+  transitionCustomer,
 } from "../services/customersService.js";
 
 export const handle_get_customers = async (req, res, next) => {
@@ -143,6 +144,29 @@ export const handle_post_customer_id_resolve = async (req, res, next) => {
   } catch (e) {
     if (e.status === 409)
       return res.status(409).json({ error: e.message, ...(e.current !== undefined ? { type: "customer_conflict", current: e.current, serverVersion: e.serverVersion || e.current?.serverVersion || 1, resolutionVersion: e.resolutionVersion || e.current?.resolutionVersion || 1 } : {}), ...(e.code ? { code: e.code } : {}), ...(e.audit ? { audit: e.audit } : {}) });
+    next(e);
+  }
+};
+
+export const handle_patch_customer_lifecycle = async (req, res, next) => {
+  const parsed = customerLifecycleSchema.safeParse(req.body || {});
+  if (!parsed.success) return error(res, 400, "Invalid customer status change");
+  try {
+    res.json(await transitionCustomer({
+      shopId: req.shopId,
+      actorId: req.user._id,
+      customerId: req.params.id,
+      ...parsed.data,
+    }));
+  } catch (e) {
+    if (e.status === 404) return res.status(404).json({ error: e.message, code: e.code });
+    if (e.status === 409) return res.status(409).json({
+      error: e.message,
+      code: e.code || "CUSTOMER_STATUS_CONFLICT",
+      ...(e.current !== undefined ? { type: "customer_conflict", current: e.current } : {}),
+      ...(e.serverVersion ? { serverVersion: e.serverVersion } : {}),
+      ...(e.resolutionVersion ? { resolutionVersion: e.resolutionVersion } : {}),
+    });
     next(e);
   }
 };

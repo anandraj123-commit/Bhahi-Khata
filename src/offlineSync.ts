@@ -51,7 +51,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
           error instanceof api.ApiError &&
           error.status === 409 &&
           error.payload?.type === "customer_conflict" &&
-          pending.change.customers.some((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete")
+          pending.change.customers.some((item) => item.operation === "create" || item.operation === "update" || item.operation === "delete" || item.operation === "lifecycle")
         ) {
           await markCustomerConflict(pending.id, pending.change, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
           pending = await readNextChange(accountId);
@@ -74,7 +74,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
           error instanceof api.ApiError &&
           error.status === 409 &&
           error.payload?.type === "transaction_conflict" &&
-          pending.change.entries.some((item) => item.operation === "update" || item.operation === "delete")
+          pending.change.entries.some((item) => item.operation === "update" || item.operation === "delete" || (item.operation === "create" && error.payload?.code === "CUSTOMER_NOT_ACTIVE"))
         ) {
           await markConflict(pending.id, pending.change, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
           pending = await readNextChange(accountId);
@@ -110,7 +110,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
       (await hasFailedChanges(accountId))
     )
       return null;
-    const remote = api.normalizeData(await api.loadAccount());
+    const remote = api.normalizeData(await api.loadAccount("offline_sync"));
     if (await adoptServerDataIfQueueEmpty(accountId, remote)) return remote;
     if (!offlineStorageAvailable()) return remote;
   }
