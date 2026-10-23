@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { env } from "./config/env.js";
 import { log } from "./config/logger.js";
 import routes from "./routes/index.js";
+import adminRouter from "./admin/index.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 
 export function createApp() {
@@ -14,6 +15,7 @@ export function createApp() {
   app.disable("x-powered-by");
   app.set("trust proxy", env.TRUST_PROXY === "true" ? 1 : false);
   app.use(helmet({ contentSecurityPolicy: false }));
+  app.use("/api/v1/admin", adminRouter);
   // Install request logging before parsers/CORS so their failures reach the
   // same redacted request logger. Request bodies are never logged.
   app.use(

@@ -99,3 +99,6 @@ Use your own release signing credentials before publishing. Keep the generated n
 - `docker-compose.yml`: optional local MongoDB replica set and API service.
 
 No test cases or test suites were added or run, as requested.
+
+ * Node.js version: v22.14.0
+ 
