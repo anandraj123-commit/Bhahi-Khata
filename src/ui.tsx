@@ -9,7 +9,10 @@ import {
   TextInput,
   StyleSheet,
   Switch,
+  StyleProp,
+  TextStyle,
   TextInputProps,
+  ViewStyle,
 } from "react-native";
 import Ionicons from "@expo/vector-icons/Ionicons";
 import { LOCALE_BY_ID, LOCALES, localeId } from "./locales";
@@ -36,31 +39,46 @@ export const colors = {
   redBg: "#FEE2E2",
   redBorder: "#FECACA",
 };
+export const spacing = Object.freeze({
+  xsmall: 4,
+  small: 8,
+  medium: 12,
+  large: 16,
+  xlarge: 20,
+  section: 24,
+  page: 32,
+});
 export const Icon = ({
   name,
   color = colors.green,
   size = 22,
+  style,
 }: {
   name: React.ComponentProps<typeof Ionicons>["name"];
   color?: string;
   size?: number;
-}) => <Ionicons name={name} size={size} color={color} />;
+  style?: StyleProp<TextStyle>;
+}) => <Ionicons accessible={false} name={name} size={size} color={color} style={[{ flexShrink: 0 }, style]} />;
 export function Button({
   title,
+  icon,
   onPress,
   secondary = false,
   orange = false,
   danger = false,
   disabled = false,
   loading = false,
+  style,
 }: {
   title: string;
+  icon?: React.ComponentProps<typeof Ionicons>["name"];
   onPress: () => void;
   secondary?: boolean;
   orange?: boolean;
   danger?: boolean;
   disabled?: boolean;
   loading?: boolean;
+  style?: StyleProp<ViewStyle>;
 }) {
   return (
     <Pressable
@@ -74,13 +92,23 @@ export function Button({
         orange && { backgroundColor: colors.orange, borderColor: colors.orange },
         danger && { backgroundColor: colors.red },
         loading && { flexDirection: "row", gap: 8 },
+        style,
         (pressed || disabled || loading) && { opacity: 0.55 },
       ]}
     >
       {loading && <ActivityIndicator size="small" color={secondary && !orange && !danger ? colors.green : "white"} />}
-      <Text style={[s.buttonText, { flexShrink: 1 }, secondary && !orange && !danger && { color: colors.green }]}>
-        {title}
-      </Text>
+      {icon ? (
+        <View style={s.buttonContent}>
+          <Icon name={icon} size={18} color={secondary && !orange && !danger ? colors.green : "white"} />
+          <Text style={[s.buttonText, s.buttonLabel, secondary && !orange && !danger && { color: colors.green }]}>
+            {title}
+          </Text>
+        </View>
+      ) : (
+        <Text style={[s.buttonText, { flexShrink: 1 }, secondary && !orange && !danger && { color: colors.green }]}>
+          {title}
+        </Text>
+      )}
     </Pressable>
   );
 }
@@ -126,24 +154,42 @@ export function Chips({
   value: string;
   onChange: (s: string) => void;
 }) {
+  const filterIcons: Partial<Record<string, { name: React.ComponentProps<typeof Icon>["name"]; color: string }>> = {
+    All: { name: "grid-outline", color: colors.neutral },
+    Udhari: { name: "arrow-up-circle-outline", color: colors.red },
+    Payment: { name: "wallet-outline", color: colors.green },
+    Due: { name: "time-outline", color: colors.orange },
+    Paid: { name: "checkmark-circle-outline", color: colors.green },
+  };
   return (
     <View style={s.chips}>
       {items.map((item) => (
         <Pressable
           key={item}
           accessibilityRole="button"
+          accessibilityLabel={item}
           accessibilityState={{ selected: value === item }}
           onPress={() => onChange(item)}
           style={[s.chip, value === item && s.chipActive]}
         >
-          <Text
-            style={{
-              color: value === item ? "white" : colors.muted,
-              fontWeight: "600",
-            }}
-          >
-            {item}
-          </Text>
+          <View style={s.chipContent}>
+            {filterIcons[item] ? (
+              <Icon
+                name={filterIcons[item]!.name}
+                size={17}
+                color={value === item ? "white" : filterIcons[item]!.color}
+                style={s.chipIcon}
+              />
+            ) : null}
+            <Text
+              style={{
+                color: value === item ? "white" : colors.muted,
+                fontWeight: "600",
+              }}
+            >
+              {item}
+            </Text>
+          </View>
         </Pressable>
       ))}
   </View>
@@ -197,7 +243,7 @@ export function LanguagePicker({
               onChangeText={setQuery}
               placeholder={translate("Search by language name or code", language)}
               placeholderTextColor="#9AA49F"
-              style={{ backgroundColor: "white", borderWidth: 1, borderColor: colors.border, borderRadius: 9, paddingHorizontal: 13, paddingVertical: 11, marginBottom: 10, color: colors.dark }}
+              style={[s.input, { marginBottom: spacing.small }]}
               autoCapitalize="none"
             />
             <FlatList
@@ -209,7 +255,7 @@ export function LanguagePicker({
                   accessibilityRole="button"
                   accessibilityState={{ selected: locale.id === selectedId }}
                   onPress={() => { onChange(locale.id); setOpen(false); }}
-                  style={{ backgroundColor: locale.id === selectedId ? colors.greenBg : "white", borderWidth: 1, borderColor: locale.id === selectedId ? colors.greenBorder : colors.border, borderRadius: 9, padding: 12, marginBottom: 7 }}
+                  style={{ backgroundColor: locale.id === selectedId ? colors.greenBg : "white", borderWidth: 1, borderColor: locale.id === selectedId ? colors.greenBorder : colors.border, borderRadius: 10, minHeight: 56, justifyContent: "center", padding: spacing.medium, marginBottom: spacing.xsmall }}
                 >
                   <Text style={[s.rowTitle, locale.id === selectedId && { color: colors.green }]}>{locale.nativeName}</Text>
                   <Text style={s.small}>{locale.englishName} · {translationCoverage(locale.id)}</Text>
@@ -228,7 +274,7 @@ export function Row({
   subtitle,
   value,
   onPress,
-  icon = "chevron-forward",
+  icon,
   color = colors.dark,
 }: {
   title: string;
@@ -238,6 +284,7 @@ export function Row({
   icon?: React.ComponentProps<typeof Ionicons>["name"];
   color?: string;
 }) {
+  const rowIcon = icon || (onPress ? "chevron-forward" : undefined);
   return (
     <Pressable
       accessibilityRole={onPress ? "button" : undefined}
@@ -250,7 +297,7 @@ export function Row({
         {subtitle && <Text style={s.small}>{subtitle}</Text>}
       </View>
       {value && <Text style={{ color, fontWeight: "700" }}>{value}</Text>}
-      {onPress && <Icon name={icon} color={colors.muted} size={18} />}
+      {rowIcon && <Icon name={rowIcon} color={onPress ? colors.muted : color} size={18} />}
     </Pressable>
   );
 }
@@ -296,13 +343,13 @@ export function Empty({
 }
 export const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  content: { padding: 22, paddingBottom: 36, gap: 16 },
+  content: { paddingHorizontal: spacing.xlarge, paddingTop: spacing.xlarge, paddingBottom: spacing.page + 4, gap: spacing.large },
   header: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 20,
-    paddingVertical: 17,
-    gap: 14,
+    paddingHorizontal: spacing.xlarge,
+    paddingVertical: spacing.large,
+    gap: spacing.medium,
     backgroundColor: "white",
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
@@ -313,8 +360,8 @@ export const s = StyleSheet.create({
     fontSize: 16,
     fontWeight: "700",
     color: colors.dark,
-    marginTop: 7,
-    marginBottom: 3,
+    marginTop: spacing.small,
+    marginBottom: spacing.xsmall,
   },
   hint: { fontSize: 13, color: colors.muted, lineHeight: 21 },
   small: { fontSize: 12, color: colors.muted, marginTop: 5 },
@@ -323,54 +370,62 @@ export const s = StyleSheet.create({
     borderRadius: 14,
     borderWidth: 1,
     borderColor: colors.border,
-    padding: 17,
-    gap: 9,
+    padding: 18,
+    gap: spacing.medium,
   },
   button: {
     backgroundColor: colors.green,
     borderRadius: 9,
-    minHeight: 51,
+    minHeight: 52,
     alignItems: "center",
     justifyContent: "center",
-    padding: 13,
+    paddingHorizontal: spacing.large,
+    paddingVertical: 14,
   },
   secondary: {
     backgroundColor: "white",
     borderWidth: 1,
     borderColor: colors.green,
   },
-  buttonText: { color: "white", fontWeight: "700", fontSize: 15 },
-  field: { gap: 8 },
+  buttonText: { color: "white", fontWeight: "700", fontSize: 15, lineHeight: 20, textAlign: "center" },
+  buttonContent: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, flexShrink: 1, width: "100%", maxWidth: "100%" },
+  buttonLabel: { flexShrink: 1, textAlign: "center" },
+  field: { gap: spacing.small, marginBottom: spacing.xsmall },
   label: { color: colors.dark, fontSize: 13, fontWeight: "600" },
   input: {
     borderWidth: 1,
     borderColor: colors.border,
     backgroundColor: "white",
-    borderRadius: 9,
-    padding: 14,
-    minHeight: 50,
+    borderRadius: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    minHeight: 52,
     color: colors.dark,
     fontSize: 16,
   },
   row: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
-    paddingVertical: 15,
+    gap: spacing.small + 2,
+    paddingVertical: spacing.medium,
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
   },
   rowTitle: { fontSize: 15, color: colors.dark, fontWeight: "600" },
-  chips: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: spacing.small },
+  chipContent: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 },
+  chipIcon: { width: 17, height: 17, flexShrink: 0 },
   chip: {
     backgroundColor: "#EDF1EF",
     borderRadius: 8,
-    paddingHorizontal: 15,
-    paddingVertical: 11,
+    minHeight: 44,
+    justifyContent: "center",
+    paddingHorizontal: spacing.small + 2,
+    paddingVertical: spacing.small + 1,
   },
   chipActive: { backgroundColor: colors.green },
   empty: { padding: 28, alignItems: "center", gap: 10 },
-  split: { flexDirection: "row", gap: 12 },
+  split: { flexDirection: "row", gap: spacing.medium, alignItems: "stretch" },
   amount: { fontSize: 32, fontWeight: "800", color: colors.neutral },
   avatar: {
     width: 44,
@@ -392,8 +447,8 @@ export const s = StyleSheet.create({
     backgroundColor: "white",
     borderTopWidth: 1,
     borderTopColor: colors.border,
-    paddingTop: 10,
-    paddingBottom: 8,
+    paddingTop: spacing.small + 2,
+    paddingBottom: spacing.small,
   },
   navItem: { flex: 1, alignItems: "center", justifyContent: "center", gap: 4 },
   navLabel: { fontSize: 10, color: colors.muted },

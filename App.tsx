@@ -18,6 +18,7 @@ import {
   Pressable,
   ScrollView,
   Share,
+  StyleSheet,
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -253,6 +254,43 @@ const titles: Partial<Record<Screen, string>> = {
 };
 const entryLabel = (type: Entry["type"]) =>
   type === "credit" ? "Udhari Given" : type === "refund" ? "Advance Refund" : "Payment Received";
+
+const customerDetailsStyles = StyleSheet.create({
+  listContent: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 32,
+    gap: 12,
+  },
+  headerContent: { gap: 12 },
+  balanceCard: { padding: 14, gap: 8, borderRadius: 12 },
+  balanceAmount: { fontSize: 27, lineHeight: 34, flexShrink: 1 },
+  statCard: { padding: 12, gap: 6, borderRadius: 12, minWidth: 0 },
+  statValue: { fontSize: 18, lineHeight: 23, flexShrink: 1 },
+  primaryActionGroup: { gap: 12, marginBottom: 4 },
+  actionGroup: { gap: 12, marginTop: 4 },
+  actionButton: {
+    alignSelf: "stretch",
+    width: "100%",
+    minWidth: 0,
+    minHeight: 48,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "transparent",
+  },
+  outlinedActionButton: { borderColor: colors.green },
+  actionRow: { flexDirection: "row", gap: 12, alignItems: "stretch" },
+  financialRow: { flexDirection: "row", gap: 12, alignItems: "stretch" },
+  transactionCard: { padding: 12, gap: 8, borderRadius: 12 },
+  transactionAvatar: { width: 36, height: 36, borderRadius: 18 },
+  transactionHeading: { marginTop: 8 },
+  statLabelRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  summaryIcon: { width: 18, height: 18, flexShrink: 0 },
+  balanceLabelRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  transactionTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+});
 
 async function scheduleSubscriptionNotifications(
   snapshot: SubscriptionSnapshot,
@@ -1920,31 +1958,40 @@ function AppContent() {
       </Card>
     );
   };
-  const stat = (label: string, value: string, tone: FinancialTone = "neutral") => {
+  const stat = (label: string, value: string, tone: FinancialTone = "neutral", compact = false, icon?: React.ComponentProps<typeof Icon>["name"]) => {
     const palette = financialPalette[tone];
     return (
-      <Card style={{ flex: 1, backgroundColor: palette.background, borderColor: palette.border }}>
-        <Text style={s.statLabel}>{label}</Text>
-        <Text style={[s.stat, { color: palette.text }]}>{value}</Text>
+      <Card style={[{ flex: 1, backgroundColor: palette.background, borderColor: palette.border }, compact && customerDetailsStyles.statCard]}>
+        {icon ? (
+          <View style={customerDetailsStyles.statLabelRow}>
+            <Icon name={icon} color={palette.text} size={18} style={customerDetailsStyles.summaryIcon} />
+            <Text style={[s.statLabel, { flex: 1 }]}>{label}</Text>
+          </View>
+        ) : <Text style={s.statLabel}>{label}</Text>}
+        <Text style={[s.stat, { color: palette.text }, compact && customerDetailsStyles.statValue]}>{value}</Text>
       </Card>
     );
   };
-  const actions = (id?: string) => (
-    id && !isActiveCustomer(data.customers.find((item) => item.id === id) || {}) ? null :
-    <>
-      <View style={s.split}>
-        <View style={{ flex: 1 }}>
-          <Button title="+ Give Udhari" danger onPress={() => go("credit", id)} />
+  const actions = (id?: string, compact = false) => {
+    if (id && !isActiveCustomer(data.customers.find((item) => item.id === id) || {})) return null;
+    const buttonStyle = compact ? customerDetailsStyles.actionButton : undefined;
+    const actionContent = (
+      <>
+        <View style={compact ? customerDetailsStyles.actionRow : s.split}>
+          <View style={{ flex: 1 }}>
+            <Button style={buttonStyle} icon="arrow-up-outline" title="+ Give Udhari" danger onPress={() => go("credit", id)} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Button style={buttonStyle} icon="arrow-down-outline" title="Receive Money / Add Advance" onPress={() => go("payment", id)} />
+          </View>
         </View>
-        <View style={{ flex: 1 }}>
-          <Button title="Receive Money / Add Advance" onPress={() => go("payment", id)} />
-        </View>
-      </View>
-      {id && balance(data, id) < 0 && (
-        <Button title="Refund Advance (एडवांस वापस करें)" orange onPress={() => go("refund", id)} />
-      )}
-    </>
-  );
+        {id && balance(data, id) < 0 && (
+          <Button style={buttonStyle} icon="refresh-outline" title="Refund Advance (एडवांस वापस करें)" orange onPress={() => go("refund", id)} />
+        )}
+      </>
+    );
+    return compact ? <View style={customerDetailsStyles.primaryActionGroup}>{actionContent}</View> : actionContent;
+  };
   const customerRow = (c: Customer) => {
     const signedBalance = balance(data, c.id);
     const { tone, label } = customerBalanceDisplay(signedBalance, money);
@@ -1997,42 +2044,44 @@ function AppContent() {
         </View>
         <Text style={{ color: financialPalette[tone].text, fontWeight: "700", marginTop: 8 }}>{label}</Text>
         <View style={[s.split, { marginTop: 8 }]}>
-          <View style={{ flex: 1 }}><Button title="View Customer" secondary onPress={() => go("customer", c.id)} /></View>
-          <View style={{ flex: 1 }}><Button title="Statement" secondary onPress={() => go("statement", c.id)} /></View>
+          <View style={{ flex: 1 }}><Button icon="person-outline" title="View Customer" secondary onPress={() => go("customer", c.id)} /></View>
+          <View style={{ flex: 1 }}><Button icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", c.id)} /></View>
         </View>
         {state === "active" ? (
           <>
             <View style={s.split}>
-              <View style={{ flex: 1 }}><Button title="Edit Customer" disabled={Boolean(saving)} secondary onPress={() => go("customerForm", c.id)} /></View>
-              <View style={{ flex: 1 }}><Button title="Disable Customer" loading={saving === "disabled"} disabled={Boolean(saving)} secondary onPress={() => changeCustomerLifecycle(c, "disabled")} /></View>
+              <View style={{ flex: 1 }}><Button icon="create-outline" title="Edit Customer" disabled={Boolean(saving)} secondary onPress={() => go("customerForm", c.id)} /></View>
+              <View style={{ flex: 1 }}><Button icon="person-remove-outline" title="Disable Customer" loading={saving === "disabled"} disabled={Boolean(saving)} secondary onPress={() => changeCustomerLifecycle(c, "disabled")} /></View>
             </View>
-            <Button title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} />
+            <Button icon="trash-outline" title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} />
           </>
         ) : state === "disabled" ? (
           <View style={s.split}>
-            <View style={{ flex: 1 }}><Button title="Enable Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} /></View>
-            <View style={{ flex: 1 }}><Button title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} /></View>
+            <View style={{ flex: 1 }}><Button icon="person-add-outline" title="Enable Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} /></View>
+            <View style={{ flex: 1 }}><Button icon="trash-outline" title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} /></View>
           </View>
         ) : (
-          <Button title="Restore Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} />
+          <Button icon="refresh-outline" title="Restore Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} />
         )}
       </Card>
     );
   };
-  const entryRow = (e: Entry) => (
+  const entryRow = (e: Entry, compact = false) => (
     <Pressable
       key={e.id}
       accessibilityRole="button"
       onPress={() => go("transaction", e.id)}
     >
-      <Card>
+      <Card style={compact ? customerDetailsStyles.transactionCard : undefined}>
         <View style={[s.split, { alignItems: "center" }]}>
-          <View style={s.avatar}>
+          <View style={compact ? [s.avatar, customerDetailsStyles.transactionAvatar] : s.avatar}>
             <Icon
               name={
                 e.type === "credit"
-                  ? "bag-handle-outline"
-                  : "arrow-down-outline"
+                  ? "arrow-up-outline"
+                  : e.type === "refund"
+                    ? "refresh-outline"
+                    : "arrow-down-outline"
               }
               size={20}
             />
@@ -2591,8 +2640,9 @@ function AppContent() {
             <Hint>Udhari ka hisaab, ab aur bhi aasan</Hint>
           </Card>
           <LanguagePicker value={data.language} onChange={selectLanguage} />
-          <Button title="Login" onPress={() => go("login")} />
+          <Button icon="log-in-outline" title="Login" onPress={() => go("login")} />
           <Button
+            icon="person-add-outline"
             title="Create Account"
             secondary
             onPress={() => go("login")}
@@ -2617,6 +2667,7 @@ function AppContent() {
             placeholder="98XXXXXXXX"
           />
           <Button
+            icon="arrow-forward-outline"
             title="Continue"
             disabled={busy}
             onPress={async () => {
@@ -2701,6 +2752,7 @@ function AppContent() {
             </Text>
           </Pressable>
           <Button
+            icon={otpVerified ? "arrow-forward-outline" : "shield-checkmark-outline"}
             title={otpVerified ? "Continue" : "Verify"}
             disabled={busy}
             onPress={async () => {
@@ -2762,6 +2814,7 @@ function AppContent() {
             }}
           />
           <Button
+            icon="call-outline"
             title="Change mobile number"
             secondary
             onPress={() => { setOtpVerified(false); go("login"); }}
@@ -2788,6 +2841,7 @@ function AppContent() {
           <Title>Language</Title>
           <LanguagePicker value={data.language} onChange={selectLanguage} />
           <Button
+            icon="checkmark-outline"
             title={data.shopExists !== false ? "Save Profile" : "Start Using Khata"}
             disabled={busy}
             onPress={() => {
@@ -2849,20 +2903,20 @@ function AppContent() {
             </Pressable>
           </View>
           <View style={s.split}>
-            {stat("Current Outstanding", money(financial.outstandingPaise / 100), financial.outstandingPaise > 0 ? "red" : "neutral")}
-            {stat("Total Udhari", money(financial.totalUdhariPaise / 100), "blue")}
+            {stat("Current Outstanding", money(financial.outstandingPaise / 100), financial.outstandingPaise > 0 ? "red" : "neutral", true, "wallet-outline")}
+            {stat("Total Udhari", money(financial.totalUdhariPaise / 100), "blue", true, "arrow-up-circle-outline")}
           </View>
           <View style={s.split}>
-            {stat("Total Money Received", money(financial.totalReceivedPaise / 100), "green")}
-            {stat("Udhari Recovered", money(financial.totalUdhariRecoveredPaise / 100), "green")}
+            {stat("Total Money Received", money(financial.totalReceivedPaise / 100), "green", true, "arrow-down-circle-outline")}
+            {stat("Udhari Recovered", money(financial.totalUdhariRecoveredPaise / 100), "green", true, "checkmark-circle-outline")}
           </View>
           <View style={s.split}>
-            {stat("Available Advances", money(financial.availableAdvancePaise / 100), financial.availableAdvancePaise > 0 ? "green" : "neutral")}
-            {stat("Advance Deposited", money(financial.totalAdvanceDepositedPaise / 100), "blue")}
+            {stat("Available Advances", money(financial.availableAdvancePaise / 100), financial.availableAdvancePaise > 0 ? "green" : "neutral", true, "wallet-outline")}
+            {stat("Advance Deposited", money(financial.totalAdvanceDepositedPaise / 100), "blue", true, "cash-outline")}
           </View>
           <View style={s.split}>
-            {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100), "amber")}
-            {stat("Customers", String(data.customers.filter(isActiveCustomer).length))}
+            {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100), "amber", true, "return-down-back-outline")}
+            {stat("Customers", String(data.customers.filter(isActiveCustomer).length), "neutral", true, "people-outline")}
           </View>
           <Hint>Current outstanding and advances are balances. The other totals show recorded activity.</Hint>
           {actions()}
@@ -2871,32 +2925,43 @@ function AppContent() {
               "This month’s udhari",
               money(periodUdhari(data, today().slice(0, 7))),
               "blue",
+              true,
+              "arrow-up-outline",
             )}
             {stat(
               "This month’s collection",
               money(periodReceived(data, today().slice(0, 7))),
               "green",
+              true,
+              "arrow-down-outline",
             )}
           </View>
-          <Title>Recent Transactions</Title>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <Icon name="time-outline" size={18} color={colors.dark} style={{ width: 18, height: 18, flexShrink: 0 }} />
+            <Title>Recent Transactions</Title>
+          </View>
           {data.entries.length ? (
             data.entries
               .slice()
               .sort((a, b) => b.date.localeCompare(a.date))
               .slice(0, 4)
-              .map(entryRow)
+              .map((entry) => entryRow(entry))
           ) : (
             <Empty
               title="Your khata starts here"
               description="Add your first customer, then record udhari or a payment."
             />
           )}
-          <Title>Customers With Pending Balance</Title>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <Icon name="people-outline" size={18} color={colors.dark} style={{ width: 18, height: 18, flexShrink: 0 }} />
+            <Title>Customers With Pending Balance</Title>
+          </View>
           {data.customers
             .filter((c) => isActiveCustomer(c) && balance(data, c.id) > 0)
             .slice(0, 4)
             .map(customerRow)}
           <Button
+            icon="person-add-outline"
             title="+ Add Customer"
             secondary
             onPress={() => go("customerForm")}
@@ -2926,7 +2991,7 @@ function AppContent() {
         </>,
         footer: <>
           {listFooter(page.hasMore, "Loading more customers...")}
-          <Button title="+ Add Customer" onPress={() => go("customerForm")} />
+          <Button icon="person-add-outline" title="+ Add Customer" onPress={() => go("customerForm")} />
         </>,
         empty: !list.length ? <Empty title="No customers found" description="Add a customer or try a different search." /> : null,
       };
@@ -2997,6 +3062,7 @@ function AppContent() {
             disabled={!!route.id && !isActiveCustomer(customer || {})}
           />
           <Button
+            icon="checkmark-outline"
             title="Save Customer"
             disabled={busy || (!!route.id && !isActiveCustomer(customer || {}))}
             onPress={saveCustomer}
@@ -3012,12 +3078,12 @@ function AppContent() {
           .sort((a, b) => b.date.localeCompare(a.date));
         const historyItems: { id: string; element: React.ReactElement }[] = [];
         if (customer.opening > 0)
-          historyItems.push({ id: "opening-udhari", element: <Row title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.opening))} color={colors.red} /> });
+          historyItems.push({ id: "opening-udhari", element: <Row icon="book-outline" title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.opening))} color={colors.red} /> });
         if ((customer.openingAdvance || 0) > 0)
-          historyItems.push({ id: "opening-advance", element: <Row title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} /> });
+          historyItems.push({ id: "opening-advance", element: <Row icon="wallet-outline" title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} /> });
         if (customer.opening > 0 && (customer.openingAdvance || 0) > 0)
-          historyItems.push({ id: "opening-adjustment", element: <Row title="Opening Advance Adjusted Against Udhari" subtitle={t("Remaining advance: {{amount}}", data.language, { amount: money(Math.max(0, customer.openingAdvance! - customer.opening)) })} value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} /> });
-        historyItems.push(...entries.map((entry) => ({ id: entry.id, element: entryRow(entry) })));
+          historyItems.push({ id: "opening-adjustment", element: <Row icon="swap-horizontal-outline" title="Opening Advance Adjusted Against Udhari" subtitle={t("Remaining advance: {{amount}}", data.language, { amount: money(Math.max(0, customer.openingAdvance! - customer.opening)) })} value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} /> });
+        historyItems.push(...entries.map((entry) => ({ id: entry.id, element: entryRow(entry, true) })));
         const transactionPage = pageRecords(historyItems);
         const customerFinancial = financialSummary(data, customer.id);
         const currentOutstandingPaise = customerFinancial.outstandingPaise;
@@ -3026,64 +3092,70 @@ function AppContent() {
           data: transactionPage.items,
           keyExtractor: (item) => item.id,
           renderItem: (item) => item.element,
-          header: <>
+          header: <View style={customerDetailsStyles.headerContent}>
             <Hint>
               {customer.phone || "No phone number"} •{" "}
               {customer.address || "No address"}
             </Hint>
-            <Card style={{ backgroundColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].background, borderColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].border }}>
-              <Hint style={{ color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }}>Current Outstanding</Hint>
-              <Text style={[s.amount, { color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }]}>{money(currentOutstandingPaise / 100)}</Text>
+            <Card style={[customerDetailsStyles.balanceCard, { backgroundColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].background, borderColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].border }]}>
+              <View style={customerDetailsStyles.balanceLabelRow}>
+                <Icon name="wallet-outline" size={18} style={customerDetailsStyles.summaryIcon} color={financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text} />
+                <Hint style={{ color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }}>Current Outstanding</Hint>
+              </View>
+              <Text style={[s.amount, customerDetailsStyles.balanceAmount, { color: financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text }]}>{money(currentOutstandingPaise / 100)}</Text>
               <Hint style={{ color: financialPalette[availableAdvancePaise > 0 ? "green" : "neutral"].text }}>Available Advance: {money(availableAdvancePaise / 100)}</Hint>
             </Card>
-            {customerLifecycleState(customer) === "active" ? actions(customer.id) : (
+            {customerLifecycleState(customer) === "active" ? actions(customer.id, true) : (
               <View style={[s.badge, { backgroundColor: customerLifecycleState(customer) === "removed" ? colors.redBg : colors.neutralBg }]}>
                 <Text style={{ color: customerLifecycleState(customer) === "removed" ? colors.red : colors.neutral, fontWeight: "700" }}>{t(customerLifecycleState(customer) === "removed" ? "Removed" : "Disabled", data.language)}</Text>
               </View>
             )}
-            <View style={s.split}>
+            <View style={customerDetailsStyles.financialRow}>
               {stat(
                 "Total Udhari",
                 money(totalUdhari(data, customer.id)),
                 "blue",
+                true,
+                "arrow-up-circle-outline",
               )}
               {stat(
                 "Total Money Received",
                 money(customerFinancial.totalReceivedPaise / 100),
                 "green",
+                true,
+                "arrow-down-circle-outline",
               )}
             </View>
-            <View style={s.split}>
-              {stat("Udhari Recovered", money(customerFinancial.totalUdhariRecoveredPaise / 100), "green")}
-              {stat("Advance Deposited", money(customerFinancial.totalAdvanceDepositedPaise / 100), "blue")}
+            <View style={customerDetailsStyles.financialRow}>
+              {stat("Udhari Recovered", money(customerFinancial.totalUdhariRecoveredPaise / 100), "green", true, "checkmark-circle-outline")}
+              {stat("Advance Deposited", money(customerFinancial.totalAdvanceDepositedPaise / 100), "blue", true, "cash-outline")}
             </View>
-            <View style={s.split}>
-              {stat("Advance Refunded", money(customerFinancial.totalAdvanceRefundedPaise / 100), "amber")}
-              {stat("Available Advance", money(availableAdvancePaise / 100), availableAdvancePaise > 0 ? "green" : "neutral")}
+            <View style={customerDetailsStyles.financialRow}>
+              {stat("Advance Refunded", money(customerFinancial.totalAdvanceRefundedPaise / 100), "amber", true, "return-down-back-outline")}
+              {stat("Available Advance", money(availableAdvancePaise / 100), availableAdvancePaise > 0 ? "green" : "neutral", true, "wallet-outline")}
             </View>
-            <View style={s.split}>
-              {customerLifecycleState(customer) === "active" ? <View style={{ flex: 1 }}>
-                <Button
-                  title="View Customer"
-                  secondary
-                  onPress={() => go("viewCustomer", customer.id)}
-                />
-              </View> : null}
-            </View>
-            <View style={s.split}>
-              <View style={{ flex: 1 }}>
-                <Button
-                  title="Statement"
-                  secondary
-                  onPress={() => go("statement", customer.id)}
-                />
+            <View style={customerDetailsStyles.actionGroup}>
+              <View style={customerDetailsStyles.actionRow}>
+                {customerLifecycleState(customer) === "active" ? <View style={{ flex: 1 }}>
+                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.outlinedActionButton]} icon="person-outline" title="View Customer" secondary onPress={() => go("viewCustomer", customer.id)} />
+                </View> : null}
+                <View style={{ flex: 1 }}>
+                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.outlinedActionButton]} icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", customer.id)} />
+                </View>
               </View>
-              {customerLifecycleState(customer) === "active" ? <View style={{ flex: 1 }}>
-                <Button title="Edit Customer" secondary onPress={() => go("customerForm", customer.id)} />
+              {customerLifecycleState(customer) === "active" ? <View style={customerDetailsStyles.actionRow}>
+                <View style={{ flex: 1 }}>
+                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.outlinedActionButton]} icon="create-outline" title="Edit Customer" secondary onPress={() => go("customerForm", customer.id)} />
+                </View>
               </View> : null}
             </View>
-            <Title>Transaction History</Title>
-          </>,
+            <View style={customerDetailsStyles.transactionHeading}>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="time-outline" size={18} style={customerDetailsStyles.summaryIcon} color={colors.dark} />
+                <Title>Transaction History</Title>
+              </View>
+            </View>
+          </View>,
           footer: listFooter(transactionPage.hasMore),
           empty: !historyItems.length ? <Empty title="No transactions yet" description="Opening outstanding is included in the outstanding amount." /> : null,
         };
@@ -3098,24 +3170,25 @@ function AppContent() {
           <>
             <Title>Personal Information</Title>
             <Card>
-              <Row title="Customer Name" value={customer.name} />
-              <Row title="Mobile Number" value={customer.phone || "Not provided"} />
+              <Row icon="person-outline" title="Customer Name" value={customer.name} />
+              <Row icon="call-outline" title="Mobile Number" value={customer.phone || "Not provided"} />
               <View style={s.row}>
+                <Icon name="location-outline" color={colors.muted} size={18} />
                 <View style={{ flex: 1 }}>
                   <Text style={s.rowTitle}>Address</Text>
                   <Text style={s.small}>{customer.address || "Not provided"}</Text>
                 </View>
               </View>
-              <Row title="Created On" value={formatCustomerCreatedOn(customer.createdAt)} />
+              <Row icon="calendar-outline" title="Created On" value={formatCustomerCreatedOn(customer.createdAt)} />
               <Row title="Credit Limit" value={money(Math.abs(customer.limit || 0))} />
               <Row title="Reminders" value={customer.reminder ? "Allowed" : "Off"} />
             </Card>
             <Title>Financial Information</Title>
             <Card>
-              <Row title="Opening Udhari" value={money(Math.abs(customer.opening))} color={colors.red} />
-              <Row title="Opening Advance" value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} />
-              <Row title="Current Outstanding" value={money(customerFinancial.outstandingPaise / 100)} color={financialPalette[outstandingTone].text} />
-              <Row title="Available Advance" value={money(customerFinancial.availableAdvancePaise / 100)} color={financialPalette[advanceTone].text} />
+              <Row icon="arrow-up-outline" title="Opening Udhari" value={money(Math.abs(customer.opening))} color={colors.red} />
+              <Row icon="wallet-outline" title="Opening Advance" value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} />
+              <Row icon="wallet-outline" title="Current Outstanding" value={money(customerFinancial.outstandingPaise / 100)} color={financialPalette[outstandingTone].text} />
+              <Row icon="wallet-outline" title="Available Advance" value={money(customerFinancial.availableAdvancePaise / 100)} color={financialPalette[advanceTone].text} />
             </Card>
           </>
         );
@@ -3287,6 +3360,7 @@ function AppContent() {
                 multiline: true,
               })}
               <Button
+                icon={route.screen === "editTransaction" ? "checkmark-outline" : route.screen === "credit" ? "arrow-up-outline" : route.screen === "refund" ? "refresh-outline" : "arrow-down-outline"}
                 title={
                   route.screen === "editTransaction"
                     ? "Save Changes"
@@ -3301,6 +3375,7 @@ function AppContent() {
               />
               {route.screen === "editTransaction" && entry && (
                 <Button
+                  icon="trash-outline"
                   title="Delete Transaction"
                   danger
                   onPress={() => deleteEntry(entry)}
@@ -3325,14 +3400,17 @@ function AppContent() {
               <Title>
                 {data.customers.find((c) => c.id === entry.customerId)?.name}
               </Title>
-              <Hint>{entry.date}</Hint>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="calendar-outline" size={16} color={colors.muted} />
+                <Hint>{entry.date}</Hint>
+              </View>
             </Card>
             <Title>Description</Title>
             <Text style={s.rowTitle}>{entry.note || "No description"}</Text>
             {entry.type !== "credit" && (
-              <Row title="Payment Method" value={entry.method} />
+              <Row icon="card-outline" title="Payment Method" value={entry.method} />
             )}
-            {entry.reference ? <Row title="Reference" value={entry.reference} /> : null}
+            {entry.reference ? <Row icon="pricetag-outline" title="Reference" value={entry.reference} /> : null}
             {entry.type === "payment" && entry.appliedToUdhari !== undefined && (
               <>
                 <Row title="Adjusted Against Udhari" value={money(entry.appliedToUdhari)} />
@@ -3343,10 +3421,11 @@ function AppContent() {
               <Row title="Adjusted From Advance" value={money(entry.advanceApplied || 0)} />
             )}
             {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button
+              icon="create-outline"
               title="Edit"
               onPress={() => go("editTransaction", entry.id)}
             /> : <Hint>{t("Historical transactions are read-only.", data.language)}</Hint>}
-            {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button title="Delete" danger onPress={() => deleteEntry(entry)} /> : null}
+            {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button icon="trash-outline" title="Delete" danger onPress={() => deleteEntry(entry)} /> : null}
           </>
         );
       }
@@ -3451,10 +3530,12 @@ function AppContent() {
               </Hint>
             </Card>
             <Button
+              icon="logo-whatsapp"
               title="WhatsApp / SMS Share"
               onPress={() => go("share", customer.id)}
             />
             <Button
+              icon="share-outline"
               title="Share Statement"
               secondary
               onPress={() => {
@@ -3576,7 +3657,10 @@ function AppContent() {
             )}
           </View>
           <Card>
-            <Title>6-Month Udhari Trend</Title>
+            <View style={customerDetailsStyles.transactionTitleRow}>
+              <Icon name="bar-chart-outline" size={18} color={colors.dark} />
+              <Title>6-Month Udhari Trend</Title>
+            </View>
             <View
               style={{
                 height: 180,
@@ -3606,7 +3690,10 @@ function AppContent() {
             </View>
           </Card>
           <Card>
-            <Title>Customer Balance Distribution</Title>
+            <View style={customerDetailsStyles.transactionTitleRow}>
+              <Icon name="pie-chart-outline" size={18} color={colors.dark} />
+              <Title>Customer Balance Distribution</Title>
+            </View>
             <Row
               title="Paid / Credit balance"
               value={String(
@@ -3650,6 +3737,7 @@ function AppContent() {
             <Row
               key={screen}
               title={titles[screen] || screen}
+              icon={screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "notifications" ? "notifications-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
               onPress={() => go(screen)}
             />
           ))}
@@ -3668,18 +3756,21 @@ function AppContent() {
           <Text style={[s.heading, { textAlign: "center" }]}>
             {data.shop.name}
           </Text>
-          <Row title="Owner" value={data.shop.owner} />
-          <Row title="Phone" value={data.shop.phone} />
-          <Row title="WhatsApp" value={data.shop.whatsapp || "Not added"} />
-          <Row title="Address" value={data.shop.address || "Not added"} />
-          <Button title="Edit Profile" onPress={() => go("setup")} />
+          <Row icon="person-outline" title="Owner" value={data.shop.owner} />
+          <Row icon="call-outline" title="Phone" value={data.shop.phone} />
+          <Row icon="chatbubble-outline" title="WhatsApp" value={data.shop.whatsapp || "Not added"} />
+          <Row icon="location-outline" title="Address" value={data.shop.address || "Not added"} />
+          <Button icon="create-outline" title="Edit Profile" onPress={() => go("setup")} />
         </>
       );
       break;
     case "settings":
       content = (
         <>
-          <Title>NETWORK</Title>
+          <View style={customerDetailsStyles.transactionTitleRow}>
+            <Icon name={connectivityStatus === "online" ? "wifi-outline" : connectivityStatus === "checking" ? "sync-outline" : "cloud-offline-outline"} size={18} color={connectivityStatus === "online" ? colors.green : colors.muted} />
+            <Title>NETWORK</Title>
+          </View>
           <Hint>
             {connectivityStatus === "online"
               ? "Online — Digital-Khata server is reachable."
@@ -3694,7 +3785,10 @@ function AppContent() {
               {`Network: ${currentConnectivityDetails().networkType}; internet: ${currentConnectivityDetails().internetReachable === null ? "unknown" : currentConnectivityDetails().internetReachable ? "available" : "unavailable"}; API: ${currentConnectivityDetails().backendReachable ? "reachable" : currentConnectivityDetails().backendReachable === false ? "unreachable" : "not checked"}.`}
             </Hint>
           )}
-          <Title>SYNC STATUS</Title>
+          <View style={customerDetailsStyles.transactionTitleRow}>
+            <Icon name={!syncStatus ? "help-circle-outline" : syncStatus.pending ? "time-outline" : syncStatus.failed || syncStatus.conflicts || syncStatus.mobileConflicts ? "alert-circle-outline" : "cloud-done-outline"} size={18} color={!syncStatus ? colors.muted : syncStatus.failed || syncStatus.conflicts || syncStatus.mobileConflicts ? colors.orange : colors.green} />
+            <Title>SYNC STATUS</Title>
+          </View>
           {!syncStatus ? (
             <Hint>Sync status is unavailable in this app build.</Hint>
           ) : syncStatus.failed ? (
@@ -3725,14 +3819,16 @@ function AppContent() {
           )}
           {!!syncStatus?.failed && (
             <Button
+              icon="refresh-outline"
               title="Retry failed sync"
               onPress={() => void retryFailedSync()}
               disabled={busy}
             />
           )}
           <Title>ACCOUNT</Title>
-          <Row title="Mobile Number" value={data.shop.phone} />
+          <Row icon="phone-portrait-outline" title="Mobile Number" value={data.shop.phone} />
           <Row
+            icon="lock-closed-outline"
             title="Change PIN"
             onPress={() =>
               Alert.alert(
@@ -3741,12 +3837,12 @@ function AppContent() {
               )
             }
           />
-          <Row title="Logout / Account actions" onPress={() => go("account")} />
+          <Row icon="log-out-outline" title="Logout / Account actions" onPress={() => go("account")} />
           <Hint>
             Sign-in and account data are connected to the Digital Khata server.
           </Hint>
           <Title>KHATA</Title>
-          <Row title="Reminder Settings" onPress={() => go("reminders")} />
+          <Row icon="notifications-outline" title="Reminder Settings" onPress={() => go("reminders")} />
           <Title>Default payment method</Title>
           <Chips
             items={["Cash", "UPI", "Bank", "Other"]}
@@ -3754,9 +3850,9 @@ function AppContent() {
             onChange={(v) => commit({ ...data, defaultMethod: v })}
           />
           <Title>DATA</Title>
-          <Row title="Export data (CSV)" onPress={() => exportData(false)} />
-          <Row title="Save backup (JSON)" onPress={() => exportData(true)} />
-          <Row title="Restore backup" onPress={restore} />
+          <Row icon="download-outline" title="Export data (CSV)" onPress={() => exportData(false)} />
+          <Row icon="save-outline" title="Save backup (JSON)" onPress={() => exportData(true)} />
+          <Row icon="refresh-outline" title="Restore backup" onPress={restore} />
           <Title>LANGUAGE</Title>
           <LanguagePicker value={data.language} onChange={selectLanguage} />
           <Hint>Your account data syncs with the server. Export backups regularly.</Hint>
@@ -3912,16 +4008,16 @@ function AppContent() {
           {current && (
             <Card>
               <Title>Current Subscription</Title>
-              <Row title="Plan" value={current.plan.name} />
-              <Row title="Status" value={t("Active", data.language)} />
-              <Row title="Start date" value={current.startsAt ? new Date(current.startsAt).toLocaleDateString("en-IN") : "—"} />
-              <Row title="Expiry" value={current.expiresAt ? new Date(current.expiresAt).toLocaleDateString("en-IN") : t("Never", data.language)} />
-              <Row title="Time remaining" value={remainingText} />
-              <Row title="Customer limit" value={current.customerUsage.unlimited ? t("Unlimited", data.language) : String(current.customerUsage.limit ?? 0)} />
-              <Row title="Customers used" value={String(current.customerUsage.used)} />
-              {!current.customerUsage.unlimited && <Row title="Customer capacity left" value={String(current.customerUsage.remaining ?? 0)} />}
-              {current.durationMonths > 0 && <Row title="Duration" value={t("{{count}} months", data.language, { count: current.durationMonths })} />}
-              {current.amountPaidMinor !== null && <Row title="Amount paid" value={asRupees(current.amountPaidMinor)} />}
+              <Row icon="ribbon-outline" title="Plan" value={current.plan.name} />
+              <Row icon="checkmark-circle-outline" title="Status" value={t("Active", data.language)} />
+              <Row icon="calendar-outline" title="Start date" value={current.startsAt ? new Date(current.startsAt).toLocaleDateString("en-IN") : "—"} />
+              <Row icon="calendar-outline" title="Expiry" value={current.expiresAt ? new Date(current.expiresAt).toLocaleDateString("en-IN") : t("Never", data.language)} />
+              <Row icon="time-outline" title="Time remaining" value={remainingText} />
+              <Row icon="people-outline" title="Customer limit" value={current.customerUsage.unlimited ? t("Unlimited", data.language) : String(current.customerUsage.limit ?? 0)} />
+              <Row icon="people-outline" title="Customers used" value={String(current.customerUsage.used)} />
+              {!current.customerUsage.unlimited && <Row icon="people-outline" title="Customer capacity left" value={String(current.customerUsage.remaining ?? 0)} />}
+              {current.durationMonths > 0 && <Row icon="calendar-outline" title="Duration" value={t("{{count}} months", data.language, { count: current.durationMonths })} />}
+              {current.amountPaidMinor !== null && <Row icon="card-outline" title="Amount paid" value={asRupees(current.amountPaidMinor)} />}
               {current.scheduled && (
                 <>
                   <Title>Next Scheduled Plan</Title>
@@ -3973,7 +4069,10 @@ function AppContent() {
             <Pressable key={item.code} onPress={() => { setPlan(item.name); setSubscriptionDuration(String(item.durations[0]?.months ?? 1)); }}>
               <Card style={{ borderColor: plan === item.name || plan.toLowerCase() === item.code ? colors.green : colors.border, borderWidth: plan === item.name || plan.toLowerCase() === item.code ? 2 : 1 }}>
                 <View style={s.split}>
-                  <Text style={[s.heading, { fontSize: 20 }]}>{item.name}</Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flex: 1 }}>
+                    <Icon name={item.code === "free" ? "gift-outline" : item.code === "pro" ? "ribbon-outline" : "business-outline"} color={colors.green} size={22} />
+                    <Text style={[s.heading, { fontSize: 20 }]}>{item.name}</Text>
+                  </View>
                   <Text style={s.stat}>{asRupees(item.monthlyPriceMinor)}{item.monthlyPriceMinor ? "/mo" : ""}</Text>
                 </View>
                 {item.description ? <Hint>{item.description}</Hint> : null}
@@ -3987,27 +4086,31 @@ function AppContent() {
           ))}
           {selected && selected.code !== "free" && (
             <Card>
-              <Title>Subscription duration</Title>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="calendar-outline" size={18} color={colors.dark} />
+                <Title>Subscription duration</Title>
+              </View>
               <Chips items={selected.durations.map((item) => t("{{count}} months", data.language, { count: item.months }))} value={t("{{count}} months", data.language, { count: price?.months ?? duration })} onChange={(value) => setSubscriptionDuration(value.split(" ")[0])} />
               {price && (
                 <>
                   {price.discountPercent > 0 && <Hint>{t("Save {{discountPercent}}% for {{months}} months", data.language, { discountPercent: price.discountPercent, months: price.months })}</Hint>}
-                  <Row title="Base price" value={asRupees(price.basePriceMinor)} />
-                  <Row title={t("Discount ({{percent}}%)", data.language, { percent: price.discountPercent })} value={`−${asRupees(price.discountAmountMinor)}`} />
-                  <Row title="Subtotal" value={asRupees(price.taxableAmountMinor)} />
-                  <Row title={t("Tax ({{rate}}%)", data.language, { rate: (price.taxPercent).toFixed(2) })} value={`+${asRupees(price.taxAmountMinor)}`} />
-                  <Row title="Final payable" value={asRupees(price.finalAmountMinor)} />
+                  <Row icon="cash-outline" title="Base price" value={asRupees(price.basePriceMinor)} />
+                  <Row icon="pricetag-outline" title={t("Discount ({{percent}}%)", data.language, { percent: price.discountPercent })} value={`−${asRupees(price.discountAmountMinor)}`} />
+                  <Row icon="wallet-outline" title="Subtotal" value={asRupees(price.taxableAmountMinor)} />
+                  <Row icon="receipt-outline" title={t("Tax ({{rate}}%)", data.language, { rate: (price.taxPercent).toFixed(2) })} value={`+${asRupees(price.taxAmountMinor)}`} />
+                  <Row icon="card-outline" title="Final payable" value={asRupees(price.finalAmountMinor)} />
                 </>
               )}
             </Card>
           )}
           <Button
+            icon="card-outline"
             title={subscriptionPaymentLoading ? "Contacting Cashfree…" : `Pay securely with Cashfree${price ? ` • ${asRupees(price.finalAmountMinor)}` : ""}`}
             loading={subscriptionPaymentLoading}
             disabled={!subscriptionSnapshot?.checkoutEnabled || !selected || selected.code === "free" || !price}
             onPress={() => void purchaseSubscription()}
           />
-          <Button title="Payment History" secondary onPress={() => go("subscriptionPayments")} />
+          <Button icon="receipt-outline" title="Payment History" secondary onPress={() => go("subscriptionPayments")} />
           <Hint>
             {subscriptionSnapshot?.cachedAt
               ? `Last synchronized ${new Date(subscriptionSnapshot.cachedAt).toLocaleString("en-IN")}. ${subscriptionSnapshot.notificationsGranted === false ? "Enable notifications to receive local renewal reminders." : "Renewal reminders are scheduled when permission is available."} ${subscriptionSnapshot.checkoutEnabled ? "Payments require an internet connection and are confirmed by the server." : "Cashfree checkout is not enabled for this app build."}`
@@ -4026,18 +4129,21 @@ function AppContent() {
         keyExtractor: (payment) => payment.id,
         renderItem: (payment) => (
           <Card>
-            <Title>{String(payment.planCode || "").toUpperCase()} • {payment.durationMonths} months</Title>
-            <Row title="Original amount" value={money((payment.pricing?.originalAmountMinor || 0) / 100)} />
-            <Row title="Discount" value={money((payment.pricing?.discountAmountMinor || 0) / 100)} />
-            <Row title="Tax" value={money((payment.pricing?.taxAmountMinor || 0) / 100)} />
-            <Row title="Amount paid" value={money((payment.amountMinor || 0) / 100)} />
-            <Row title="Date" value={new Date(payment.createdAt).toLocaleString("en-IN")} />
-            <Row title="Status" value={payment.status} />
-            {payment.gatewayPaymentId && <Row title="Payment reference" value={payment.gatewayPaymentId} />}
-            {payment.gatewayOrderId && <Row title="Order reference" value={payment.gatewayOrderId} />}
-            {payment.method && <Row title="Payment method" value={payment.method} />}
+            <View style={customerDetailsStyles.transactionTitleRow}>
+              <Icon name="card-outline" size={18} color={colors.dark} />
+              <Title>{String(payment.planCode || "").toUpperCase()} • {payment.durationMonths} months</Title>
+            </View>
+            <Row icon="cash-outline" title="Original amount" value={money((payment.pricing?.originalAmountMinor || 0) / 100)} />
+            <Row icon="pricetag-outline" title="Discount" value={money((payment.pricing?.discountAmountMinor || 0) / 100)} />
+            <Row icon="receipt-outline" title="Tax" value={money((payment.pricing?.taxAmountMinor || 0) / 100)} />
+            <Row icon="card-outline" title="Amount paid" value={money((payment.amountMinor || 0) / 100)} />
+            <Row icon="calendar-outline" title="Date" value={new Date(payment.createdAt).toLocaleString("en-IN")} />
+            <Row icon={payment.status === "paid" ? "checkmark-circle-outline" : payment.status === "failed" ? "close-circle-outline" : payment.status === "refunded" || payment.status === "partially_refunded" ? "refresh-outline" : "time-outline"} title="Status" value={payment.status} />
+            {payment.gatewayPaymentId && <Row icon="receipt-outline" title="Payment reference" value={payment.gatewayPaymentId} />}
+            {payment.gatewayOrderId && <Row icon="receipt-outline" title="Order reference" value={payment.gatewayOrderId} />}
+            {payment.method && <Row icon="card-outline" title="Payment method" value={payment.method} />}
             {payment.currency && <Row title="Currency" value={payment.currency} />}
-            {payment.refunded && <Row title="Refund status" value={`${payment.status} • ${money((payment.refundedAmountMinor || 0) / 100)} refunded`} />}
+            {payment.refunded && <Row icon="refresh-outline" title="Refund status" value={`${payment.status} • ${money((payment.refundedAmountMinor || 0) / 100)} refunded`} />}
             <Hint>Tax invoice availability depends on the merchant's configured invoicing service.</Hint>
           </Card>
         ),
@@ -4050,6 +4156,7 @@ function AppContent() {
           {listFooter(paymentsPage.hasMore || !!subscriptionSnapshot?.paymentsNextCursor)}
           {subscriptionSnapshot?.paymentsNextCursor ? (
             <Button
+              icon="download-outline"
               title={subscriptionPageLoading ? "Loading…" : "Load more payments"}
               secondary
               disabled={subscriptionPageLoading}
@@ -4058,7 +4165,7 @@ function AppContent() {
           ) : null}
           {subscriptionLoadError ? <Hint>{subscriptionLoadError}</Hint> : null}
           {subscriptionLoading && <ActivityIndicator color={colors.green} />}
-          <Button title="Refresh" secondary onPress={() => void refreshSubscriptionInfo()} />
+          <Button icon="refresh-outline" title="Refresh" secondary onPress={() => void refreshSubscriptionInfo()} />
         </>,
         empty: (subscriptionSnapshot?.payments || []).length === 0 && !subscriptionLoading
           ? <Empty title="No payments yet" description="Verified subscription payments will appear here." />
@@ -4251,7 +4358,7 @@ function AppContent() {
               ListHeaderComponent={virtualizedRows.header ? <>{virtualizedRows.header}</> : null}
               ListFooterComponent={virtualizedRows.footer ? <>{virtualizedRows.footer}</> : null}
               ListEmptyComponent={virtualizedRows.empty ? <>{virtualizedRows.empty}</> : null}
-              contentContainerStyle={s.content}
+              contentContainerStyle={route.screen === "customer" ? [s.content, customerDetailsStyles.listContent] : s.content}
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
               initialNumToRender={PAGE_SIZE}

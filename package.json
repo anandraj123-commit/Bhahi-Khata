@@ -34,6 +34,7 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
+    "test:customer-icons": "node --test src/customerDetailsIcons.test.cjs",
     "test:subscription-security": "node --experimental-strip-types --test src/subscriptionClock.test.ts plugins/withCashfreeLogRedaction.test.cjs",
     "build:android": "expo run:android --variant release",
     "export:android": "expo export --platform android"
