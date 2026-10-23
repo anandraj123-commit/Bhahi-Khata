@@ -7,20 +7,28 @@ export type SubscriptionPlan = {
   currency: string;
   customerLimit: number | null;
   unlimitedCustomers: boolean;
+  configurationVersion: number;
+  pricingVersion: number;
   entitlements: Record<string, unknown>;
+  features: string[];
   enabled: boolean;
   displayOrder: number;
   durations: {
     months: number;
     durationMonths: number;
+    basePriceMinor: number;
     originalAmountMinor: number;
     discountPercent: number;
     discountAmountMinor: number;
     discountedAmountMinor: number;
+    taxableAmountMinor: number;
+    taxPercent: number;
     taxRateBps: number;
     taxInclusive: boolean;
     taxAmountMinor: number;
     finalAmountMinor: number;
+    isActive: boolean;
+    pricingVersion: number;
     currency: string;
   }[];
 };
@@ -34,8 +42,11 @@ export type CurrentSubscription = {
     customerLimit: number | null;
     unlimitedCustomers: boolean;
     entitlements: Record<string, unknown>;
+    configurationVersion: number;
   };
   status: "active";
+  /** Derived from the last verified expiry while offline; never grants access. */
+  offlineExpired?: boolean;
   startsAt: string | null;
   expiresAt: string | null;
   durationMonths: number;
@@ -46,7 +57,7 @@ export type CurrentSubscription = {
   isFallback: boolean;
   scheduled: null | {
     id: string;
-    plan: { code: string; name: string; customerLimit: number | null; unlimitedCustomers: boolean; entitlements: Record<string, unknown> };
+    plan: { code: string; name: string; customerLimit: number | null; unlimitedCustomers: boolean; entitlements: Record<string, unknown>; configurationVersion: number };
     startsAt: string;
     expiresAt: string | null;
     durationMonths: number;
@@ -54,6 +65,7 @@ export type CurrentSubscription = {
   customerUsage: { used: number; limit: number | null; unlimited: boolean; remaining: number | null };
   verifiedAt: string;
   lastSyncedAt: string;
+  entitlementVersion: number;
 };
 
 export type SubscriptionSnapshot = {
@@ -77,6 +89,7 @@ export type SubscriptionSnapshot = {
   checkoutEnabled: boolean;
   provider: string;
   cachedAt?: number;
+  entitlementLastVerifiedAt?: string;
   notificationsGranted?: boolean;
   localNotificationIds?: string[];
   paymentsNextCursor?: string | null;

@@ -9,7 +9,8 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "indexes": "node src/index.js --indexes"
+    "indexes": "node src/index.js --indexes",
+    "test:payments": "node --test src/providers/cashfree.test.js src/services/subscriptionPricing.test.js src/services/cashfreeLifecycle.test.js"
   },
   "dependencies": {
     "compression": "^1.8.1",

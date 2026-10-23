@@ -106,6 +106,44 @@ const orderJoin = () => [
   },
   { $unset: "order" },
 ];
+const paymentDetailsJoin = () => [
+  {
+    $lookup: {
+      from: PaymentOrder.collection.name,
+      localField: "orderId",
+      foreignField: "_id",
+      pipeline: [{ $project: { appMode: 1, planCode: 1, durationMonths: 1, pricingSnapshot: 1, createdAt: 1 } }],
+      as: "purchaseOrder",
+    },
+  },
+  {
+    $match: {
+      "purchaseOrder.appMode": process.env.APP_MODE || (process.env.NODE_ENV === "production" ? "production" : "development"),
+    },
+  },
+  {
+    $lookup: {
+      from: ShopSubscription.collection.name,
+      localField: "_id",
+      foreignField: "sourcePaymentId",
+      pipeline: [{ $project: { startsAt: 1, expiresAt: 1, status: 1 } }],
+      as: "subscription",
+    },
+  },
+  {
+    $addFields: {
+      planCode: { $arrayElemAt: ["$purchaseOrder.planCode", 0] },
+      durationMonths: { $arrayElemAt: ["$purchaseOrder.durationMonths", 0] },
+      planName: { $arrayElemAt: ["$purchaseOrder.pricingSnapshot.plan.name", 0] },
+      pricingSnapshot: { $arrayElemAt: ["$purchaseOrder.pricingSnapshot", 0] },
+      orderCreatedAt: { $arrayElemAt: ["$purchaseOrder.createdAt", 0] },
+      subscriptionStartsAt: { $arrayElemAt: ["$subscription.startsAt", 0] },
+      subscriptionExpiresAt: { $arrayElemAt: ["$subscription.expiresAt", 0] },
+      subscriptionStatus: { $arrayElemAt: ["$subscription.status", 0] },
+    },
+  },
+  { $unset: ["purchaseOrder", "subscription"] },
+];
 async function aggregate(model, pipeline) {
   return model.aggregate(pipeline).option({ maxTimeMS: 10000 }).exec();
 }
@@ -266,7 +304,7 @@ export async function payments(f) {
           ...(f.shopId ? { shopId: oid(f.shopId) } : {}),
         },
       },
-      ...orderJoin(),
+      ...paymentDetailsJoin(),
       shopLookup,
       ...shopFields(),
       ...searchStage(f, ["shopName", "gatewayPaymentId", "gatewayOrderId"]),
@@ -274,6 +312,10 @@ export async function payments(f) {
     f,
     {
       _id: 1,
+      planCode: 1,
+      durationMonths: 1,
+      planName: 1,
+      pricingSnapshot: 1,
       shopId: 1,
       shopName: 1,
       gatewayPaymentId: 1,
@@ -284,7 +326,12 @@ export async function payments(f) {
       verificationStatus: 1,
       refundedAmountMinor: 1,
       verifiedAt: 1,
+      gatewayCreatedAt: 1,
       createdAt: 1,
+      orderCreatedAt: 1,
+      subscriptionStartsAt: 1,
+      subscriptionExpiresAt: 1,
+      subscriptionStatus: 1,
     },
   );
 }

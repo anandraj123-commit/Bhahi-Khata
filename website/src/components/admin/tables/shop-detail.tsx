@@ -7,6 +7,7 @@ import { date } from "../../../lib/admin/api";
 import { useAdmin } from "../layout/shell";
 import { Badge, Button, Empty, ErrorState, Skeleton } from "../shared/ui";
 import { ResourceTable } from "./resource-table";
+import { ShopCustomers } from "./customer-management";
 export function ShopDetail({ id }: { id: string }) {
   const query = useAdminQuery<Detail>(`shops/${id}`);
   const session = useAdmin();
@@ -92,6 +93,9 @@ export function ShopDetail({ id }: { id: string }) {
               </p>
             </section>
           </div>
+          {session.permissions.includes("customers:read") && (
+            <ShopCustomers shopId={id} />
+          )}
           {session.permissions.includes("subscriptions:read") && (
             <>
               <h2 className="a-title" style={{ margin: "24px 0 14px" }}>

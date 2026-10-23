@@ -721,6 +721,16 @@ export async function readSubscriptionSnapshot(accountId: string): Promise<unkno
   try { return JSON.parse(row.snapshot_json); } catch { return null; }
 }
 
+/** Remove only cached subscription authorization metadata; customer, ledger and sync data stay intact. */
+export async function clearOfflineSubscriptionState(accountId: string) {
+  const db = await openDatabase();
+  if (db)
+    await db.runAsync(
+      "DELETE FROM local_subscription_cache WHERE account_id = ?",
+      accountId,
+    );
+}
+
 export async function readOfflineSession(): Promise<OfflineSession | null> {
   const [raw, refreshToken] = await Promise.all([
     SecureStore.getItemAsync(OFFLINE_SESSION),

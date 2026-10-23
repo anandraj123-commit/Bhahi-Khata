@@ -14,12 +14,18 @@
         "backgroundColor": "#0B9E59"
       }
     },
+    "ios": {
+      "infoPlist": {
+        "LSApplicationQueriesSchemes": ["phonepe", "tez", "paytm", "bhim"]
+      }
+    },
     "icon": "./assets/khata-icon.png",
     "plugins": [
       "expo-sharing",
       "expo-secure-store",
       "expo-notifications",
-      ["expo-sqlite", { "useSQLCipher": true }]
+      ["expo-sqlite", { "useSQLCipher": true }],
+      "./plugins/withCashfreeLogRedaction"
     ]
   }
 }

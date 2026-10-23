@@ -76,10 +76,9 @@ export const permit = (permission) => (req, res, next) => {
   next();
 };
 export function recentAuthentication(req, res, next) {
-  if (
-    !req.adminSession.reauthenticatedAt ||
-    Date.now() - req.adminSession.reauthenticatedAt.getTime() > REAUTH_MS
-  )
+  const reauthenticatedAt = req.adminSession.reauthenticatedAt?.getTime();
+  const age = reauthenticatedAt == null ? Infinity : Date.now() - reauthenticatedAt;
+  if (!Number.isFinite(age) || age < 0 || age >= REAUTH_MS)
     throw fail(
       403,
       "ADMIN_REAUTH_REQUIRED",

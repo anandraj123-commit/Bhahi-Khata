@@ -1,21 +1,16 @@
 "use client";
-import { useState, useSyncExternalStore } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, UserRound, MonitorSmartphone } from "lucide-react";
 import { useAdminQuery } from "../../../hooks/admin/use-admin-query";
+import { useClock } from "../../../hooks/admin/use-clock";
 import { adminRequest, date } from "../../../lib/admin/api";
 import type { Settings as SettingsData } from "../../../types/admin";
 import { useAdmin } from "../layout/shell";
 import { useToast } from "../layout/providers";
 import { AdminForm } from "./admin-form";
 import { Badge, Button, ErrorState, Skeleton } from "../shared/ui";
-const subscribeClock = (callback: () => void) => {
-  const timer = window.setInterval(callback, 1000);
-  return () => window.clearInterval(timer);
-};
-const getClockSnapshot = () => Date.now();
-const getServerClockSnapshot = () => 0;
 export function Settings() {
   const session = useAdmin();
   const query = useAdminQuery<SettingsData>("settings");
@@ -23,16 +18,9 @@ export function Settings() {
   const router = useRouter();
   const toast = useToast();
   const [busy, setBusy] = useState("");
-  const [reauthenticatedAt, setReauthenticatedAt] = useState<string | null>(
-    session.reauthenticatedAt,
-  );
-  const now = useSyncExternalStore(
-    subscribeClock,
-    getClockSnapshot,
-    getServerClockSnapshot,
-  );
-  const verifiedUntil = reauthenticatedAt
-    ? Date.parse(reauthenticatedAt) + 5 * 60 * 1000
+  const now = useClock();
+  const verifiedUntil = session.reauthenticatedAt
+    ? Date.parse(session.reauthenticatedAt) + 5 * 60 * 1000
     : 0;
   const secondsLeft = Math.max(0, Math.ceil((verifiedUntil - now) / 1000));
   const identityVerified = now > 0 && secondsLeft > 0;
@@ -140,7 +128,7 @@ export function Settings() {
                   }
                   submitVariant={identityVerified ? "default" : "outline"}
                   onSubmit={async (values) => {
-                    const result = await adminRequest<{
+                    await adminRequest<{
                       success: boolean;
                       reauthenticatedAt: string;
                     }>("auth/reauth", {
@@ -148,7 +136,7 @@ export function Settings() {
                       body: { password: values.password },
                       csrf: session.csrfToken,
                     });
-                    setReauthenticatedAt(result.data.reauthenticatedAt);
+                    await session.refreshSession();
                     toast("Password confirmed for five minutes");
                   }}
                 />

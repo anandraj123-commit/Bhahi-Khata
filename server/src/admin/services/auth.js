@@ -37,7 +37,9 @@ export async function issueSession(admin, req, res, session) {
         version: admin.sessionVersion,
         expiresAt: new Date(now.getTime() + SESSION_MS),
         lastSeenAt: now,
-        reauthenticatedAt: now,
+        // Logging in authenticates the session, but sensitive plan mutations
+        // require a separate, explicit password confirmation.
+        reauthenticatedAt: null,
       },
     ],
     session ? { session } : {},

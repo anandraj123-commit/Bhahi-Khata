@@ -49,7 +49,7 @@ export function createApp() {
     }),
   );
   app.use(compression());
-  // Razorpay signs the exact raw JSON bytes; this route must run before the
+  // Cashfree signs the exact raw JSON bytes; this route must run before the
   // general JSON parser so signature verification uses the original body.
   app.use("/api/v1/payments/webhook", express.raw({ type: "application/json", limit: "1mb" }));
   app.use(express.json({ limit: "10mb", strict: true }));

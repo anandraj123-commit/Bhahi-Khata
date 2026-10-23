@@ -11,6 +11,9 @@ export function serverConfig() {
     throw new Error("Admin server configuration unavailable");
   const url = new URL(base);
   const site = new URL(origin);
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  const localLoopbackTest =
+    loopbackHosts.has(url.hostname) && loopbackHosts.has(site.hostname);
   if (
     url.username ||
     url.password ||
@@ -20,7 +23,8 @@ export function serverConfig() {
     site.origin !== origin ||
     !["http:", "https:"].includes(url.protocol) ||
     (process.env.NODE_ENV === "production" &&
-      (url.protocol !== "https:" || site.protocol !== "https:"))
+      (url.protocol !== "https:" || site.protocol !== "https:") &&
+      !localLoopbackTest)
   )
     throw new Error("Invalid admin server configuration");
   return { base: base.replace(/\/$/, ""), origin, secret };

@@ -8,6 +8,7 @@ import { ensureCustomerLifecycleDefaults, ensureCustomerMobileIndex, ensureIndex
 import { startReminderWorker } from "./reminders.js";
 import { ensureSubscriptionPlans } from "./services/subscriptionService.js";
 import { startSubscriptionReminderWorker } from "./subscriptionReminders.js";
+import { startPaymentReconciliationWorker } from "./paymentReconciliation.js";
 
 try {
   await connectDatabase();
@@ -87,6 +88,7 @@ server.on("error", (error) => {
 });
 startReminderWorker(log);
 startSubscriptionReminderWorker(log);
+startPaymentReconciliationWorker(log);
 async function shutdown(signal) {
   log.info({ signal }, "shutting down");
   server.close(async () => {

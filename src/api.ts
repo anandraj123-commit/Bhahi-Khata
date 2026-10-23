@@ -547,25 +547,42 @@ export async function getSubscriptionPayments(cursor: string, limit = 15) {
 export async function createSubscriptionCheckout(input: {
   planCode: "pro" | "business";
   durationMonths: number;
+  acceptedPricingVersion: number;
   idempotencyKey: string;
 }) {
   return request("/subscription/checkout", {
     method: "POST",
     headers: { "Idempotency-Key": input.idempotencyKey },
-    body: JSON.stringify({ planCode: input.planCode, durationMonths: input.durationMonths }),
+    body: JSON.stringify({
+      planCode: input.planCode,
+      durationMonths: input.durationMonths,
+      acceptedPricingVersion: input.acceptedPricingVersion,
+    }),
   });
 }
 
-export async function verifySubscriptionPayment(input: {
-  orderId: string;
-  paymentId: string;
-  signature: string;
-}) {
+export async function verifySubscriptionPayment(input: { orderId: string }) {
   return request("/payments/verify", { method: "POST", body: JSON.stringify(input) });
 }
 
-export async function getSubscriptionPaymentStatus(orderId: string) {
+export async function getSubscriptionPaymentStatus(orderId: string): Promise<{
+  id: string;
+  status: "created" | "pending" | "paid" | "failed";
+  amountMinor: number;
+  currency: string;
+  paymentId?: string | null;
+  subscription?: SubscriptionSnapshot["current"];
+}> {
   return request(`/payments/${encodeURIComponent(orderId)}/status`);
+}
+
+export async function getSubscriptionPaymentAttemptStatus(idempotencyKey: string): Promise<{
+  id: string;
+  status: "created" | "pending" | "paid" | "failed";
+  amountMinor: number;
+  currency: string;
+}> {
+  return request(`/payments/attempts/${encodeURIComponent(idempotencyKey)}/status`);
 }
 export async function syncQueuedChange(change: SyncDelta) {
   change = normalizeSyncDelta(change);

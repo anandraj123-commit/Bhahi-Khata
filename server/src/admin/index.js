@@ -10,6 +10,8 @@ import auth from "./routes/authRoutes.js";
 import reads from "./routes/readRoutes.js";
 import administrators from "./routes/administratorsRoutes.js";
 import settings from "./routes/settingsRoutes.js";
+import customers from "./routes/customersRoutes.js";
+import plans from "./routes/plansRoutes.js";
 const router = express.Router();
 // Keep privileged cookies outside the mobile HTTP logger's response-header serializer.
 router.use((req, res, next) => {
@@ -37,6 +39,8 @@ router.use(
 router.use(express.json({ limit: "32kb", strict: true }));
 router.use("/auth", auth);
 router.use(authenticate);
+router.use(customers);
+router.use("/plans", plans);
 router.use(reads);
 router.use("/administrators", administrators);
 router.use("/settings", settings);

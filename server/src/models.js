@@ -261,14 +261,24 @@ export const SubscriptionPlan = mongoose.model(
       customerLimit: { type: Number, min: 0, default: null, validate: { validator: (value) => value == null || Number.isSafeInteger(value) } },
       unlimitedCustomers: { type: Boolean, default: false },
       entitlements: { type: Schema.Types.Mixed, default: {} },
+      features: { type: [String], default: [] },
       enabled: { type: Boolean, default: true },
       displayOrder: { type: Number, default: 0 },
       durations: {
+        validate: {
+          validator: (values) => Array.isArray(values) &&
+            new Set(values.map((value) => value.months)).size === values.length &&
+            values.every((value) => [1, 3, 6, 12].includes(value.months)),
+          message: "Subscription durations must be unique supported month values",
+        },
         type: [
           new Schema(
             {
               months: { type: Number, required: true, validate: Number.isSafeInteger },
-              discountPercent: { type: Number, required: true, min: 0, max: 100, validate: Number.isInteger },
+              basePriceMinor: { type: Number, min: 1, validate: Number.isSafeInteger },
+              discountPercent: { type: Number, required: true, min: 0, max: 100, validate: (value) => Number.isFinite(value) && Math.abs(value * 100 - Math.round(value * 100)) < 1e-8 },
+              taxPercent: { type: Number, default: 0, min: 0, max: 100, validate: (value) => Number.isFinite(value) && Math.abs(value * 100 - Math.round(value * 100)) < 1e-8 },
+              isActive: { type: Boolean, default: true },
             },
             { _id: false },
           ),
@@ -276,6 +286,9 @@ export const SubscriptionPlan = mongoose.model(
         default: [],
       },
       configurationVersion: { type: Number, default: 1 },
+      pricingVersion: { type: Number, min: 1, default: 1, validate: Number.isSafeInteger },
+      createdByAdminId: Schema.Types.ObjectId,
+      updatedByAdminId: Schema.Types.ObjectId,
     },
     base,
   ),
@@ -289,7 +302,8 @@ export const ShopSubscription = mongoose.model(
       shopId: { type: Schema.Types.ObjectId, required: true },
       planId: { type: Schema.Types.ObjectId, required: true },
       planCode: { type: String, required: true },
-      planSnapshot: { type: Schema.Types.Mixed, required: true },
+      planSnapshot: { type: Schema.Types.Mixed, required: true, immutable: true },
+      pricingSnapshot: { type: Schema.Types.Mixed, immutable: true },
       status: { type: String, enum: ["active", "scheduled", "expired", "cancelled"], required: true },
       startsAt: { type: Date, required: true },
       expiresAt: Date,
@@ -319,8 +333,11 @@ export const PaymentOrder = mongoose.model(
       durationMonths: { type: Number, required: true },
       amountMinor: { type: Number, required: true, min: 0 },
       currency: { type: String, required: true },
-      pricingSnapshot: { type: Schema.Types.Mixed, required: true },
+      pricingSnapshot: { type: Schema.Types.Mixed, required: true, immutable: true },
       gatewayOrderId: String,
+      gatewayReferenceId: String,
+      paymentSessionId: String,
+      providerRequestId: String,
       idempotencyKey: { type: String, required: true },
       requestHash: { type: String, required: true },
       status: { type: String, enum: ["created", "pending", "paid", "failed", "refunded", "partially_refunded"], default: "created" },
@@ -328,6 +345,9 @@ export const PaymentOrder = mongoose.model(
       checkoutActive: { type: Boolean, default: false },
       checkoutExpiresAt: Date,
       verifiedAt: Date,
+      paymentReconciliationAttempts: { type: Number, default: 0, min: 0 },
+      paymentReconciliationNextAt: Date,
+      paymentReconciliationLastCode: String,
     },
     base,
   ),
@@ -339,6 +359,10 @@ PaymentOrder.schema.index(
 );
 PaymentOrder.schema.index({ shopId: 1, createdAt: -1, _id: -1 });
 PaymentOrder.schema.index({ gatewayOrderId: 1 }, { unique: true, sparse: true });
+PaymentOrder.schema.index(
+  { status: 1, paymentReconciliationNextAt: 1, createdAt: 1 },
+  { partialFilterExpression: { gatewayOrderId: { $exists: true } } },
+);
 
 export const PaymentTransaction = mongoose.model(
   "PaymentTransaction",
@@ -346,7 +370,7 @@ export const PaymentTransaction = mongoose.model(
     {
       shopId: { type: Schema.Types.ObjectId, required: true },
       orderId: { type: Schema.Types.ObjectId, required: true },
-      provider: { type: String, enum: ["razorpay"], required: true },
+      provider: { type: String, enum: ["razorpay", "cashfree"], required: true },
       gatewayPaymentId: { type: String, required: true },
       gatewayOrderId: { type: String, required: true },
       amountMinor: { type: Number, required: true },

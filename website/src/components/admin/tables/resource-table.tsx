@@ -10,6 +10,7 @@ import {
 import { date, money } from "../../../lib/admin/api";
 import { Badge, Button, Empty, ErrorState, Skeleton } from "../shared/ui";
 import { DateFilter } from "../shared/date-filter";
+import { PlanLimitManagement } from "./plan-limit-management";
 export type Resource =
   "shops" | "subscriptions" | "payments" | "audit-logs" | "administrators";
 type Column = {
@@ -20,6 +21,10 @@ type Column = {
 const status = (value: unknown) => (
   <Badge tone={String(value)}>{String(value || "Unavailable")}</Badge>
 );
+const paymentPricing = (row: DataRow) =>
+  row.pricingSnapshot && typeof row.pricingSnapshot === "object"
+    ? row.pricingSnapshot as Record<string, unknown>
+    : null;
 const columns: Record<Resource, Column[]> = {
   shops: [
     {
@@ -65,6 +70,34 @@ const columns: Record<Resource, Column[]> = {
     { key: "durationMonths", label: "Months" },
   ],
   payments: [
+    { key: "planCode", label: "Purchased plan", render: (r) => String(r.planName || r.planCode || "—") },
+    { key: "durationMonths", label: "Duration", render: (r) => Number(r.durationMonths) > 0 ? `${r.durationMonths} months` : "—" },
+    {
+      key: "pricingSnapshot.basePriceMinor",
+      label: "Base price",
+      render: (r) => {
+        const p = paymentPricing(r);
+        return p && Number.isSafeInteger(p.basePriceMinor) ? money(Number(p.basePriceMinor), "INR") : "—";
+      },
+    },
+    {
+      key: "pricingSnapshot.discountPercent",
+      label: "Discount",
+      render: (r) => {
+        const p = paymentPricing(r);
+        return p && Number.isFinite(p.discountPercent) && Number.isSafeInteger(p.discountAmountMinor)
+          ? `${p.discountPercent}% · −${money(Number(p.discountAmountMinor), "INR")}` : "—";
+      },
+    },
+    {
+      key: "pricingSnapshot.taxPercent",
+      label: "Tax",
+      render: (r) => {
+        const p = paymentPricing(r);
+        return p && Number.isFinite(p.taxPercent) && Number.isSafeInteger(p.taxAmountMinor)
+          ? `${p.taxPercent}% · ${money(Number(p.taxAmountMinor), "INR")}` : "—";
+      },
+    },
     {
       key: "gatewayPaymentId",
       label: "Payment reference",
@@ -84,7 +117,7 @@ const columns: Record<Resource, Column[]> = {
     },
     {
       key: "amountMinor",
-      label: "Amount",
+      label: "Final paid",
       render: (r) => money(Number(r.amountMinor), String(r.currency)),
     },
     {
@@ -99,8 +132,9 @@ const columns: Record<Resource, Column[]> = {
       label: "Verification",
       render: (r) => status(r.verificationStatus),
     },
-    { key: "verifiedAt", label: "Verified", render: (r) => date(r.verifiedAt) },
-    { key: "createdAt", label: "Recorded", render: (r) => date(r.createdAt) },
+    { key: "subscriptionStartsAt", label: "Subscription starts", render: (r) => date(r.subscriptionStartsAt) },
+    { key: "subscriptionExpiresAt", label: "Subscription expires", render: (r) => date(r.subscriptionExpiresAt) },
+    { key: "gatewayCreatedAt", label: "Payment date", render: (r) => date(r.gatewayCreatedAt || r.verifiedAt || r.createdAt) },
   ],
   "audit-logs": [
     { key: "action", label: "Action" },
@@ -361,7 +395,7 @@ export function ResourcePage({
   const description = {
     shops: "Explore registered shops and their current subscription access.",
     subscriptions:
-      "Review recorded entitlements without changing subscription rules.",
+      "Manage the three canonical plans and their duration-specific pricing, tax and customer entitlements.",
     payments:
       "Inspect gateway records. Only verified, captured amounts contribute to revenue.",
     "audit-logs":
@@ -379,17 +413,24 @@ export function ResourcePage({
           <h1>{title}</h1>
           <p>{description}</p>
         </div>
-        <Badge>Read-only</Badge>
+        <Badge>{resource === "subscriptions" ? "Plan and pricing management" : "Read-only"}</Badge>
       </div>
+      {resource === "subscriptions" && <PlanLimitManagement />}
       {(resource === "subscriptions" || resource === "payments") && (
-        <SubscriptionSummary payments={resource === "payments"} />
+        resource === "payments" && <SubscriptionSummary payments />
       )}
       <ResourceTable resource={resource} />
       {resource === "subscriptions" && (
         <p className="a-definition">
           Status filters use effective dates, including scheduled records that
           have started. The table shows stored status. Free-plan fallback access
-          without a subscription record is not listed.
+          without a subscription record is not listed. Free-plan fallback limits
+          use the current plan record. Paid subscriptions retain the customer
+          limit in their plan snapshot until a new subscription or renewal is
+          recorded; changing a plan does not rewrite existing subscription terms.
+          Lowering a limit never deletes existing customers; the existing
+          capacity check prevents additional customer creation once the applicable
+          limit is reached.
         </p>
       )}
     </>

@@ -32,20 +32,24 @@ export async function fixture() {
   const {
     User,
     Shop,
+    Customer,
     ShopSubscription,
     SubscriptionPlan,
     PaymentOrder,
     PaymentTransaction,
+    SubscriptionUsage,
   } = await import("../../models.js");
   const { hashPassword } = await import("../utils/security.js");
   for (const model of [
     ...adminModels,
     User,
     Shop,
+    Customer,
     ShopSubscription,
     SubscriptionPlan,
     PaymentOrder,
     PaymentTransaction,
+    SubscriptionUsage,
   ]) {
     await model.createCollection();
     await model.createIndexes();
@@ -89,6 +93,20 @@ export async function fixture() {
     customerLimit: 50,
     enabled: true,
   });
+  const configuredDurations = (monthlyPriceMinor) => [1, 3, 6, 12].map((months) => ({
+    months,
+    basePriceMinor: monthlyPriceMinor * months,
+    discountPercent: 0,
+    taxPercent: 0,
+    isActive: true,
+  }));
+  for (const record of [
+    { code: "free", name: "Free", description: "Free fallback", monthlyPriceMinor: 0, currency: "INR", customerLimit: 50, unlimitedCustomers: false, enabled: true, displayOrder: 0, features: [], entitlements: {}, durations: [] },
+    { code: "pro", name: "Pro", description: "Pro plan", monthlyPriceMinor: 19900, currency: "INR", customerLimit: 500, unlimitedCustomers: false, enabled: true, displayOrder: 1, features: [], entitlements: {}, durations: configuredDurations(19900) },
+    { code: "business", name: "Business", description: "Business plan", monthlyPriceMinor: 49900, currency: "INR", customerLimit: null, unlimitedCustomers: true, enabled: true, displayOrder: 2, features: [], entitlements: {}, durations: configuredDurations(49900) },
+  ])
+    await SubscriptionPlan.updateOne({ code: record.code }, { $set: record }, { upsert: true });
+  const standardPlans = await SubscriptionPlan.find({ code: { $in: ["free", "pro", "business"] } }).sort({ displayOrder: 1 }).lean();
   const shops = [];
   for (let i = 0; i < 25; i++) {
     const user = await User.create({ phone: `+910${run}${i}` });
@@ -110,6 +128,40 @@ export async function fixture() {
     shops.push(shop);
   }
   const now = Date.now();
+  const lifecycleCustomers = await Customer.create([
+    { shopId: shops[0]._id, clientId: `active-${run}`, name: `Customer Active ${run}`, nameFolded: `customer active ${run}`, status: true, disabled: false, removed: false },
+    { shopId: shops[0]._id, clientId: `disabled-${run}`, name: `Customer Disabled ${run}`, nameFolded: `customer disabled ${run}`, status: false, disabled: true, removed: false },
+    { shopId: shops[0]._id, clientId: `removed-${run}`, name: `Customer Removed ${run}`, nameFolded: `customer removed ${run}`, status: false, disabled: false, removed: true },
+  ]);
+  const legacyCustomer = new mongoose.Types.ObjectId();
+  await Customer.collection.insertOne({
+    _id: legacyCustomer,
+    shopId: shops[0]._id,
+    clientId: `legacy-${run}`,
+    name: `Customer Legacy ${run}`,
+    nameFolded: `customer legacy ${run}`,
+    createdAt: new Date(now - 1000),
+    updatedAt: new Date(now - 1000),
+  });
+  await Customer.collection.insertOne({
+    shopId: shops[0]._id,
+    clientId: `tombstone-${run}`,
+    name: `Customer Tombstone ${run}`,
+    nameFolded: `customer tombstone ${run}`,
+    status: true,
+    disabled: false,
+    removed: false,
+    deletedAt: new Date(),
+  });
+  await Customer.collection.insertOne({
+    shopId: new mongoose.Types.ObjectId(),
+    clientId: `orphan-${run}`,
+    name: `Customer Orphan ${run}`,
+    nameFolded: `customer orphan ${run}`,
+    status: true,
+    disabled: false,
+    removed: false,
+  });
   await ShopSubscription.create([
     {
       shopId: shops[0]._id,
@@ -185,6 +237,8 @@ export async function fixture() {
     support,
     admin,
     plan,
+    standardPlans,
     shops,
+    customers: [...lifecycleCustomers, { _id: legacyCustomer }],
   };
 }

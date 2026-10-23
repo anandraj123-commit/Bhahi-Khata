@@ -1,12 +1,13 @@
 "use client";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import {
   LayoutDashboard,
   Store,
+  Users,
   CreditCard,
   Wallet,
   ShieldCheck,
@@ -39,6 +40,12 @@ export const navigation = [
     label: "Shops",
     icon: Store,
     permission: "shops:read",
+  },
+  {
+    href: "/admin/customers",
+    label: "Customers",
+    icon: Users,
+    permission: "customers:read",
   },
   {
     href: "/admin/subscriptions",
@@ -77,7 +84,10 @@ export const navigation = [
     permission: "",
   },
 ];
-const SessionContext = createContext<AdminSession | null>(null);
+type AdminContextValue = AdminSession & {
+  refreshSession: () => Promise<AdminSession>;
+};
+const SessionContext = createContext<AdminContextValue | null>(null);
 export function useAdmin() {
   const value = useContext(SessionContext);
   if (!value) throw new Error("Admin context required");
@@ -98,6 +108,16 @@ export function AdminShell({
   const [drawer, setDrawer] = useState(false);
   const [dark, setDark] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [currentSession, setCurrentSession] = useState(session);
+  const refreshSession = useCallback(async () => {
+    const result = await adminRequest<AdminSession>("auth/me");
+    setCurrentSession(result.data);
+    return result.data;
+  }, []);
+  const sessionContext = useMemo(
+    () => ({ ...currentSession, refreshSession }),
+    [currentSession, refreshSession],
+  );
   useEffect(() => {
     const stored = (() => {
       try {
@@ -134,13 +154,15 @@ export function AdminShell({
     } catch {}
   };
   const links = navigation.filter(
-    (item) => !item.permission || session.permissions.includes(item.permission),
+    (item) => !item.permission || currentSession.permissions.includes(item.permission),
   );
   const current =
     navigation.find((item) => item.href === path) ||
     (path.startsWith("/admin/shops/")
       ? { label: "Shop details" }
-      : { label: "Administration" });
+      : path.startsWith("/admin/customers/")
+        ? { label: "Customer details" }
+        : { label: "Administration" });
   const sidebar = (
     <>
       <Link href="/admin" className="a-brand">
@@ -176,7 +198,7 @@ export function AdminShell({
     </>
   );
   return (
-    <SessionContext.Provider value={session}>
+    <SessionContext.Provider value={sessionContext}>
       <div className={`a-shell ${collapsed ? "is-collapsed" : ""}`}>
         <aside className="a-sidebar">{sidebar}</aside>
         <Dialog.Root open={drawer} onOpenChange={setDrawer}>
@@ -231,12 +253,12 @@ export function AdminShell({
               <Dropdown.Root>
                 <Dropdown.Trigger className="a-profile">
                   <span className="a-avatar">
-                    {session.administrator.name.slice(0, 2).toUpperCase()}
+                    {currentSession.administrator.name.slice(0, 2).toUpperCase()}
                   </span>
                   <span className="a-profile-text">
-                    {session.administrator.name}
+                    {currentSession.administrator.name}
                     <small>
-                      {session.administrator.role
+                      {currentSession.administrator.role
                         .replaceAll("_", " ")
                         .toLowerCase()}
                     </small>
@@ -261,7 +283,7 @@ export function AdminShell({
                           await adminRequest("auth/logout", {
                             method: "POST",
                             body: {},
-                            csrf: session.csrfToken,
+                            csrf: currentSession.csrfToken,
                           });
                           queryClient.clear();
                           router.replace("/admin/login");

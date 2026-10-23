@@ -1,20 +1,35 @@
 import mongoose from "mongoose";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   Customer,
   PaymentOrder,
   PaymentTransaction,
+  Shop,
   ShopSubscription,
   SubscriptionAuditLog,
   SubscriptionPlan,
   SubscriptionUsage,
+  User,
 } from "../models.js";
 import { subscriptionConfig } from "../config/env.js";
 import { paymentProvider } from "../providers/paymentProvider.js";
+import { cashfreeAmountMinor } from "../providers/cashfree.js";
 import { digest } from "../utils/hashing.js";
 import { sendSubscriptionPush } from "./subscriptionNotificationService.js";
+import {
+  calculateDurationPricing,
+  normalizePaidPlanDurations,
+  SUPPORTED_SUBSCRIPTION_DURATIONS,
+} from "./subscriptionPricing.js";
 
-const durations = [1, 3, 6, 12];
+const durations = SUPPORTED_SUBSCRIPTION_DURATIONS;
+const defaultDurationPricing = (monthlyPriceMinor) => durations.map((months) => ({
+  months,
+  basePriceMinor: monthlyPriceMinor * months,
+  discountPercent: 0,
+  taxPercent: 0,
+  isActive: true,
+}));
 const seededPlans = [
   {
     code: "free",
@@ -25,6 +40,7 @@ const seededPlans = [
     customerLimit: 50,
     unlimitedCustomers: false,
     entitlements: {},
+    features: [],
     enabled: true,
     displayOrder: 0,
     durations: [],
@@ -38,12 +54,10 @@ const seededPlans = [
     customerLimit: 500,
     unlimitedCustomers: false,
     entitlements: {},
+    features: [],
     enabled: true,
     displayOrder: 1,
-    durations: durations.map((months) => ({
-      months,
-      discountPercent: ({ 1: 0, 3: 5, 6: 10, 12: 20 })[months],
-    })),
+    durations: defaultDurationPricing(19900),
   },
   {
     code: "business",
@@ -54,12 +68,10 @@ const seededPlans = [
     customerLimit: null,
     unlimitedCustomers: true,
     entitlements: {},
+    features: [],
     enabled: true,
     displayOrder: 2,
-    durations: durations.map((months) => ({
-      months,
-      discountPercent: ({ 1: 0, 3: 5, 6: 10, 12: 20 })[months],
-    })),
+    durations: defaultDurationPricing(49900),
   },
 ];
 
@@ -67,16 +79,73 @@ const serviceError = (message, status, extra = {}) =>
   Object.assign(new Error(message), { status, ...extra });
 
 export async function ensureSubscriptionPlans() {
+  // The unique code index is needed even while checkout is disabled so a
+  // multi-instance startup cannot create duplicate canonical plan records.
+  await SubscriptionPlan.createIndexes();
   for (const plan of seededPlans)
     await SubscriptionPlan.updateOne(
       { code: plan.code },
       { $setOnInsert: plan },
       { upsert: true },
     );
-}
-
-function roundRatio(numerator, denominator) {
-  return Math.floor((numerator + Math.floor(denominator / 2)) / denominator);
+  for (const canonical of seededPlans) {
+    const plan = await SubscriptionPlan.findOne({ code: canonical.code }).lean();
+    if (!plan) throw new Error(`Canonical subscription plan ${canonical.code} could not be initialized`);
+    if (plan.code === "free") {
+      const correction = {};
+      if (plan.enabled !== true) correction.enabled = true;
+      if (plan.monthlyPriceMinor !== 0) correction.monthlyPriceMinor = 0;
+      if (plan.currency !== "INR") correction.currency = "INR";
+      if ((!Number.isSafeInteger(plan.customerLimit) || plan.customerLimit <= 0) && !plan.unlimitedCustomers) correction.customerLimit = 50;
+      if (Object.keys(correction).length) {
+        const version = Number.isSafeInteger(plan.configurationVersion) ? plan.configurationVersion : 1;
+        const versionFilter = Number.isSafeInteger(plan.configurationVersion)
+          ? { configurationVersion: version }
+          : { configurationVersion: { $exists: false } };
+        const result = await SubscriptionPlan.updateOne(
+          { _id: plan._id, ...versionFilter },
+          { $set: correction, $inc: { configurationVersion: 1 } },
+        );
+        if (result.modifiedCount !== 1)
+          throw new Error("Free plan changed during canonical fallback validation; retry startup");
+      }
+      continue;
+    }
+    if (plan.currency !== "INR")
+      throw new Error(`Plan ${plan.code} uses a non-INR currency; pricing migration requires review`);
+    const hasLegacyTax = (plan.durations || []).length !== durations.length ||
+      (plan.durations || []).some((duration) => duration.taxPercent == null);
+    if (hasLegacyTax && subscriptionConfig.taxInclusive && subscriptionConfig.taxBps > 0)
+      throw new Error("Legacy tax-inclusive plan pricing needs an explicit migration decision before startup");
+    const migratedDurations = normalizePaidPlanDurations(plan, subscriptionConfig.taxBps / 100);
+    const changed = (plan.durations || []).length !== durations.length ||
+      (plan.durations || []).some((duration, index) => {
+        const next = migratedDurations[index];
+        return duration.months !== next.months ||
+          duration.basePriceMinor !== next.basePriceMinor ||
+          duration.discountPercent !== next.discountPercent ||
+          duration.taxPercent !== next.taxPercent ||
+          duration.isActive !== next.isActive;
+      }) || !Number.isSafeInteger(plan.pricingVersion);
+    if (!changed) continue;
+    const version = Number.isSafeInteger(plan.configurationVersion) ? plan.configurationVersion : 1;
+    const versionFilter = Number.isSafeInteger(plan.configurationVersion)
+      ? { configurationVersion: version }
+      : { configurationVersion: { $exists: false } };
+    const result = await SubscriptionPlan.updateOne(
+      { _id: plan._id, ...versionFilter },
+      {
+        $set: {
+          durations: migratedDurations,
+          pricingVersion: Number.isSafeInteger(plan.pricingVersion) ? plan.pricingVersion : 1,
+          currency: "INR",
+        },
+        $inc: { configurationVersion: 1 },
+      },
+    );
+    if (result.modifiedCount !== 1)
+      throw new Error(`Plan ${plan.code} changed during pricing migration; retry startup`);
+  }
 }
 
 export function quoteSubscription(plan, months) {
@@ -85,41 +154,32 @@ export function quoteSubscription(plan, months) {
     return {
       durationMonths: 0,
       currency: plan.currency,
+      basePriceMinor: 0,
       originalAmountMinor: 0,
       discountPercent: 0,
       discountAmountMinor: 0,
+      taxableAmountMinor: 0,
+      taxPercent: 0,
       taxRateBps: 0,
-      taxInclusive: subscriptionConfig.taxInclusive,
+      taxInclusive: false,
       taxAmountMinor: 0,
       finalAmountMinor: 0,
     };
   const duration = plan.durations.find((item) => item.months === months);
-  if (!duration) throw serviceError("Subscription duration is unavailable", 400);
-  const originalAmountMinor = plan.monthlyPriceMinor * months;
-  const discountAmountMinor = roundRatio(
-    originalAmountMinor * duration.discountPercent,
-    100,
-  );
-  const discountedAmountMinor = originalAmountMinor - discountAmountMinor;
-  const taxAmountMinor = subscriptionConfig.taxInclusive
-    ? roundRatio(
-        discountedAmountMinor * subscriptionConfig.taxBps,
-        10000 + subscriptionConfig.taxBps,
-      )
-    : roundRatio(discountedAmountMinor * subscriptionConfig.taxBps, 10000);
+  if (!duration || duration.isActive === false) throw serviceError("Subscription duration is unavailable", 400);
+  const pricing = calculateDurationPricing({
+    months,
+    basePriceMinor: duration.basePriceMinor ?? plan.monthlyPriceMinor * months,
+    discountPercent: duration.discountPercent ?? 0,
+    taxPercent: duration.taxPercent ?? subscriptionConfig.taxBps / 100,
+    isActive: duration.isActive !== false,
+    pricingVersion: plan.pricingVersion || 1,
+  });
   return {
-    durationMonths: months,
-    currency: plan.currency,
-    originalAmountMinor,
-    discountPercent: duration.discountPercent,
-    discountAmountMinor,
-    discountedAmountMinor,
-    taxRateBps: subscriptionConfig.taxBps,
-    taxInclusive: subscriptionConfig.taxInclusive,
-    taxAmountMinor,
-    finalAmountMinor: subscriptionConfig.taxInclusive
-      ? discountedAmountMinor
-      : discountedAmountMinor + taxAmountMinor,
+    ...pricing,
+    originalAmountMinor: pricing.basePriceMinor,
+    discountedAmountMinor: pricing.taxableAmountMinor,
+    taxInclusive: false,
   };
 }
 
@@ -134,10 +194,12 @@ function planOut(plan) {
     customerLimit: plan.customerLimit,
     unlimitedCustomers: plan.unlimitedCustomers,
     entitlements: plan.entitlements || {},
+    features: plan.features || [],
     enabled: plan.enabled,
     displayOrder: plan.displayOrder,
     configurationVersion: plan.configurationVersion,
-    durations: plan.durations.map((duration) => ({
+    pricingVersion: plan.pricingVersion || 1,
+    durations: plan.durations.filter((duration) => duration.isActive !== false).map((duration) => ({
       ...quoteSubscription(plan, duration.months),
       months: duration.months,
     })),
@@ -147,13 +209,13 @@ function planOut(plan) {
 }
 
 export async function listSubscriptionPlans() {
-  const plans = await SubscriptionPlan.find({ enabled: true })
+  const plans = await SubscriptionPlan.find({ code: { $in: ["free", "pro", "business"] }, enabled: true })
     .sort({ displayOrder: 1, _id: 1 })
     .lean();
   return {
     items: plans.map(planOut),
     checkoutEnabled: subscriptionConfig.checkoutEnabled,
-    provider: "razorpay",
+    provider: "cashfree",
     lastUpdatedAt: plans.reduce(
       (latest, plan) => Math.max(latest, new Date(plan.updatedAt || 0).getTime()),
       0,
@@ -226,6 +288,7 @@ export async function getCurrentSubscription(shopId, now = new Date()) {
       customerLimit: plan.customerLimit,
       unlimitedCustomers: plan.unlimitedCustomers,
       entitlements: plan.entitlements || {},
+      configurationVersion: plan.configurationVersion || 1,
     },
     status: "active",
     startsAt: effective.startsAt?.toISOString?.() || null,
@@ -245,6 +308,7 @@ export async function getCurrentSubscription(shopId, now = new Date()) {
             customerLimit: scheduledPlan.customerLimit,
             unlimitedCustomers: scheduledPlan.unlimitedCustomers,
             entitlements: scheduledPlan.entitlements || {},
+            configurationVersion: scheduledPlan.configurationVersion || 1,
           },
           startsAt: scheduled.startsAt.toISOString(),
           expiresAt: scheduled.expiresAt?.toISOString?.() || null,
@@ -261,6 +325,7 @@ export async function getCurrentSubscription(shopId, now = new Date()) {
     },
     verifiedAt,
     lastSyncedAt: verifiedAt,
+    entitlementVersion: plan?.configurationVersion || 1,
   };
   return subscription;
 }
@@ -442,7 +507,7 @@ export async function releaseCustomerCapacity({ shopId, session }) {
   );
 }
 
-function addCalendarMonths(date, months) {
+export function addCalendarMonths(date, months) {
   // Clamp to the final day of the target month (Jan 31 + 1 month = Feb 28/29).
   const result = new Date(date);
   const day = result.getUTCDate();
@@ -470,9 +535,10 @@ async function getScheduleForPurchase(shopId, plan, session, now) {
   throw serviceError("This plan change is not available", 409);
 }
 
-export async function createSubscriptionOrder({ shopId, userId, planCode, months, idempotencyKey }) {
+export async function createSubscriptionOrder({ shopId, userId, planCode, months, idempotencyKey, acceptedPricingVersion }) {
   if (!idempotencyKey || idempotencyKey.length > 128)
     throw serviceError("A valid Idempotency-Key is required", 400);
+  paymentProvider();
   const hash = digest(JSON.stringify({ planCode, months }));
   const now = new Date();
   await PaymentOrder.updateMany(
@@ -489,14 +555,23 @@ export async function createSubscriptionOrder({ shopId, userId, planCode, months
     if (old.requestHash !== hash) throw serviceError("Idempotency key was used for a different purchase", 409);
     if (old.checkoutExpiresAt && old.checkoutExpiresAt <= now && old.status !== "paid")
       throw serviceError("Checkout order expired; start a new checkout", 409);
-    if (!old.gatewayOrderId)
-      throw serviceError("Checkout order is still being prepared; retry shortly", 409);
-    return { order: old, keyId: subscriptionConfig.razorpayKeyId };
+    if (old.status === "failed") throw serviceError("Checkout order failed; start a new checkout", 409);
+    return { order: await prepareCashfreeOrder(old), repeated: true };
   }
-  const provider = paymentProvider();
   const plan = await SubscriptionPlan.findOne({ code: planCode, enabled: true }).lean();
   if (!plan || plan.code === "free") throw serviceError("Paid plan not found", 404);
   const pricing = quoteSubscription(plan, months);
+  if (!Number.isSafeInteger(acceptedPricingVersion))
+    throw serviceError("Refresh the plan price before checkout", 428, { code: "SUBSCRIPTION_PRICE_ACCEPTANCE_REQUIRED" });
+  if (acceptedPricingVersion !== pricing.pricingVersion)
+    throw serviceError("Subscription pricing changed. Review and accept the new total.", 409, {
+      code: "SUBSCRIPTION_PRICE_CHANGED",
+      currentPricing: {
+        planCode: plan.code,
+        planName: plan.name,
+        ...pricing,
+      },
+    });
   const schedule = await getScheduleForPurchase(shopId, plan, null, new Date());
   let order;
   try {
@@ -511,12 +586,26 @@ export async function createSubscriptionOrder({ shopId, userId, planCode, months
         amountMinor: pricing.finalAmountMinor,
         currency: pricing.currency,
         pricingSnapshot: {
-          plan: { id: String(plan._id), code: plan.code, name: plan.name, monthlyPriceMinor: plan.monthlyPriceMinor, customerLimit: plan.customerLimit, unlimitedCustomers: plan.unlimitedCustomers },
+          plan: {
+            id: String(plan._id),
+            code: plan.code,
+            name: plan.name,
+            description: plan.description,
+            monthlyPriceMinor: plan.monthlyPriceMinor,
+            currency: plan.currency,
+            customerLimit: plan.customerLimit,
+            unlimitedCustomers: plan.unlimitedCustomers,
+            entitlements: plan.entitlements || {},
+            features: plan.features || [],
+            configurationVersion: plan.configurationVersion || 1,
+            pricingVersion: plan.pricingVersion || 1,
+          },
           ...pricing,
           createdAt: new Date().toISOString(),
         },
         idempotencyKey,
         requestHash: hash,
+        providerRequestId: randomUUID(),
         status: "created",
         checkoutActive: true,
         checkoutExpiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
@@ -526,48 +615,115 @@ export async function createSubscriptionOrder({ shopId, userId, planCode, months
   } catch (error) {
     if (error.code === 11000) {
       const existing = await PaymentOrder.findOne({ shopId, idempotencyKey }).lean();
-      if (existing?.requestHash === hash && existing.gatewayOrderId)
-        return { order: existing, keyId: subscriptionConfig.razorpayKeyId };
       if (existing?.requestHash === hash)
-        throw serviceError("Checkout order is still being prepared; retry shortly", 409);
+        return { order: await prepareCashfreeOrder(existing), repeated: true };
       throw serviceError("Another subscription checkout is already in progress", 409);
     }
     throw error;
   }
-  let gateway;
-  try {
-    gateway = await provider.createOrder({
-      amountMinor: pricing.finalAmountMinor,
-      currency: pricing.currency,
-      receipt: `dk_${String(shopId).slice(-10)}_${Date.now()}`,
-      notes: { shopId: String(shopId), planCode, durationMonths: String(months) },
-    });
-  } catch (error) {
-    await PaymentOrder.updateOne({ _id: order._id, shopId }, { $set: { status: "failed", checkoutActive: false } });
-    throw error;
-  }
-  order.gatewayOrderId = gateway.id;
-  await order.save();
-  return { order, keyId: subscriptionConfig.razorpayKeyId };
+  return { order: await prepareCashfreeOrder(order.toObject()), repeated: false };
 }
 
-async function reconcilePayment({ gatewayPayment, order, actorId, session }) {
+async function prepareCashfreeOrder(order) {
+  if (order.gatewayOrderId && order.paymentSessionId)
+    return order;
+  if (order.status === "paid") return order;
+  let providerRequestId = order.providerRequestId;
+  if (!providerRequestId) {
+    await PaymentOrder.updateOne(
+      { _id: order._id, providerRequestId: { $exists: false } },
+      { $set: { providerRequestId: randomUUID() } },
+    );
+    const current = await PaymentOrder.findById(order._id).lean();
+    providerRequestId = current?.providerRequestId;
+    if (current) order = current;
+  }
+  if (!providerRequestId)
+    throw serviceError("Checkout order is still being prepared; retry shortly", 409);
+  const [user, shop] = await Promise.all([
+    User.findById(order.userId).select("phone").lean(),
+    Shop.findById(order.shopId).select("owner").lean(),
+  ]);
+  const customerPhone = String(user?.phone || "").replace(/\D/g, "").slice(-10);
+  if (!/^[6-9]\d{9}$/.test(customerPhone))
+    throw serviceError("A valid shop owner mobile number is required for checkout", 400);
+  const provider = paymentProvider();
+  const gateway = await provider.createOrder({
+    orderId: `dk_${String(order._id)}`,
+    amountMinor: order.amountMinor,
+    currency: order.currency,
+    customerId: `shop_${String(order.shopId).replaceAll("-", "")}`,
+    customerPhone,
+    customerName: shop?.owner || undefined,
+    idempotencyKey: providerRequestId,
+  });
+  await PaymentOrder.updateOne(
+    { _id: order._id, status: { $ne: "paid" } },
+    {
+      $set: {
+        gatewayOrderId: gateway.id,
+        gatewayReferenceId: gateway.cfOrderId || undefined,
+        paymentSessionId: gateway.paymentSessionId,
+        status: "pending",
+      },
+    },
+  );
+  return await PaymentOrder.findById(order._id).lean();
+}
+
+function normalizeCashfreePayment(payment) {
+  if (!payment || !payment.cf_payment_id || !payment.order_id)
+    throw serviceError("Cashfree payment record is incomplete", 409);
+  const amountMinor = cashfreeAmountMinor(payment.payment_amount);
+  const status = payment.payment_status === "SUCCESS"
+    ? "captured"
+    : ["FAILED", "USER_DROPPED", "CANCELLED"].includes(payment.payment_status)
+      ? "failed"
+      : "pending";
+  return {
+    id: String(payment.cf_payment_id),
+    order_id: payment.order_id,
+    status,
+    gatewayStatus: payment.payment_status,
+    amount: amountMinor,
+    currency: payment.payment_currency,
+    method: payment.payment_group,
+    created_at: payment.payment_time,
+  };
+}
+
+function assertCashfreeOrder(order, providerOrder) {
+  const amountMinor = cashfreeAmountMinor(providerOrder?.order_amount);
+  if (
+    providerOrder?.order_id !== order.gatewayOrderId ||
+    providerOrder?.order_status !== "PAID" ||
+    amountMinor !== order.amountMinor ||
+    providerOrder?.order_currency !== order.currency
+  )
+    throw serviceError("Payment amount, order or status does not match", 409);
+}
+
+async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, session }) {
+  assertCashfreeOrder(order, gatewayOrder);
   if (!gatewayPayment || gatewayPayment.order_id !== order.gatewayOrderId)
     throw serviceError("Payment does not match the order", 409);
   if (gatewayPayment.status !== "captured" || gatewayPayment.amount !== order.amountMinor || gatewayPayment.currency !== order.currency)
     throw serviceError("Payment amount or status does not match the order", 409);
   const existing = await PaymentTransaction.findOne({ gatewayPaymentId: gatewayPayment.id }).session(session);
+  if (existing && (String(existing.shopId) !== String(order.shopId) || String(existing.orderId) !== String(order._id)))
+    throw serviceError("Payment reference is already attached to another order", 409);
   if (existing?.status === "captured" && existing.verificationStatus === "verified")
     return { payment: existing.toObject(), repeated: true };
-  const plan = await SubscriptionPlan.findById(order.planId).session(session).lean();
-  if (!plan) throw serviceError("Purchased plan is no longer available", 409);
+  const plan = order.pricingSnapshot?.plan;
+  if (!plan || plan.code !== order.planCode)
+    throw serviceError("Purchased plan snapshot is unavailable", 409);
   const now = new Date();
   const schedule = await getScheduleForPurchase(order.shopId, plan, session, now);
   const expiresAt = addCalendarMonths(schedule.startsAt, order.durationMonths);
   const payment = {
     shopId: order.shopId,
     orderId: order._id,
-    provider: "razorpay",
+    provider: "cashfree",
     gatewayPaymentId: gatewayPayment.id,
     gatewayOrderId: gatewayPayment.order_id,
     amountMinor: gatewayPayment.amount,
@@ -575,7 +731,9 @@ async function reconcilePayment({ gatewayPayment, order, actorId, session }) {
     method: gatewayPayment.method,
     status: "captured",
     verificationStatus: "verified",
-    gatewayCreatedAt: gatewayPayment.created_at ? new Date(gatewayPayment.created_at * 1000) : undefined,
+    gatewayCreatedAt: gatewayPayment.created_at
+      ? (typeof gatewayPayment.created_at === "number" ? new Date(gatewayPayment.created_at * 1000) : new Date(gatewayPayment.created_at))
+      : undefined,
     verifiedAt: now,
   };
   let paymentDoc = existing;
@@ -590,17 +748,10 @@ async function reconcilePayment({ gatewayPayment, order, actorId, session }) {
     [
       {
         shopId: order.shopId,
-        planId: plan._id,
+        planId: order.planId,
         planCode: plan.code,
-        planSnapshot: {
-          code: plan.code,
-          name: plan.name,
-          monthlyPriceMinor: plan.monthlyPriceMinor,
-          currency: plan.currency,
-          customerLimit: plan.customerLimit,
-          unlimitedCustomers: plan.unlimitedCustomers,
-          entitlements: plan.entitlements || {},
-        },
+        planSnapshot: { ...plan },
+        pricingSnapshot: { ...order.pricingSnapshot },
         status,
         startsAt: schedule.startsAt,
         expiresAt,
@@ -636,191 +787,251 @@ async function reconcilePayment({ gatewayPayment, order, actorId, session }) {
   return { payment: paymentDoc.toObject(), subscription: subscription.toObject(), repeated: false };
 }
 
-export async function verifyPayment({ shopId, userId, orderId, paymentId, signature }) {
-  const provider = paymentProvider({ forVerification: true });
-  const order = await PaymentOrder.findOne({ _id: orderId, shopId });
-  if (!order) throw serviceError("Payment order not found", 404);
-  const expected = createHmac("sha256", subscriptionConfig.razorpayKeySecret)
-    .update(`${order.gatewayOrderId}|${paymentId}`)
-    .digest();
-  let provided;
-  try { provided = Buffer.from(signature, "hex"); } catch { provided = Buffer.alloc(0); }
-  if (provided.length !== expected.length || !timingSafeEqual(provided, expected))
-    throw serviceError("Payment signature is invalid", 400);
-  const gatewayPayment = await provider.fetchPayment(paymentId);
+async function activateVerifiedPayment({ shopId, userId, order, gatewayOrder, payment }) {
+  assertCashfreeOrder(order, gatewayOrder);
+  const gatewayPayment = normalizeCashfreePayment(payment);
+  if (gatewayPayment.status !== "captured" || gatewayPayment.amount !== order.amountMinor || gatewayPayment.currency !== order.currency)
+    throw serviceError("Payment amount or status does not match the order", 409);
   const session = await mongoose.startSession();
   let result;
   try {
     await session.withTransaction(async () => {
       const current = await PaymentOrder.findOne({ _id: order._id, shopId }).session(session);
       if (!current) throw serviceError("Payment order not found", 404);
-      result = await reconcilePayment({ gatewayPayment, order: current, actorId: userId, session });
+      if (current.status !== "paid")
+        result = await reconcilePayment({ gatewayPayment, gatewayOrder, order: current, actorId: userId || null, session });
+      else {
+        const committed = await PaymentTransaction.findOne({ orderId: current._id, status: "captured", verificationStatus: "verified" }).session(session);
+        if (!committed) throw serviceError("Paid order has no verified transaction", 409);
+        result = { payment: committed.toObject(), repeated: true };
+      }
     });
   } catch (error) {
     if (error.code === 11000) {
-      const committed = await PaymentTransaction.findOne({ shopId, gatewayPaymentId: paymentId }).lean();
-      if (committed && String(committed.orderId) === String(order._id)) {
-        await notifyPaymentSuccess(shopId, paymentId);
-        return { status: "paid", paymentId: String(committed._id), subscription: await getCurrentSubscription(shopId) };
-      }
-    }
-    throw error;
+      const committed = await PaymentTransaction.findOne({ shopId, gatewayPaymentId: gatewayPayment.id, orderId: order._id, status: "captured", verificationStatus: "verified" }).lean();
+      if (committed) result = { payment: committed, repeated: true };
+      else throw error;
+    } else throw error;
   } finally { await session.endSession(); }
-  await notifyPaymentSuccess(shopId, result.payment.gatewayPaymentId);
+  await notifyPaymentSuccess(shopId, gatewayPayment.id);
   return { status: "paid", paymentId: String(result.payment._id), subscription: await getCurrentSubscription(shopId) };
 }
 
-export async function getPaymentOrderStatus({ shopId, orderId }) {
-  let order = await PaymentOrder.findOne({ _id: orderId, shopId });
-  if (!order) throw serviceError("Payment order not found", 404);
-  if (order.status !== "paid" && order.gatewayOrderId) {
-    const provider = paymentProvider({ forVerification: true });
-    const payments = await provider.fetchOrderPayments(order.gatewayOrderId);
-    const captured = payments.find((payment) => payment.status === "captured");
-    if (captured) {
-      const session = await mongoose.startSession();
-      try {
-        await session.withTransaction(async () => {
-          order = await PaymentOrder.findOne({ _id: order._id, shopId }).session(session);
-          if (!order) throw serviceError("Payment order not found", 404);
-          if (order.status !== "paid")
-            await reconcilePayment({ gatewayPayment: captured, order, actorId: null, session });
-        });
-      } catch (error) {
-        if (error.code !== 11000) throw error;
-        const committed = await PaymentTransaction.findOne({
-          shopId,
-          gatewayPaymentId: captured.id,
-          orderId: order._id,
-          status: "captured",
-          verificationStatus: "verified",
-        }).lean();
-        if (!committed) throw error;
-      } finally { await session.endSession(); }
-      order = await PaymentOrder.findOne({ _id: orderId, shopId });
-      if (order?.status === "paid") await notifyPaymentSuccess(shopId, captured.id);
-    }
+async function inspectCashfreeOrder(order, userId = null) {
+  if (!order.gatewayOrderId) return { id: String(order._id), status: "pending", amountMinor: order.amountMinor, currency: order.currency };
+  const provider = paymentProvider({ forVerification: true });
+  const [gatewayOrder, payments] = await Promise.all([
+    provider.fetchOrder(order.gatewayOrderId),
+    provider.fetchOrderPayments(order.gatewayOrderId),
+  ]);
+  const successful = payments.find((payment) => payment.payment_status === "SUCCESS");
+  if (gatewayOrder.order_status === "PAID" && successful) {
+    const result = await activateVerifiedPayment({ shopId: order.shopId, userId, order, gatewayOrder, payment: successful });
+    return { id: String(order._id), status: "paid", amountMinor: order.amountMinor, currency: order.currency, paymentId: result.paymentId, subscription: result.subscription };
+  }
+  if (["EXPIRED", "TERMINATED"].includes(gatewayOrder.order_status) && order.status !== "paid") {
+    await PaymentOrder.updateOne({ _id: order._id, shopId: order.shopId, status: { $ne: "paid" } }, { $set: { status: "failed", checkoutActive: false } });
+    order.status = "failed";
   }
   return {
     id: String(order._id),
     status: order.status === "created" ? "pending" : order.status,
     amountMinor: order.amountMinor,
     currency: order.currency,
+    gatewayOrderId: order.gatewayOrderId,
   };
 }
 
-export async function processPaymentWebhook({ eventId, eventType, payment }) {
-  const order = await PaymentOrder.findOne({ gatewayOrderId: payment.order_id }).lean();
+export async function verifyPayment({ shopId, userId, orderId }) {
+  const order = await PaymentOrder.findOne({ _id: orderId, shopId }).lean();
+  if (!order) throw serviceError("Payment order not found", 404);
+  if (order.status === "paid") {
+    const payment = await PaymentTransaction.findOne({ orderId: order._id, status: "captured", verificationStatus: "verified" }).lean();
+    return { status: "paid", paymentId: payment ? String(payment._id) : null, subscription: await getCurrentSubscription(shopId) };
+  }
+  return inspectCashfreeOrder(order, userId);
+}
+
+export async function getPaymentOrderStatus({ shopId, orderId }) {
+  const order = await PaymentOrder.findOne({ _id: orderId, shopId }).lean();
+  if (!order) throw serviceError("Payment order not found", 404);
+  if (order.status === "paid") {
+    const payment = await PaymentTransaction.findOne({ orderId: order._id, status: "captured", verificationStatus: "verified" }).lean();
+    return { id: String(order._id), status: "paid", amountMinor: order.amountMinor, currency: order.currency, paymentId: payment ? String(payment._id) : null };
+  }
+  return inspectCashfreeOrder(order);
+}
+
+export async function getPaymentAttemptStatus({ shopId, idempotencyKey }) {
+  const order = await PaymentOrder.findOne({ shopId, idempotencyKey }).select("_id").lean();
+  if (!order) throw serviceError("Payment attempt not found", 404);
+  return getPaymentOrderStatus({ shopId, orderId: String(order._id) });
+}
+
+const paymentReconciliationBackoffMinutes = [1, 5, 15, 60, 240, 720, 1440, 2880];
+const PAYMENT_RECONCILIATION_MAX_ATTEMPTS = paymentReconciliationBackoffMinutes.length;
+
+/** Bounded recovery for paid orders whose app callback and webhook were missed. */
+export async function reconcilePendingCashfreePayments({ limit = 20, now = new Date() } = {}) {
+  const boundedLimit = Math.min(50, Math.max(1, Number.isSafeInteger(limit) ? limit : 20));
+  const recentCutoff = new Date(now.getTime() - 7 * 86400000);
+  const candidates = await PaymentOrder.find({
+    status: { $in: ["created", "pending"] },
+    gatewayOrderId: { $type: "string" },
+    createdAt: { $gte: recentCutoff },
+    $or: [
+      { paymentReconciliationAttempts: { $lt: PAYMENT_RECONCILIATION_MAX_ATTEMPTS } },
+      { paymentReconciliationAttempts: { $exists: false } },
+    ],
+    $and: [{
+      $or: [
+        { paymentReconciliationNextAt: { $exists: false } },
+        { paymentReconciliationNextAt: null },
+        { paymentReconciliationNextAt: { $lte: now } },
+      ],
+    }],
+  })
+    .sort({ paymentReconciliationNextAt: 1, createdAt: 1, _id: 1 })
+    .limit(boundedLimit)
+    .select("_id shopId status createdAt paymentReconciliationAttempts paymentReconciliationNextAt")
+    .lean();
+  const result = { scanned: candidates.length, attempted: 0, paid: 0, pending: 0, failed: 0, skipped: 0 };
+  for (const candidate of candidates) {
+    const attempts = candidate.paymentReconciliationAttempts ?? 0;
+    const delayMinutes = paymentReconciliationBackoffMinutes[attempts];
+    if (delayMinutes === undefined) { result.skipped += 1; continue; }
+    const due = candidate.paymentReconciliationNextAt;
+    const claim = await PaymentOrder.findOneAndUpdate(
+      {
+        _id: candidate._id,
+        status: { $in: ["created", "pending"] },
+        $and: [
+          {
+            $or: [
+              { paymentReconciliationAttempts: attempts },
+              ...(candidate.paymentReconciliationAttempts == null
+                ? [{ paymentReconciliationAttempts: { $exists: false } }]
+                : []),
+            ],
+          },
+          {
+            $or: [
+              { paymentReconciliationNextAt: { $exists: false } },
+              { paymentReconciliationNextAt: null },
+              { paymentReconciliationNextAt: { $lte: now } },
+            ],
+          },
+        ],
+        ...(due ? { paymentReconciliationNextAt: due } : {}),
+      },
+      {
+        $inc: { paymentReconciliationAttempts: 1 },
+        $set: { paymentReconciliationNextAt: new Date(now.getTime() + delayMinutes * 60000) },
+      },
+      { new: true },
+    ).lean();
+    if (!claim) { result.skipped += 1; continue; }
+    result.attempted += 1;
+    try {
+      const status = await inspectCashfreeOrder(claim);
+      if (status.status === "paid") result.paid += 1;
+      else if (status.status === "failed") result.failed += 1;
+      else result.pending += 1;
+      await PaymentOrder.updateOne(
+        { _id: claim._id },
+        { $unset: { paymentReconciliationLastCode: 1 } },
+      );
+    } catch (error) {
+      const code = typeof error?.code === "string" && /^[A-Z0-9_-]{1,40}$/i.test(error.code)
+        ? error.code
+        : "PAYMENT_RECONCILIATION_FAILED";
+      await PaymentOrder.updateOne(
+        { _id: claim._id, status: { $in: ["created", "pending"] } },
+        { $set: { paymentReconciliationLastCode: code } },
+      );
+      result.failed += 1;
+    }
+  }
+  return result;
+}
+
+export async function processPaymentWebhook({ eventId, eventType, orderId, paymentId }) {
+  const order = await PaymentOrder.findOne({ gatewayOrderId: orderId }).lean();
   if (!order) return { ignored: true };
+  const paymentEvent = await mongoose.model("PaymentWebhookEvent").findOne({ eventId }).lean();
+  if (paymentEvent?.status === "processed") return { duplicate: true };
+  const provider = paymentProvider({ forVerification: true });
+  const [gatewayOrder, remotePayment] = await Promise.all([
+    provider.fetchOrder(order.gatewayOrderId),
+    provider.fetchPayment({ orderId: order.gatewayOrderId, paymentId }),
+  ]);
+  const normalized = normalizeCashfreePayment(remotePayment);
+  if (normalized.order_id !== order.gatewayOrderId)
+    throw serviceError("Webhook payment does not match the order", 409);
+  const successEvent = eventType === "PAYMENT_SUCCESS_WEBHOOK";
+  const failureEvent = ["PAYMENT_FAILED_WEBHOOK", "PAYMENT_USER_DROPPED_WEBHOOK"].includes(eventType);
+  if (!successEvent && !failureEvent) return { ignored: true };
+  if (successEvent && (normalized.status !== "captured" || gatewayOrder.order_status !== "PAID"))
+    throw serviceError("Cashfree payment is not yet verifiably paid", 503);
+  if (failureEvent && normalized.status !== "failed") return { ignored: true };
+
   const session = await mongoose.startSession();
   let result;
   try {
     await session.withTransaction(async () => {
-      const repeated = await mongoose.model("PaymentWebhookEvent").findOne({ eventId }).session(session);
+      const WebhookEvent = mongoose.model("PaymentWebhookEvent");
+      const repeated = await WebhookEvent.findOne({ eventId }).session(session);
       if (repeated?.status === "processed") { result = { duplicate: true }; return; }
-      if (!repeated)
-        await mongoose.model("PaymentWebhookEvent").create([{ eventId, eventType }], { session });
-      const currentOrder = await PaymentOrder.findOne({ _id: order._id }).session(session);
-      if (eventType === "payment.captured" || eventType === "order.paid") {
-        result = await reconcilePayment({ gatewayPayment: payment, order: currentOrder, actorId: null, session });
-      } else if (eventType === "payment.failed") {
-        if (payment.order_id !== currentOrder.gatewayOrderId)
-          throw serviceError("Payment does not match the order", 409);
-        const existingPayment = await PaymentTransaction.findOne({ gatewayPaymentId: payment.id }).session(session);
-        if (!existingPayment) {
-          await PaymentTransaction.create([{
+      if (!repeated) await WebhookEvent.create([{ eventId, eventType }], { session });
+      const currentOrder = await PaymentOrder.findOne({ _id: order._id, shopId: order.shopId }).session(session);
+      if (!currentOrder) throw serviceError("Payment order not found", 404);
+      if (successEvent) {
+        result = await reconcilePayment({ gatewayPayment: normalized, gatewayOrder, order: currentOrder, actorId: null, session });
+      } else {
+        const existing = await PaymentTransaction.findOne({ gatewayPaymentId: normalized.id }).session(session);
+        if (existing && (String(existing.shopId) !== String(currentOrder.shopId) || String(existing.orderId) !== String(currentOrder._id)))
+          throw serviceError("Payment reference is already attached to another order", 409);
+        if (currentOrder.status !== "paid" && existing?.status !== "captured") {
+          const record = {
             shopId: currentOrder.shopId,
             orderId: currentOrder._id,
-            provider: "razorpay",
-            gatewayPaymentId: payment.id,
-            gatewayOrderId: payment.order_id,
-            amountMinor: Number.isSafeInteger(payment.amount) ? payment.amount : currentOrder.amountMinor,
-            currency: payment.currency || currentOrder.currency,
-            method: payment.method,
+            provider: "cashfree",
+            gatewayPaymentId: normalized.id,
+            gatewayOrderId: normalized.order_id,
+            amountMinor: normalized.amount ?? currentOrder.amountMinor,
+            currency: normalized.currency || currentOrder.currency,
+            method: normalized.method,
             status: "failed",
             verificationStatus: "verified",
-            gatewayCreatedAt: payment.created_at ? new Date(payment.created_at * 1000) : undefined,
+            gatewayCreatedAt: normalized.created_at ? new Date(normalized.created_at) : undefined,
             verifiedAt: new Date(),
-          }], { session });
-        }
-        if (currentOrder.status !== "paid") {
-          currentOrder.status = "failed";
-          currentOrder.checkoutActive = false;
-          await currentOrder.save({ session });
+          };
+          if (existing) { existing.set(record); await existing.save({ session }); }
+          else await PaymentTransaction.create([record], { session });
           await SubscriptionAuditLog.create([{
             shopId: currentOrder.shopId,
             previousPlan: null,
             newPlan: null,
             eventType: "payment_failed",
-            referenceId: `payment-failed:${payment.id}`,
+            referenceId: `payment-failed:${normalized.id}`,
             actorType: "gateway",
             occurredAt: new Date(),
             metadata: { paymentOrderId: String(currentOrder._id) },
           }], { session });
         }
-        result = {
-          failed: currentOrder.status !== "paid" && existingPayment?.status !== "captured",
-        };
-      } else if (["payment.refunded", "refund.processed"].includes(eventType)) {
-        const transaction = await PaymentTransaction.findOne({ gatewayPaymentId: payment.id }).session(session);
-        if (transaction) {
-          const refundedAmountMinor = payment.amount_refunded;
-          if (
-            !Number.isSafeInteger(refundedAmountMinor) ||
-            refundedAmountMinor < 0 ||
-            refundedAmountMinor > transaction.amountMinor ||
-            payment.currency !== transaction.currency ||
-            payment.order_id !== transaction.gatewayOrderId
-          )
-            throw serviceError("Refund amount or payment does not match the transaction", 409);
-          // Razorpay webhook payloads are event-time snapshots and can arrive
-          // out of order. Cumulative refunded amount is monotonic, so an older
-          // snapshot must never reduce the amount already reconciled.
-          const reconciledRefundAmount = Math.max(
-            transaction.refundedAmountMinor || 0,
-            refundedAmountMinor,
-          );
-          transaction.refundedAmountMinor = reconciledRefundAmount;
-          transaction.status = reconciledRefundAmount === 0
-            ? "captured"
-            : reconciledRefundAmount >= transaction.amountMinor
-              ? "refunded"
-              : "partially_refunded";
-          transaction.refundReferences.addToSet(eventId);
-          await transaction.save({ session });
-          currentOrder.status = transaction.status;
-          await currentOrder.save({ session });
-          await SubscriptionAuditLog.create([{ shopId: currentOrder.shopId, eventType: "payment_refund_review_required", referenceId: `refund:${eventId}`, actorType: "gateway", occurredAt: new Date(), metadata: { paymentTransactionId: String(transaction._id), amountRefundedMinor: reconciledRefundAmount } }], { session });
-        }
-        result = { refunded: Boolean(transaction) };
-      } else result = { ignored: true };
-      await mongoose.model("PaymentWebhookEvent").updateOne({ eventId }, { $set: { status: "processed", processedAt: new Date() } }, { session });
+        result = { failed: currentOrder.status !== "paid" };
+      }
+      await WebhookEvent.updateOne({ eventId }, { $set: { status: "processed", processedAt: new Date() } }, { session });
     });
   } catch (error) {
     if (error.code === 11000) {
-      const committed = payment?.id
-        ? await PaymentTransaction.findOne({ gatewayPaymentId: payment.id }).lean()
-        : null;
-      if (committed) {
-        await mongoose.model("PaymentWebhookEvent").updateOne(
-          { eventId },
-          { $setOnInsert: { eventId, eventType, status: "processed", processedAt: new Date() } },
-          { upsert: true },
-        ).catch(() => {});
-        if (eventType === "payment.captured")
-          await notifyPaymentSuccess(order.shopId, payment.id);
-        if (eventType === "payment.failed")
-          await notifyPaymentFailure(order.shopId, payment.id);
-        return { duplicate: true };
-      }
       const duplicateEvent = await mongoose.model("PaymentWebhookEvent").findOne({ eventId }).lean();
-      if (duplicateEvent?.status === "processed") return { duplicate: true };
+      const committed = await PaymentTransaction.findOne({ shopId: order.shopId, gatewayPaymentId: normalized.id, orderId: order._id }).lean();
+      if (duplicateEvent?.status === "processed" || committed) return { duplicate: true };
     }
     throw error;
   } finally { await session.endSession(); }
-  if (eventType === "payment.captured" && result?.payment)
-    await notifyPaymentSuccess(order.shopId, result.payment.gatewayPaymentId);
-  if (eventType === "payment.failed" && result?.failed)
-    await notifyPaymentFailure(order.shopId, payment.id);
+  if (successEvent && result?.payment) await notifyPaymentSuccess(order.shopId, normalized.id);
+  if (failureEvent && result?.failed) await notifyPaymentFailure(order.shopId, normalized.id);
   return result;
 }

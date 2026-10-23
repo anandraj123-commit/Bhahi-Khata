@@ -15,8 +15,30 @@ export type AdminSession = {
   expiresAt: string;
   reauthenticatedAt: string | null;
 };
-export type Pagination = { page: number; limit: number; total: number };
-export type Envelope<T> = { data: T; pagination?: Pagination };
+export type Pagination = { page: number; limit: number; total: number; pages?: number };
+export type CustomerStatus = "active" | "disabled" | "removed" | "invalid";
+export type AdminCustomer = {
+  _id: string;
+  customerId: string;
+  name: string;
+  shopId: string;
+  shopName: string;
+  status: CustomerStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+export type CustomerSummary = {
+  total: number;
+  active: number;
+  disabled: number;
+  removed: number;
+};
+export type CustomerShop = { id: string; name: string };
+export type Envelope<T> = {
+  data: T;
+  pagination?: Pagination;
+  summary?: CustomerSummary;
+};
 export type DataRow = { _id?: string; id?: string; [key: string]: unknown };
 export type Series = { _id: string; count: number }[];
 export type Dashboard = {

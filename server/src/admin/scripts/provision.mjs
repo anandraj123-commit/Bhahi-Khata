@@ -3,6 +3,7 @@
 import "dotenv/config";
 import mongoose from "mongoose";
 import { connectDatabase } from "../../config/database.js";
+import { Customer } from "../../models.js";
 import { adminConfig } from "../config/index.js";
 import {
   adminModels,
@@ -12,6 +13,7 @@ import {
 } from "../models/index.js";
 import { createAdmin } from "../validators/index.js";
 import { hashPassword } from "../utils/security.js";
+import { customerAdminIndexes } from "../services/customers.js";
 try {
   const mode = process.argv[2];
   if (!["--indexes", "--bootstrap"].includes(mode))
@@ -37,6 +39,9 @@ try {
     if (!exists) await model.createCollection();
     await model.createIndexes();
   }
+  if (mode === "--indexes")
+    for (const [keys, options] of customerAdminIndexes)
+      await Customer.collection.createIndex(keys, options);
   if (input) {
     await mongoose.connection.transaction(async (session) => {
       if (await AdminUser.countDocuments().session(session))

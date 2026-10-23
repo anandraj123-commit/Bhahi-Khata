@@ -7,7 +7,10 @@ const { connectDatabase } = await import("../../config/database.js");
 await connectDatabase();
 const f = await fixture();
 const { createApp } = await import("../../app.js");
-const server = createApp().listen(4100, "127.0.0.1");
+const port = Number(process.env.ADMIN_TEST_PORT || 4100);
+if (!Number.isInteger(port) || port < 1024 || port > 65535)
+  throw new Error("Invalid admin browser-test port");
+const server = createApp().listen(port, "127.0.0.1");
 await new Promise((resolve) => server.once("listening", resolve));
 await writeFile(
   "/tmp/dk-admin-browser-fixture.json",
@@ -22,7 +25,7 @@ await writeFile(
   { mode: 0o600 },
 );
 console.log(
-  "Admin browser test fixtures ready on localhost:4100; credentials are in a private temporary file.",
+  `Admin browser test fixtures ready on localhost:${port}; credentials are in a private temporary file.`,
 );
 const shutdown = () =>
   server.close(async () => {
