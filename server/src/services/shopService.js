@@ -3,18 +3,21 @@ import {
   Audit, Customer, Device, Entry, FinancialResolution, Idempotency, Notification,
   PaymentOrder, PaymentTransaction, ReminderDelivery, Shop, ShopSubscription,
   SubscriptionAuditLog, SubscriptionNotificationLog,
-  SubscriptionNotificationPreference, SubscriptionUsage, User,
+  SubscriptionNotificationPreference, SubscriptionUsage, User, Referral, WalletAccount,
+  WalletLedgerEntry, createReferralCode,
 } from "../models.js";
 import { digest } from "../utils/hashing.js";
 import { shopOut } from "../utils/serializers.js";
 import { isShopSettingsConflict, sameShopValues } from "../utils/records.js";
 import { normalizePhone } from "../utils/phone.js";
+import { attachReferral } from "./referralService.js";
 
 const shopScopedModels = [
   Customer, Entry, Audit, FinancialResolution, Notification, Device, Idempotency,
   ReminderDelivery, ShopSubscription, PaymentOrder, PaymentTransaction,
   SubscriptionAuditLog, SubscriptionNotificationLog,
-  SubscriptionNotificationPreference, SubscriptionUsage,
+  SubscriptionNotificationPreference, SubscriptionUsage, Referral, WalletAccount,
+  WalletLedgerEntry,
 ];
 
 export async function hasShopScopedData(shopId, session) {
@@ -24,7 +27,9 @@ export async function hasShopScopedData(shopId, session) {
     if (session) query = query.session(session);
     return query;
   }));
-  return counts.some((count) => count > 0);
+  const referralQuery = Referral.countDocuments({ $or: [{ referrerShopId: shopId }, { referredShopId: shopId }] }).limit(1);
+  if (session) referralQuery.session(session);
+  return counts.some((count) => count > 0) || (await referralQuery) > 0;
 }
 
 export async function getShop(shopId) {
@@ -62,8 +67,16 @@ export async function registerShop({ userId, input }) {
         address: input.address || "",
         phone: normalizePhone(user.phone),
         whatsapp: input.whatsapp || "",
+        referralCode: createReferralCode(),
         ...(input.language ? { language: input.language } : {}),
       }], { session });
+      if (input.referralCode)
+        await attachReferral({
+          referralCode: input.referralCode,
+          referredShopId: shop._id,
+          referredOwnerId: user._id,
+          session,
+        });
       user.shopId = shop._id;
       await user.save({ session });
       result = { shop, created: true };

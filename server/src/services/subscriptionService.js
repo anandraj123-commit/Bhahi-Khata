@@ -10,6 +10,8 @@ import {
   SubscriptionPlan,
   SubscriptionUsage,
   User,
+  WalletAccount,
+  WalletLedgerEntry,
 } from "../models.js";
 import { subscriptionConfig } from "../config/env.js";
 import { paymentProvider } from "../providers/paymentProvider.js";
@@ -445,7 +447,9 @@ export async function listPaymentHistory({ shopId, limit = 30, cursor }) {
         planCode: row.planCode,
         durationMonths: row.durationMonths,
         pricing: row.pricingSnapshot,
-        amountMinor: row.amountMinor,
+        amountMinor: row.totalAmountMinor ?? (row.amountMinor + (row.walletAppliedMinor || 0)),
+        cashPaidMinor: row.amountMinor,
+        walletAppliedMinor: row.walletAppliedMinor || 0,
         currency: row.currency,
         status: payment?.status || (row.status === "created" ? "pending" : row.status),
         gatewayOrderId: row.gatewayOrderId || null,
@@ -535,17 +539,20 @@ async function getScheduleForPurchase(shopId, plan, session, now) {
   throw serviceError("This plan change is not available", 409);
 }
 
-export async function createSubscriptionOrder({ shopId, userId, planCode, months, idempotencyKey, acceptedPricingVersion }) {
+export async function createSubscriptionOrder({ shopId, userId, planCode, months, idempotencyKey, acceptedPricingVersion, useWallet = false }) {
   if (!idempotencyKey || idempotencyKey.length > 128)
     throw serviceError("A valid Idempotency-Key is required", 400);
+  // Keep existing distribution, compliance and payment-readiness gates for all
+  // paid-plan purchases, including wallet-only purchases.
   paymentProvider();
-  const hash = digest(JSON.stringify({ planCode, months }));
+  const hash = digest(JSON.stringify(useWallet === true ? { planCode, months, useWallet: true } : { planCode, months }));
   const now = new Date();
   await PaymentOrder.updateMany(
     {
       shopId,
       status: { $in: ["created", "pending"] },
       checkoutActive: true,
+      walletReservationStatus: { $ne: "reserved" },
       checkoutExpiresAt: { $lte: now },
     },
     { $set: { checkoutActive: false, status: "failed" } },
@@ -557,6 +564,14 @@ export async function createSubscriptionOrder({ shopId, userId, planCode, months
       throw serviceError("Checkout order expired; start a new checkout", 409);
     if (old.status === "failed") throw serviceError("Checkout order failed; start a new checkout", 409);
     return { order: await prepareCashfreeOrder(old), repeated: true };
+  }
+  const reservedCheckout = await PaymentOrder.findOne({ shopId, checkoutActive: true, walletReservationStatus: "reserved" }).lean();
+  if (reservedCheckout) {
+    if (reservedCheckout.gatewayOrderId && reservedCheckout.checkoutExpiresAt <= now)
+      await inspectCashfreeOrder(reservedCheckout, userId);
+    const stillOpen = await PaymentOrder.findOne({ _id: reservedCheckout._id, checkoutActive: true }).lean();
+    if (stillOpen)
+      throw serviceError("A wallet-assisted payment is still pending. Verify or finish it before starting another purchase.", 409, { code: "WALLET_PAYMENT_PENDING" });
   }
   const plan = await SubscriptionPlan.findOne({ code: planCode, enabled: true }).lean();
   if (!plan || plan.code === "free") throw serviceError("Paid plan not found", 404);
@@ -573,6 +588,98 @@ export async function createSubscriptionOrder({ shopId, userId, planCode, months
       },
     });
   const schedule = await getScheduleForPurchase(shopId, plan, null, new Date());
+  if (useWallet) {
+    const session = await mongoose.startSession();
+    let walletOrder;
+    let repeatedWalletOrder = false;
+    try {
+      await session.withTransaction(async () => {
+        const account = await WalletAccount.findOneAndUpdate(
+          { shopId },
+          { $setOnInsert: { shopId, balanceMinor: 0, reservedMinor: 0 } },
+          { upsert: true, new: true, session },
+        ).lean();
+        const available = Math.max(0, (account?.balanceMinor || 0) - (account?.reservedMinor || 0));
+        // Cashfree does not accept sub-rupee order values; leave at least ₹1
+        // for gateway checkout unless the wallet covers the entire purchase.
+        const walletAppliedMinor = available >= pricing.finalAmountMinor
+          ? pricing.finalAmountMinor
+          : Math.min(available, Math.max(0, pricing.finalAmountMinor - 100));
+        if (walletAppliedMinor <= 0)
+          throw serviceError("There is not enough wallet balance to apply. Add wallet funds or continue without wallet.", 409, { code: "WALLET_BALANCE_INSUFFICIENT" });
+        const cashAmountMinor = pricing.finalAmountMinor - walletAppliedMinor;
+        const purchasePricing = {
+          plan: {
+            id: String(plan._id), code: plan.code, name: plan.name, description: plan.description,
+            monthlyPriceMinor: plan.monthlyPriceMinor, currency: plan.currency,
+            customerLimit: plan.customerLimit, unlimitedCustomers: plan.unlimitedCustomers,
+            entitlements: plan.entitlements || {}, features: plan.features || [],
+            configurationVersion: plan.configurationVersion || 1, pricingVersion: plan.pricingVersion || 1,
+          },
+          ...pricing,
+          walletAppliedMinor,
+          cashPayableMinor: cashAmountMinor,
+          createdAt: new Date().toISOString(),
+        };
+        const now = new Date();
+        const currentSchedule = await getScheduleForPurchase(shopId, plan, session, now);
+        const fullWallet = cashAmountMinor === 0;
+        [walletOrder] = await PaymentOrder.create([{
+          shopId, userId, appMode: subscriptionConfig.appMode, planId: plan._id, planCode, durationMonths: months,
+          amountMinor: cashAmountMinor, totalAmountMinor: pricing.finalAmountMinor, walletAppliedMinor,
+          walletReservationStatus: fullWallet ? "captured" : "reserved", currency: pricing.currency,
+          pricingSnapshot: purchasePricing, idempotencyKey, requestHash: hash, providerRequestId: randomUUID(),
+          status: fullWallet ? "paid" : "created", checkoutActive: !fullWallet,
+          checkoutExpiresAt: fullWallet ? undefined : new Date(Date.now() + 2 * 60 * 60 * 1000),
+          scheduledStartAt: currentSchedule.status === "scheduled" ? currentSchedule.startsAt : null,
+          ...(fullWallet ? { verifiedAt: now } : {}),
+        }], { session });
+        if (fullWallet) {
+          const charged = await WalletAccount.updateOne(
+            { shopId, balanceMinor: { $gte: walletAppliedMinor }, $expr: { $gte: [{ $subtract: ["$balanceMinor", "$reservedMinor"] }, walletAppliedMinor] } },
+            { $inc: { balanceMinor: -walletAppliedMinor } }, { session },
+          );
+          if (charged.modifiedCount !== 1) throw serviceError("Wallet balance changed. Refresh and try again.", 409, { code: "WALLET_BALANCE_CHANGED" });
+          await WalletLedgerEntry.create([{
+            shopId, direction: "debit", amountMinor: walletAppliedMinor, reason: "subscription_purchase",
+            idempotencyKey: `subscription:${walletOrder._id}`, orderId: walletOrder._id,
+            description: `Subscription purchase: ${plan.name} (${months} months)`,
+          }], { session });
+          const expiresAt = addCalendarMonths(currentSchedule.startsAt, months);
+          const status = currentSchedule.startsAt > now ? "scheduled" : "active";
+          const [subscription] = await ShopSubscription.create([{
+            shopId, planId: plan._id, planCode, planSnapshot: purchasePricing.plan,
+            pricingSnapshot: purchasePricing, status, startsAt: currentSchedule.startsAt, expiresAt,
+            durationMonths: months, renewalOf: currentSchedule.renewalOf,
+            activatedAt: status === "active" ? now : undefined, amountPaidMinor: pricing.finalAmountMinor,
+          }], { session });
+          await SubscriptionAuditLog.create([{
+            shopId, previousPlan: currentSchedule.previousPlan || null, newPlan: subscription.planSnapshot,
+            eventType: status === "active" ? "subscription_activated" : "subscription_scheduled",
+            referenceId: `wallet-order:${walletOrder._id}`, actorType: "shopkeeper", actorId: userId,
+            occurredAt: now, metadata: { durationMonths: months, amountMinor: pricing.finalAmountMinor, walletAppliedMinor },
+          }], { session });
+        } else {
+          const reserved = await WalletAccount.updateOne(
+            { shopId, $expr: { $gte: [{ $subtract: ["$balanceMinor", "$reservedMinor"] }, walletAppliedMinor] } },
+            { $inc: { reservedMinor: walletAppliedMinor } }, { session },
+          );
+          if (reserved.modifiedCount !== 1) throw serviceError("Wallet balance changed. Refresh and try again.", 409, { code: "WALLET_BALANCE_CHANGED" });
+        }
+      });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      const existing = await PaymentOrder.findOne({ shopId, idempotencyKey }).lean();
+      if (existing?.requestHash !== hash)
+        throw serviceError("Another subscription checkout is already in progress", 409);
+      walletOrder = existing;
+      repeatedWalletOrder = true;
+    } finally { await session.endSession(); }
+    const walletOrderValue = walletOrder.toObject ? walletOrder.toObject() : walletOrder;
+    if (walletOrder.status === "paid")
+      return { order: walletOrderValue, repeated: repeatedWalletOrder };
+    return { order: await prepareCashfreeOrder(walletOrderValue), repeated: repeatedWalletOrder };
+  }
   let order;
   try {
     [order] = await PaymentOrder.create([
@@ -584,6 +691,7 @@ export async function createSubscriptionOrder({ shopId, userId, planCode, months
         planCode,
         durationMonths: months,
         amountMinor: pricing.finalAmountMinor,
+        totalAmountMinor: pricing.finalAmountMinor,
         currency: pricing.currency,
         pricingSnapshot: {
           plan: {
@@ -714,6 +822,21 @@ async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, 
     throw serviceError("Payment reference is already attached to another order", 409);
   if (existing?.status === "captured" && existing.verificationStatus === "verified")
     return { payment: existing.toObject(), repeated: true };
+  if (order.walletReservationStatus === "reserved" && order.walletAppliedMinor > 0) {
+    const captured = await WalletAccount.updateOne(
+      { shopId: order.shopId, reservedMinor: { $gte: order.walletAppliedMinor }, balanceMinor: { $gte: order.walletAppliedMinor } },
+      { $inc: { reservedMinor: -order.walletAppliedMinor, balanceMinor: -order.walletAppliedMinor } },
+      { session },
+    );
+    if (captured.modifiedCount !== 1)
+      throw serviceError("Reserved wallet funds could not be captured", 409, { code: "WALLET_CAPTURE_FAILED" });
+    await WalletLedgerEntry.create([{
+      shopId: order.shopId, direction: "debit", amountMinor: order.walletAppliedMinor,
+      reason: "subscription_purchase", idempotencyKey: `subscription:${order._id}`,
+      orderId: order._id, description: `Subscription purchase: ${order.pricingSnapshot.plan.name} (${order.durationMonths} months)`,
+    }], { session });
+    order.walletReservationStatus = "captured";
+  }
   const plan = order.pricingSnapshot?.plan;
   if (!plan || plan.code !== order.planCode)
     throw serviceError("Purchased plan snapshot is unavailable", 409);
@@ -759,7 +882,7 @@ async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, 
         sourcePaymentId: paymentDoc._id,
         renewalOf: schedule.renewalOf,
         activatedAt: status === "active" ? now : undefined,
-        amountPaidMinor: order.amountMinor,
+        amountPaidMinor: order.totalAmountMinor ?? (order.amountMinor + (order.walletAppliedMinor || 0)),
       },
     ],
     { session },
@@ -785,6 +908,27 @@ async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, 
     { session },
   );
   return { payment: paymentDoc.toObject(), subscription: subscription.toObject(), repeated: false };
+}
+
+async function releaseWalletReservation(orderId, shopId) {
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const order = await PaymentOrder.findOne({ _id: orderId, shopId }).session(session);
+      if (!order || order.status === "paid") return;
+      if (order.walletReservationStatus === "reserved" && order.walletAppliedMinor > 0) {
+        const released = await WalletAccount.updateOne(
+          { shopId, reservedMinor: { $gte: order.walletAppliedMinor } },
+          { $inc: { reservedMinor: -order.walletAppliedMinor } }, { session },
+        );
+        if (released.modifiedCount !== 1) throw serviceError("Reserved wallet funds could not be released", 409, { code: "WALLET_RELEASE_FAILED" });
+        order.walletReservationStatus = "released";
+      }
+      order.status = "failed";
+      order.checkoutActive = false;
+      await order.save({ session });
+    });
+  } finally { await session.endSession(); }
 }
 
 async function activateVerifiedPayment({ shopId, userId, order, gatewayOrder, payment }) {
@@ -818,7 +962,7 @@ async function activateVerifiedPayment({ shopId, userId, order, gatewayOrder, pa
 }
 
 async function inspectCashfreeOrder(order, userId = null) {
-  if (!order.gatewayOrderId) return { id: String(order._id), status: "pending", amountMinor: order.amountMinor, currency: order.currency };
+  if (!order.gatewayOrderId) return { id: String(order._id), status: "pending", amountMinor: order.amountMinor, totalAmountMinor: order.totalAmountMinor ?? order.amountMinor, walletAppliedMinor: order.walletAppliedMinor || 0, currency: order.currency };
   const provider = paymentProvider({ forVerification: true });
   const [gatewayOrder, payments] = await Promise.all([
     provider.fetchOrder(order.gatewayOrderId),
@@ -827,16 +971,18 @@ async function inspectCashfreeOrder(order, userId = null) {
   const successful = payments.find((payment) => payment.payment_status === "SUCCESS");
   if (gatewayOrder.order_status === "PAID" && successful) {
     const result = await activateVerifiedPayment({ shopId: order.shopId, userId, order, gatewayOrder, payment: successful });
-    return { id: String(order._id), status: "paid", amountMinor: order.amountMinor, currency: order.currency, paymentId: result.paymentId, subscription: result.subscription };
+    return { id: String(order._id), status: "paid", amountMinor: order.amountMinor, totalAmountMinor: order.totalAmountMinor ?? order.amountMinor, walletAppliedMinor: order.walletAppliedMinor || 0, currency: order.currency, paymentId: result.paymentId, subscription: result.subscription };
   }
   if (["EXPIRED", "TERMINATED"].includes(gatewayOrder.order_status) && order.status !== "paid") {
-    await PaymentOrder.updateOne({ _id: order._id, shopId: order.shopId, status: { $ne: "paid" } }, { $set: { status: "failed", checkoutActive: false } });
+    await releaseWalletReservation(order._id, order.shopId);
     order.status = "failed";
   }
   return {
     id: String(order._id),
     status: order.status === "created" ? "pending" : order.status,
     amountMinor: order.amountMinor,
+    totalAmountMinor: order.totalAmountMinor ?? order.amountMinor,
+    walletAppliedMinor: order.walletAppliedMinor || 0,
     currency: order.currency,
     gatewayOrderId: order.gatewayOrderId,
   };
@@ -857,7 +1003,7 @@ export async function getPaymentOrderStatus({ shopId, orderId }) {
   if (!order) throw serviceError("Payment order not found", 404);
   if (order.status === "paid") {
     const payment = await PaymentTransaction.findOne({ orderId: order._id, status: "captured", verificationStatus: "verified" }).lean();
-    return { id: String(order._id), status: "paid", amountMinor: order.amountMinor, currency: order.currency, paymentId: payment ? String(payment._id) : null };
+    return { id: String(order._id), status: "paid", amountMinor: order.amountMinor, totalAmountMinor: order.totalAmountMinor ?? order.amountMinor, walletAppliedMinor: order.walletAppliedMinor || 0, currency: order.currency, paymentId: payment ? String(payment._id) : null };
   }
   return inspectCashfreeOrder(order);
 }
@@ -874,14 +1020,19 @@ const PAYMENT_RECONCILIATION_MAX_ATTEMPTS = paymentReconciliationBackoffMinutes.
 /** Bounded recovery for paid orders whose app callback and webhook were missed. */
 export async function reconcilePendingCashfreePayments({ limit = 20, now = new Date() } = {}) {
   const boundedLimit = Math.min(50, Math.max(1, Number.isSafeInteger(limit) ? limit : 20));
-  const recentCutoff = new Date(now.getTime() - 7 * 86400000);
   const candidates = await PaymentOrder.find({
     status: { $in: ["created", "pending"] },
     gatewayOrderId: { $type: "string" },
-    createdAt: { $gte: recentCutoff },
-    $or: [
-      { paymentReconciliationAttempts: { $lt: PAYMENT_RECONCILIATION_MAX_ATTEMPTS } },
-      { paymentReconciliationAttempts: { $exists: false } },
+    $and: [
+      { $or: [
+        { createdAt: { $gte: new Date(now.getTime() - 7 * 86400000) } },
+        { walletReservationStatus: "reserved" },
+      ] },
+      { $or: [
+        { walletReservationStatus: "reserved" },
+        { paymentReconciliationAttempts: { $lt: PAYMENT_RECONCILIATION_MAX_ATTEMPTS } },
+        { paymentReconciliationAttempts: { $exists: false } },
+      ] },
     ],
     $and: [{
       $or: [
@@ -898,8 +1049,7 @@ export async function reconcilePendingCashfreePayments({ limit = 20, now = new D
   const result = { scanned: candidates.length, attempted: 0, paid: 0, pending: 0, failed: 0, skipped: 0 };
   for (const candidate of candidates) {
     const attempts = candidate.paymentReconciliationAttempts ?? 0;
-    const delayMinutes = paymentReconciliationBackoffMinutes[attempts];
-    if (delayMinutes === undefined) { result.skipped += 1; continue; }
+    const delayMinutes = paymentReconciliationBackoffMinutes[attempts] ?? paymentReconciliationBackoffMinutes.at(-1);
     const due = candidate.paymentReconciliationNextAt;
     const claim = await PaymentOrder.findOneAndUpdate(
       {

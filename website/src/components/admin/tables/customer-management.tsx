@@ -19,6 +19,25 @@ function Status({ value }: { value: AdminCustomer["status"] }) {
   return <Badge tone={value === "invalid" ? "expired" : value}>{label}</Badge>;
 }
 
+function transactionDateTime(accountingDate: string, recordedAt: string | null) {
+  const dateText = date(`${accountingDate}T00:00:00Z`);
+  if (!recordedAt || Number.isNaN(Date.parse(recordedAt))) return dateText;
+  const timeText = new Date(recordedAt)
+    .toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true })
+    .replace(/\b(am|pm)\b/i, (period) => period.toUpperCase());
+  return `${dateText}, ${timeText}`;
+}
+
+function timestampDateTime(value: string | null) {
+  if (!value || Number.isNaN(Date.parse(value))) return date(value);
+  return new Date(value)
+    .toLocaleString("en-IN", {
+      day: "2-digit", month: "short", year: "numeric",
+      hour: "numeric", minute: "2-digit", hour12: true,
+    })
+    .replace(/\b(am|pm)\b/i, (period) => period.toUpperCase());
+}
+
 function CustomerTable({
   rows,
   compact = false,
@@ -302,14 +321,14 @@ export function CustomerDetail({ id }: { id: string }) {
         </div>
         {transactionQuery.isPending ? <Skeleton /> : transactionQuery.isError ? <ErrorState message={transactionQuery.error.message} retry={() => void transactionQuery.refetch()} /> : !transactionData?.data.length && !transactionData?.openingEntries?.length ? <Empty title="No transactions found" message="No ledger entries match this period and filter." /> : <>
           {!!transactionData?.openingEntries?.length && <div className="a-table-wrap"><table className="a-table"><thead><tr><th>Opening record</th><th>Date</th><th>Amount</th><th>Effect</th><th>Status</th></tr></thead><tbody>{transactionData.openingEntries.map((entry) => <tr key={entry.id}><td>{entry.label}</td><td>{date(`${entry.date}T00:00:00Z`)}</td><td>{money(entry.amountPaise)}</td><td>{entry.balanceEffectPaise > 0 ? "+" : entry.balanceEffectPaise < 0 ? "−" : "—"}{money(Math.abs(entry.balanceEffectPaise))}</td><td><Badge>Opening record</Badge></td></tr>)}</tbody></table></div>}
-          {!!transactionData?.data.length && <div className="a-table-wrap"><table className="a-table"><thead><tr><th>Transaction</th><th>Date</th><th>Type</th><th>Amount</th><th>Balance effect</th><th>Status</th><th>Details</th></tr></thead><tbody>{transactionData.data.map((entry) => <tr key={entry.id}><td><code>{entry.id}</code></td><td>{date(entry.recordedAt || `${entry.date}T00:00:00Z`)}<small>{entry.date}</small></td><td>{transactionLabel(entry.type)}</td><td>{money(entry.amountPaise)}</td><td>{entry.balanceEffectPaise === null ? "—" : `${entry.balanceEffectPaise > 0 ? "+" : "−"}${money(Math.abs(entry.balanceEffectPaise))}`}</td><td><Badge tone={entry.status === "voided" ? "disabled" : entry.status === "conflict_resolved" ? "expired" : "active"}>{entry.status.replaceAll("_", " ")}</Badge></td><td><Button variant="ghost" aria-label={`View transaction ${entry.id}`} onClick={() => setSelected(entry)}><Eye size={16} />View</Button></td></tr>)}</tbody></table></div>}
+          {!!transactionData?.data.length && <div className="a-table-wrap"><table className="a-table"><thead><tr><th>Transaction</th><th>Date and time</th><th>Type</th><th>Amount</th><th>Balance effect</th><th>Status</th><th>Details</th></tr></thead><tbody>{transactionData.data.map((entry) => <tr key={entry.id}><td><code>{entry.id}</code></td><td>{transactionDateTime(entry.date, entry.recordedAt || entry.createdAt)}</td><td>{transactionLabel(entry.type)}</td><td>{money(entry.amountPaise)}</td><td>{entry.balanceEffectPaise === null ? "—" : `${entry.balanceEffectPaise > 0 ? "+" : "−"}${money(Math.abs(entry.balanceEffectPaise))}`}</td><td><Badge tone={entry.status === "voided" ? "disabled" : entry.status === "conflict_resolved" ? "expired" : "active"}>{entry.status.replaceAll("_", " ")}</Badge></td><td><Button variant="ghost" aria-label={`View transaction ${entry.id}`} onClick={() => setSelected(entry)}><Eye size={16} />View</Button></td></tr>)}</tbody></table></div>}
           <div className="a-pagination"><span>{(pageInfo?.total || 0).toLocaleString()} ledger records · Page {page} of {Math.max(1, pageInfo?.pages || 1)}</span><div className="a-pagination-controls"><Button variant="outline" disabled={page <= 1 || transactionQuery.isFetching} onClick={() => setPage((value) => value - 1)}><ChevronLeft size={15} />Previous</Button><Button variant="outline" disabled={page >= (pageInfo?.pages || 1) || transactionQuery.isFetching} onClick={() => setPage((value) => value + 1)}>Next<ChevronRight size={15} /></Button></div></div>
         </>}
       </section>}
       {!canReadFinancial && <Empty title="Financial overview unavailable" message="Your administrator role does not permit access to customer financial information." />}
       <Modal title="Transaction details" description="Read-only information from the customer ledger." open={Boolean(selected)} onOpenChange={(open) => { if (!open) setSelected(null); }}>
         {selected && <dl className="a-detail-grid" style={{ marginTop: 20 }}>
-          <div><dt>Transaction ID</dt><dd><code>{selected.id}</code></dd></div><div><dt>Type</dt><dd>{transactionLabel(selected.type)}</dd></div><div><dt>Amount</dt><dd>{money(selected.amountPaise)}</dd></div><div><dt>Transaction date</dt><dd>{date(`${selected.date}T00:00:00Z`)}</dd></div><div><dt>Created</dt><dd>{date(selected.createdAt)}</dd></div><div><dt>Last updated</dt><dd>{date(selected.updatedAt)}</dd></div><div><dt>Status</dt><dd>{selected.status.replaceAll("_", " ")}</dd></div><div><dt>Method</dt><dd>{selected.method || "—"}</dd></div><div><dt>Reference</dt><dd>{selected.reference || "—"}</dd></div><div><dt>Note</dt><dd>{selected.note || "—"}</dd></div>
+          <div><dt>Transaction ID</dt><dd><code>{selected.id}</code></dd></div><div><dt>Type</dt><dd>{transactionLabel(selected.type)}</dd></div><div><dt>Amount</dt><dd>{money(selected.amountPaise)}</dd></div><div><dt>Transaction date and time</dt><dd>{transactionDateTime(selected.date, selected.recordedAt || selected.createdAt)}</dd></div><div><dt>Created</dt><dd>{timestampDateTime(selected.createdAt)}</dd></div><div><dt>Last updated</dt><dd>{timestampDateTime(selected.updatedAt)}</dd></div><div><dt>Status</dt><dd>{selected.status.replaceAll("_", " ")}</dd></div><div><dt>Method</dt><dd>{selected.method || "—"}</dd></div><div><dt>Reference</dt><dd>{selected.reference || "—"}</dd></div><div><dt>Note</dt><dd>{selected.note || "—"}</dd></div>
         </dl>}
       </Modal>
     </>

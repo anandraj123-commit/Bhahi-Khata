@@ -9,6 +9,21 @@ export function formatCustomerCreatedOn(value?: string): string {
   });
 }
 
+export function formatCustomerCreatedAt(value?: string): string {
+  if (!value) return "Not available";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Not available";
+  const dateText = date.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+  const timeText = date
+    .toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true })
+    .replace(/\b(am|pm)\b/i, (period) => period.toUpperCase());
+  return `${dateText}, ${timeText}`;
+}
+
 export function customerBalanceDisplay(
   signedBalance: number,
   currency: (amount: number) => string,

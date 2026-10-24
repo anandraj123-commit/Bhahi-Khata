@@ -29,6 +29,8 @@ export type Entry = {
   type: "credit" | "payment" | "refund";
   amount: number;
   date: string;
+  /** Server-generated creation timestamp, populated after synchronization. */
+  createdAt?: string;
   recordedAt?: string;
   note: string;
   method: string;

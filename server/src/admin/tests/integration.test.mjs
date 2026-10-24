@@ -794,3 +794,113 @@ test("plan customer limits persist through refresh and existing capacity logic h
   assert.equal(await Customer.countDocuments({}), customersBefore);
   assert.equal(await Entry.countDocuments({}), entriesBefore);
 });
+
+test("referral rewards credit both shops exactly once after the configured active-customer threshold", async () => {
+  const { Referral, ReferralProgramSettings, WalletAccount, WalletLedgerEntry, Shop } = await import("../../models.js");
+  const { attachReferral, qualifyReferralInTransaction } = await import("../../services/referralService.js");
+  const referrer = f.shops[23];
+  const referred = f.shops[24];
+  const referralCode = String(referrer._id).slice(-10).toUpperCase();
+  await Shop.updateOne({ _id: referrer._id }, { $set: { referralCode } });
+  await ReferralProgramSettings.updateOne(
+    { _id: "default" },
+    { $set: {
+      enabled: true,
+      rewardAmountMinor: 12500,
+      referrerRewardAmountMinor: 12500,
+      referredRewardAmountMinor: 7500,
+      minimumCustomers: 2,
+      revision: 7,
+    } },
+    { upsert: true },
+  );
+  await mongoose.connection.transaction((session) => attachReferral({
+    referralCode,
+    referredShopId: referred._id,
+    referredOwnerId: referred.ownerId,
+    session,
+  }));
+  const suffix = String(referred._id).slice(-8);
+  for (let i = 0; i < 2; i++) {
+    await Customer.create([{
+      shopId: referred._id,
+      clientId: `referral-customer-${suffix}-${i}`,
+      name: `Referral customer ${i}`,
+      nameFolded: `referral customer ${i}`,
+      status: true,
+      disabled: false,
+      removed: false,
+    }]);
+  }
+  await mongoose.connection.transaction((session) => qualifyReferralInTransaction(referred._id, session));
+  await mongoose.connection.transaction((session) => qualifyReferralInTransaction(referred._id, session));
+  const referral = await Referral.findOne({ referredShopId: referred._id }).lean();
+  assert.equal(referral.status, "rewarded");
+  assert.equal(referral.referrerRewardAmountMinor, 12500);
+  assert.equal(referral.referredRewardAmountMinor, 7500);
+  assert.equal((await WalletAccount.findOne({ shopId: referrer._id }).lean()).balanceMinor, 12500);
+  assert.equal((await WalletAccount.findOne({ shopId: referred._id }).lean()).balanceMinor, 7500);
+  const entries = await WalletLedgerEntry.find({ referralId: referral._id }).lean();
+  assert.equal(entries.length, 2);
+  assert.deepEqual(entries.map((entry) => entry.amountMinor).sort((a, b) => a - b), [7500, 12500]);
+});
+
+test("referral program settings are permission protected, reauthenticated, versioned and audited", async () => {
+  const { AdminAudit, AdminUser } = await import("../models/index.js");
+  const { hashPassword } = await import("../utils/security.js");
+  const referralAdminSession = superSession;
+  const [referralSupport] = await AdminUser.create([{
+    email: `referral-support-${f.run}@example.test`, name: "Referral Support",
+    role: "SUPPORT", passwordHash: await hashPassword(f.password), active: true,
+  }]);
+  const referralSupportSession = await signIn(referralSupport);
+  const initial = await request("/referrals/settings", { session: referralAdminSession });
+  assert.equal(initial.status, 200);
+  assert.equal((await request("/referrals/settings", { session: referralSupportSession })).status, 403);
+  const { digest } = await import("../utils/security.js");
+  await AdminSession.updateOne(
+    { tokenHash: digest(referralAdminSession.cookie.split("=")[1]) },
+    { $set: { reauthenticatedAt: new Date(0) } },
+  );
+  const unauthorized = await request("/referrals/settings", {
+    session: referralAdminSession,
+    method: "PATCH",
+    body: {
+      expectedVersion: initial.value.data.revision,
+      enabled: true,
+      referrerRewardAmountMinor: 7000,
+      referredRewardAmountMinor: 3000,
+      minimumCustomers: 1,
+    },
+  });
+  assert.equal(unauthorized.status, 403);
+  assert.equal((await request("/auth/reauth", { session: referralAdminSession, method: "POST", body: { password: f.password } })).status, 200);
+  const saved = await request("/referrals/settings", {
+    session: referralAdminSession,
+    method: "PATCH",
+    body: {
+      expectedVersion: initial.value.data.revision,
+      enabled: true,
+      referrerRewardAmountMinor: 7000,
+      referredRewardAmountMinor: 3000,
+      minimumCustomers: 3,
+    },
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.value.data.referrerRewardAmountMinor, 7000);
+  assert.equal(saved.value.data.referredRewardAmountMinor, 3000);
+  assert.equal(saved.value.data.minimumCustomers, 3);
+  assert.ok(await AdminAudit.exists({ adminId: f.superAdmin._id, action: "referrals.settings.update", targetId: "default" }));
+  const restored = await request("/referrals/settings", {
+    session: referralAdminSession,
+    method: "PATCH",
+    body: {
+      expectedVersion: saved.value.data.revision,
+      enabled: initial.value.data.enabled,
+      referrerRewardAmountMinor: initial.value.data.referrerRewardAmountMinor || 5000,
+      referredRewardAmountMinor: initial.value.data.referredRewardAmountMinor || 5000,
+      minimumCustomers: initial.value.data.minimumCustomers,
+    },
+  });
+  assert.equal(restored.status, 200);
+});

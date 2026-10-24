@@ -14,6 +14,7 @@ import messagesRoutes from "./messagesRoutes.js";
 import accountRoutes from "./accountRoutes.js";
 import subscriptionRoutes from "./subscriptionRoutes.js";
 import paymentRoutes from "./paymentRoutes.js";
+import referralRoutes from "./referralRoutes.js";
 import { error } from "../utils/http.js";
 
 const router = express.Router();
@@ -32,6 +33,7 @@ router.use(messagesRoutes);
 router.use(accountRoutes);
 router.use(subscriptionRoutes);
 router.use(paymentRoutes);
+router.use(referralRoutes);
 router.use((req, res) => error(res, 404, "API route not found"));
 
 export default router;

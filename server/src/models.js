@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { randomBytes } from "node:crypto";
 import { normalizeCustomerMobile } from "./utils/phone.js";
 
 const { Schema } = mongoose;
@@ -27,6 +28,7 @@ export const Shop = mongoose.model(
       address: { type: String, default: "", maxlength: 500 },
       phone: { type: String, required: true, unique: true, index: true },
       whatsapp: { type: String, default: "" },
+      referralCode: { type: String, uppercase: true, match: /^[A-F0-9]{10}$/ },
       language: { type: String, default: "English" },
       defaultMethod: { type: String, default: "Cash" },
       readAuditIds: { type: [String], default: [] },
@@ -332,6 +334,9 @@ export const PaymentOrder = mongoose.model(
       planCode: { type: String, required: true },
       durationMonths: { type: Number, required: true },
       amountMinor: { type: Number, required: true, min: 0 },
+      totalAmountMinor: { type: Number, min: 0, validate: Number.isSafeInteger },
+      walletAppliedMinor: { type: Number, min: 0, default: 0, validate: Number.isSafeInteger },
+      walletReservationStatus: { type: String, enum: ["none", "reserved", "captured", "released"], default: "none" },
       currency: { type: String, required: true },
       pricingSnapshot: { type: Schema.Types.Mixed, required: true, immutable: true },
       gatewayOrderId: String,
@@ -469,6 +474,79 @@ export const SubscriptionUsage = mongoose.model(
   ),
 );
 
+export const ReferralProgramSettings = mongoose.model(
+  "ReferralProgramSettings",
+  new Schema({
+    _id: { type: String, default: "default" },
+    enabled: { type: Boolean, default: false },
+    rewardAmountMinor: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger },
+    referrerRewardAmountMinor: { type: Number, min: 0, validate: Number.isSafeInteger },
+    referredRewardAmountMinor: { type: Number, min: 0, validate: Number.isSafeInteger },
+    minimumCustomers: { type: Number, default: 1, min: 1, validate: Number.isSafeInteger },
+    revision: { type: Number, default: 1, min: 1, validate: Number.isSafeInteger },
+  }, base),
+);
+export const Referral = mongoose.model(
+  "Referral",
+  new Schema({
+    referrerShopId: { type: Schema.Types.ObjectId, required: true },
+    referredShopId: { type: Schema.Types.ObjectId, required: true, unique: true },
+    referralCode: { type: String, required: true },
+    status: { type: String, enum: ["pending", "rewarded", "rejected"], default: "pending", required: true },
+    rewardAmountMinor: { type: Number, required: true, min: 0, validate: Number.isSafeInteger },
+    referrerRewardAmountMinor: { type: Number, min: 0, validate: Number.isSafeInteger },
+    referredRewardAmountMinor: { type: Number, min: 0, validate: Number.isSafeInteger },
+    minimumCustomers: { type: Number, required: true, min: 1, validate: Number.isSafeInteger },
+    settingsRevision: { type: Number, required: true, min: 1, validate: Number.isSafeInteger },
+    qualifiedAt: Date,
+    rewardedAt: Date,
+    rejectionCode: String,
+  }, base),
+);
+Referral.schema.index({ referrerShopId: 1, createdAt: -1, _id: -1 });
+Referral.schema.index({ status: 1, createdAt: 1 });
+Shop.schema.index({ referralCode: 1 }, { unique: true, sparse: true });
+export const WalletAccount = mongoose.model(
+  "WalletAccount",
+  new Schema({
+    shopId: { type: Schema.Types.ObjectId, required: true, unique: true },
+    balanceMinor: { type: Number, required: true, min: 0, default: 0, validate: Number.isSafeInteger },
+    reservedMinor: { type: Number, required: true, min: 0, default: 0, validate: Number.isSafeInteger },
+  }, base),
+);
+export const WalletLedgerEntry = mongoose.model(
+  "WalletLedgerEntry",
+  new Schema({
+    shopId: { type: Schema.Types.ObjectId, required: true },
+    direction: { type: String, enum: ["credit", "debit"], required: true },
+    amountMinor: { type: Number, required: true, min: 1, validate: Number.isSafeInteger },
+    currency: { type: String, required: true, default: "INR", enum: ["INR"] },
+    reason: { type: String, required: true, enum: ["referral_reward", "subscription_purchase", "subscription_refund"] },
+    idempotencyKey: { type: String, required: true, maxlength: 180 },
+    referralId: Schema.Types.ObjectId,
+    orderId: Schema.Types.ObjectId,
+    description: { type: String, required: true, maxlength: 160 },
+  }, base),
+);
+WalletLedgerEntry.schema.index({ shopId: 1, idempotencyKey: 1 }, { unique: true });
+WalletLedgerEntry.schema.index({ shopId: 1, createdAt: -1, _id: -1 });
+
+export function createReferralCode() {
+  return randomBytes(5).toString("hex").toUpperCase();
+}
+
+export async function ensureReferralIndexes() {
+  await Promise.all([
+    Shop.collection.createIndex({ referralCode: 1 }, { unique: true, sparse: true }),
+    Referral.collection.createIndex({ referredShopId: 1 }, { unique: true }),
+    Referral.collection.createIndex({ referrerShopId: 1, createdAt: -1, _id: -1 }),
+    Referral.collection.createIndex({ status: 1, createdAt: 1 }),
+    WalletAccount.collection.createIndex({ shopId: 1 }, { unique: true }),
+    WalletLedgerEntry.collection.createIndex({ shopId: 1, idempotencyKey: 1 }, { unique: true }),
+    WalletLedgerEntry.collection.createIndex({ shopId: 1, createdAt: -1, _id: -1 }),
+  ]);
+}
+
 export async function ensureIndexes() {
   await ensureCustomerLifecycleDefaults();
   await ensureCustomerMobileIndex();
@@ -493,6 +571,10 @@ export async function ensureIndexes() {
     SubscriptionNotificationPreference,
     PaymentWebhookEvent,
     SubscriptionUsage,
+    ReferralProgramSettings,
+    Referral,
+    WalletAccount,
+    WalletLedgerEntry,
   ])
     await model.createIndexes();
 }

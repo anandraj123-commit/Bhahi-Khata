@@ -60,6 +60,14 @@ Digital Khata is a React Native Android app backed by a separate Express and Mon
 
 Offline sign-in is available only after an online OTP sign-in has downloaded the account data to the encrypted local database. A cached session is eligible for up to 30 days after the last successful server validation and is removed from access on logout or server rejection. Customer, shop-setting, and ledger changes save locally first, then synchronize when the app returns online. Conflicting edits remain queued and are not applied over newer server records. `npx expo start --go` runs Expo Go and cannot provide encrypted offline storage. A development client still loads JavaScript from Metro; to check cold launch with no Metro connection, build and install a bundled Android release with `npm run build:android` (or use the EAS `preview` APK profile).
 
+## Refer & Earn
+
+Administrators configure the program at `/admin/referrals`. It is disabled until an authorized administrator enables it, sets separate positive INR rewards for the referring shop and the new shop, and chooses the minimum number of active customers the new shop must add. The backend snapshots those terms when a referral code is accepted. On qualification, one MongoDB transaction marks the referral rewarded and credits each shop's configured amount to its INR wallet; a unique referral per referred shop and idempotent wallet-ledger keys prevent duplicate rewards. Rewards remain wallet credit and are not cash withdrawals.
+
+The mobile app shares a link under **More → Refer & Earn**. Set `EXPO_PUBLIC_REFERRAL_BASE_URL` in the app build to the public website origin (for example `https://example.com`) so the link opens `/refer/<code>`. The landing page uses the Digital Khata artwork and factual product description. Copy `website/.env.example` to `website/.env.local` and set the public company/support details and actual store URLs before publishing. When store installation cannot preserve the referral link, the landing page and shop setup screen show/accept the referral code for manual entry.
+
+Wallet balance can be applied to an online subscription purchase. The server calculates wallet use and the remaining Cashfree amount from current price and available balance. Partial wallet amounts are reserved while payment is pending, captured only after verified payment, and released only after Cashfree reports an expired/terminated order. A fully wallet-funded purchase is recorded as an idempotent paid order, wallet debit, subscription and subscription audit event in a database transaction. Offline app/ledger use is unchanged; wallet balances and purchases require server connectivity.
+
 To stop local MongoDB, run `brew services stop mongodb-community@8.0`.
 
 ## Production configuration
@@ -98,7 +106,6 @@ Use your own release signing credentials before publishing. Keep the generated n
 - `server/src/reminders.js`: opt-in scheduled reminder worker.
 - `docker-compose.yml`: optional local MongoDB replica set and API service.
 
-No test cases or test suites were added or run, as requested.
+The isolated Admin integration suite is run with `node --test server/src/admin/tests/unit.test.mjs server/src/admin/tests/integration.test.mjs`; its MongoDB fixture is restricted to the local `digital_khata_testing` replica set. Mobile and payment checks are run with `npm run typecheck`, `npm run test:subscription-security`, and `npm --prefix server run test:payments`.
 
  * Node.js version: v22.14.0
- 

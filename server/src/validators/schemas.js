@@ -164,6 +164,7 @@ export const shopRegistrationSchema = z.object({
     "Enter a valid WhatsApp number",
   ).default(""),
   language: z.string().trim().max(20).optional(),
+  referralCode: z.string().trim().toUpperCase().regex(/^[A-F0-9]{10}$/).optional(),
 }).strict();
 export const shopConflictSchema = z.object({
   resolutionId: idSchema,

@@ -4,7 +4,7 @@ import { env, subscriptionConfig } from "./config/env.js";
 import { log, safeErrorContext } from "./config/logger.js";
 import { connectDatabase, databaseErrorContext } from "./config/database.js";
 import { createApp } from "./app.js";
-import { ensureCustomerLifecycleDefaults, ensureCustomerMobileIndex, ensureIndexes } from "./models.js";
+import { ensureCustomerLifecycleDefaults, ensureCustomerMobileIndex, ensureIndexes, ensureReferralIndexes } from "./models.js";
 import { startReminderWorker } from "./reminders.js";
 import { ensureSubscriptionPlans } from "./services/subscriptionService.js";
 import { startSubscriptionReminderWorker } from "./subscriptionReminders.js";
@@ -40,6 +40,7 @@ if (process.argv.includes("--check-db")) {
 }
 
 try {
+  await ensureReferralIndexes();
   await ensureCustomerLifecycleDefaults();
   await ensureCustomerMobileIndex();
 } catch (error) {

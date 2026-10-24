@@ -19,6 +19,7 @@ const purchaseSchema = z.object({
   planCode: z.enum(["pro", "business"]),
   durationMonths: z.union([z.literal(1), z.literal(3), z.literal(6), z.literal(12)]),
   acceptedPricingVersion: z.number().int().positive().safe().optional(),
+  useWallet: z.boolean().optional(),
 }).strict();
 
 function serviceFailure(res, next, e) {
@@ -67,6 +68,7 @@ async function createOrder(req, res, next) {
       planCode: parsed.data.planCode,
       months: parsed.data.durationMonths,
       acceptedPricingVersion: parsed.data.acceptedPricingVersion,
+      useWallet: parsed.data.useWallet === true,
       idempotencyKey: String(req.headers["idempotency-key"] || ""),
     });
     res.status(201).json({
@@ -74,9 +76,11 @@ async function createOrder(req, res, next) {
       gatewayOrderId: result.order.gatewayOrderId,
       paymentSessionId: result.order.paymentSessionId,
       amountMinor: result.order.amountMinor,
+      totalAmountMinor: result.order.totalAmountMinor ?? result.order.amountMinor,
+      walletAppliedMinor: result.order.walletAppliedMinor || 0,
       currency: result.order.currency,
       pricing: result.order.pricingSnapshot,
-      checkoutEnvironment: subscriptionConfig.cashfreeEnvironment,
+      checkoutEnvironment: result.order.amountMinor > 0 ? subscriptionConfig.cashfreeEnvironment : null,
       status: result.order.status,
     });
   } catch (e) { serviceFailure(res, next, e); }

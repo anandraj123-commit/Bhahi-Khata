@@ -573,12 +573,19 @@ export async function saveLocalChange(
   accountId: string,
   previous: Data,
   next: Data,
+  recordedAtAuthority?: "server",
 ) {
   const db = await openDatabase();
   if (!db) return null;
   let queueId: number | null = null;
   await withEncryptedTransaction(db, async (transaction) => {
-    const change = normalizeSyncDelta(createSyncDelta(previous, next));
+    const delta = createSyncDelta(previous, next);
+    const change = normalizeSyncDelta({
+      ...delta,
+      ...(recordedAtAuthority && delta.entries.some((item) => item.operation === "create")
+        ? { recordedAtAuthority }
+        : {}),
+    });
     const changedCustomerIds = new Set(change.customers.map((item) => (item.after || item.before)?.id).filter(Boolean));
     const seenMobiles = new Map<string, string>();
     for (const customer of next.customers) {

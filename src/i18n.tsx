@@ -178,6 +178,8 @@ const hindi: Record<string, string> = {
   "How is balance calculated?": "बकाया की गणना कैसे होती है?",
   "How do I send WhatsApp reminders?": "WhatsApp रिमाइंडर कैसे भेजें?",
   "How do I keep my data safe?": "डेटा सुरक्षित कैसे रखें?",
+  "Phone date/time differs from server.": "फ़ोन की तारीख/समय सर्वर से अलग है।",
+  "Check automatic date and time for accurate timestamps. You can continue using Digital-Khata offline.": "सही समय दर्ज करने के लिए अपने फ़ोन में स्वचालित तारीख और समय चालू करें। आप Digital-Khata ऑफ़लाइन भी इस्तेमाल कर सकते हैं।",
   English: "English",
   हिन्दी: "हिन्दी",
 };

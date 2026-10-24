@@ -38,6 +38,10 @@ export async function fixture() {
     PaymentOrder,
     PaymentTransaction,
     SubscriptionUsage,
+    Referral,
+    ReferralProgramSettings,
+    WalletAccount,
+    WalletLedgerEntry,
   } = await import("../../models.js");
   const { hashPassword } = await import("../utils/security.js");
   for (const model of [
@@ -50,6 +54,10 @@ export async function fixture() {
     PaymentOrder,
     PaymentTransaction,
     SubscriptionUsage,
+    Referral,
+    ReferralProgramSettings,
+    WalletAccount,
+    WalletLedgerEntry,
   ]) {
     await model.createCollection();
     await model.createIndexes();

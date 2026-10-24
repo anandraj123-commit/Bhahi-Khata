@@ -23,6 +23,7 @@ import {
   LogOut,
   X,
   BookOpen,
+  Gift,
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { adminRequest } from "../../../lib/admin/api";
@@ -52,6 +53,12 @@ export const navigation = [
     label: "Subscriptions",
     icon: CreditCard,
     permission: "subscriptions:read",
+  },
+  {
+    href: "/admin/referrals",
+    label: "Refer & Earn",
+    icon: Gift,
+    permission: "referrals:manage",
   },
   {
     href: "/admin/payments",

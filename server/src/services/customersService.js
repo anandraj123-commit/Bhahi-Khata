@@ -5,6 +5,7 @@ import { paise } from "../utils/money.js";
 import { customerOut } from "../utils/serializers.js";
 import { sameCustomerValues } from "../utils/records.js";
 import { normalizeCustomerMobile } from "../utils/phone.js";
+import { qualifyReferralInTransaction } from "./referralService.js";
 import { saveAudit } from "./auditService.js";
 import { canTransitionCustomerStatus, customerStatusName, lifecycleTarget } from "../utils/customerLifecycle.js";
 import {
@@ -119,6 +120,7 @@ export async function createCustomer({ shopId, actorId, customer, audit }) {
       }
       if (audit)
         await saveAudit({ shopId, actorId, session }, audit);
+      await qualifyReferralInTransaction(shopId, session);
     });
   } catch (error) {
     // A retry after an ambiguous response, or a concurrent request using the

@@ -25,6 +25,7 @@ export const entryOut = (d) => ({
   type: d.type,
   amount: d.amountPaise / 100,
   date: d.date,
+  createdAt: d.createdAt?.toISOString?.(),
   recordedAt: d.recordedAt?.toISOString?.() || d.createdAt?.toISOString?.(),
   note: d.note,
   method: d.method,

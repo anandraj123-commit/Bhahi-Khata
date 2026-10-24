@@ -115,6 +115,13 @@ export const customerLimitUpdate = z
         : value.customerLimit !== null,
     { message: "A limited plan requires a positive whole-number limit" },
   );
+export const referralSettingsUpdate = z.object({
+  expectedVersion: z.number().int().positive().safe(),
+  enabled: z.boolean(),
+  referrerRewardAmountMinor: z.number().int().min(1).max(100000000).safe(),
+  referredRewardAmountMinor: z.number().int().min(1).max(100000000).safe(),
+  minimumCustomers: z.number().int().min(1).max(50000).safe(),
+}).strict();
 const pricingPercent = z.number().finite().min(0).max(100).refine(
   (value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-8,
   "Use at most two decimal places",

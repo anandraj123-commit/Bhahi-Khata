@@ -34,6 +34,8 @@ async function cleanCashfreeTestFixtures() {
       models.ShopSubscription.deleteMany({ shopId: { $in: shopIds } }),
       models.SubscriptionAuditLog.deleteMany({ shopId: { $in: shopIds } }),
       models.SubscriptionUsage.deleteMany({ shopId: { $in: shopIds } }),
+      models.WalletAccount.deleteMany({ shopId: { $in: shopIds } }),
+      models.WalletLedgerEntry.deleteMany({ shopId: { $in: shopIds } }),
       models.Shop.deleteMany({ _id: { $in: shopIds } }),
       models.User.deleteMany({ _id: { $in: fixtureShops.map((item) => item.ownerId) } }),
     ]);
@@ -42,6 +44,7 @@ async function cleanCashfreeTestFixtures() {
   await models.PaymentWebhookEvent.deleteMany({ eventId: /^(failure|success)-event-/ });
 }
 const payments = new Map();
+const providerOrderAmounts = new Map();
 const transientProviderFailures = new Set();
 const originalFetch = globalThis.fetch;
 
@@ -55,6 +58,7 @@ before(async () => {
     models.User, models.Shop, models.SubscriptionPlan, models.ShopSubscription,
     models.PaymentOrder, models.PaymentTransaction, models.SubscriptionAuditLog,
     models.SubscriptionUsage,
+    models.WalletAccount, models.WalletLedgerEntry,
   ]) {
     await model.createCollection().catch((error) => {
       if (error.codeName !== "NamespaceExists") throw error;
@@ -77,6 +81,7 @@ before(async () => {
     const parsed = new URL(String(url));
     if (parsed.pathname === "/pg/orders" && options.method === "POST") {
       const body = JSON.parse(options.body);
+      providerOrderAmounts.set(body.order_id, Number(body.order_amount));
       return Response.json({
         order_id: body.order_id,
         cf_order_id: "isolated-cf-order",
@@ -99,7 +104,7 @@ before(async () => {
     if (parsed.pathname.endsWith("/payments")) return Response.json(state.items);
     return Response.json({
       order_id: orderId,
-      order_amount: 90,
+      order_amount: providerOrderAmounts.get(orderId) ?? 90,
       order_currency: "INR",
       order_status: state.orderStatus,
     });
@@ -368,4 +373,63 @@ test("canonical plan migration fills only absent pricing fields and is idempoten
       } },
     );
   }
+});
+
+test("wallet-assisted checkout reserves partial funds, captures them only after Cashfree verification, and is idempotent", async () => {
+  const { user, shop } = await createOrderContext();
+  await models.WalletAccount.create({ shopId: shop._id, balanceMinor: 4500, reservedMinor: 0 });
+  const key = `wallet-partial-${randomBytes(8).toString("hex")}`;
+  const input = {
+    shopId: shop._id, userId: user._id, planCode: plan.code, months: 1,
+    acceptedPricingVersion: plan.pricingVersion || 1, idempotencyKey: key, useWallet: true,
+  };
+  const created = await service.createSubscriptionOrder(input);
+  const repeated = await service.createSubscriptionOrder(input);
+  assert.equal(created.order.amountMinor, 4500);
+  assert.equal(created.order.totalAmountMinor, 9000);
+  assert.equal(created.order.walletAppliedMinor, 4500);
+  assert.equal(repeated.repeated, true);
+  assert.equal((await models.WalletAccount.findOne({ shopId: shop._id }).lean()).reservedMinor, 4500);
+  const gatewayOrderId = created.order.gatewayOrderId;
+  payments.set(gatewayOrderId, { orderStatus: "PAID", items: [{
+    cf_payment_id: `wallet-cash-${key}`, order_id: gatewayOrderId, payment_status: "SUCCESS",
+    payment_amount: 45, payment_currency: "INR", payment_group: "upi", payment_time: new Date().toISOString(),
+  }] });
+  await service.verifyPayment({ shopId: shop._id, userId: user._id, orderId: created.order._id });
+  await service.verifyPayment({ shopId: shop._id, userId: user._id, orderId: created.order._id });
+  const account = await models.WalletAccount.findOne({ shopId: shop._id }).lean();
+  assert.equal(account.balanceMinor, 0);
+  assert.equal(account.reservedMinor, 0);
+  assert.equal(await models.WalletLedgerEntry.countDocuments({ shopId: shop._id, reason: "subscription_purchase" }), 1);
+  const subscription = await models.ShopSubscription.findOne({ shopId: shop._id }).lean();
+  assert.equal(subscription.amountPaidMinor, 9000);
+  assert.equal(await models.PaymentTransaction.countDocuments({ orderId: created.order._id, amountMinor: 4500, status: "captured" }), 1);
+});
+
+test("full wallet purchases activate once without Cashfree and expired partial orders release their reservation", async () => {
+  const { user: fullUser, shop: fullShop } = await createOrderContext();
+  await models.WalletAccount.create({ shopId: fullShop._id, balanceMinor: 9000, reservedMinor: 0 });
+  const full = await service.createSubscriptionOrder({
+    shopId: fullShop._id, userId: fullUser._id, planCode: plan.code, months: 1,
+    acceptedPricingVersion: plan.pricingVersion || 1, idempotencyKey: `wallet-full-${randomBytes(8).toString("hex")}`, useWallet: true,
+  });
+  assert.equal(full.order.status, "paid");
+  assert.equal(full.order.amountMinor, 0);
+  assert.equal(full.order.walletAppliedMinor, 9000);
+  assert.equal(await models.ShopSubscription.countDocuments({ shopId: fullShop._id }), 1);
+  assert.equal(await models.PaymentTransaction.countDocuments({ shopId: fullShop._id }), 0);
+  assert.equal((await models.WalletAccount.findOne({ shopId: fullShop._id }).lean()).balanceMinor, 0);
+
+  const { user, shop } = await createOrderContext();
+  await models.WalletAccount.create({ shopId: shop._id, balanceMinor: 2000, reservedMinor: 0 });
+  const partial = await service.createSubscriptionOrder({
+    shopId: shop._id, userId: user._id, planCode: plan.code, months: 1,
+    acceptedPricingVersion: plan.pricingVersion || 1, idempotencyKey: `wallet-expire-${randomBytes(8).toString("hex")}`, useWallet: true,
+  });
+  payments.set(partial.order.gatewayOrderId, { orderStatus: "EXPIRED", items: [] });
+  const status = await service.getPaymentOrderStatus({ shopId: shop._id, orderId: partial.order._id });
+  assert.equal(status.status, "failed");
+  const afterExpiry = await models.WalletAccount.findOne({ shopId: shop._id }).lean();
+  assert.equal(afterExpiry.balanceMinor, 2000);
+  assert.equal(afterExpiry.reservedMinor, 0);
 });

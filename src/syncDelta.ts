@@ -13,6 +13,9 @@ export type SyncSettings = Pick<
   "shop" | "language" | "defaultMethod" | "reminders"
 >;
 export type SyncDelta = {
+  /** New ledger entries created while the API was reachable receive their
+   * authoritative recordedAt from the server. Missing means legacy/offline. */
+  recordedAtAuthority?: "server";
   settings?: { before: SyncSettings; after: SyncSettings };
   customers: RecordChange<Customer>[];
   entries: RecordChange<Entry>[];

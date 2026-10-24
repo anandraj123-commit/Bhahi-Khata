@@ -10,14 +10,20 @@ import { normalizeCustomerLifecycle } from "./customerLifecycle";
 import { isAuthoritativeSessionRejection } from "./startupRecovery";
 import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import type { SubscriptionSnapshot } from "./subscription";
+import { estimateServerClockOffset } from "./serverClock";
 
 const configuredBase = process.env.EXPO_PUBLIC_API_URL || "http://10.0.2.2:4000/api/v1";
 export const API_BASE_URL = `${configuredBase.trim().replace(/\/+$/, "").replace(/(?:\/api\/v1)+$/i, "")}/api/v1`;
 export const HEALTH_CHECK_URL = `${API_BASE_URL}/health`;
 let apiResponseObserver: ((status: number) => void) | null = null;
+let serverClockObserver: ((offsetMs: number) => void) | null = null;
 
 export function setApiResponseObserver(observer: (status: number) => void) {
   apiResponseObserver = observer;
+}
+
+export function setServerClockObserver(observer: ((offsetMs: number) => void) | null) {
+  serverClockObserver = observer;
 }
 
 export type BackendProbeResult = {
@@ -80,6 +86,13 @@ export async function probeBackendReachability(): Promise<BackendProbeResult> {
       headers: { Accept: "application/json", "Cache-Control": "no-cache" },
       signal: controller.signal,
     });
+    const responseReceivedAt = Date.now();
+    const clockOffset = estimateServerClockOffset(
+      response.headers.get("date"),
+      startedAt,
+      responseReceivedAt,
+    );
+    if (clockOffset !== null) serverClockObserver?.(clockOffset);
     if (!response.ok)
       return {
         apiBaseUrl: diagnosticBaseUrl,
@@ -176,6 +189,7 @@ async function request(
   const access = await SecureStore.getItemAsync(ACCESS);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20_000);
+  const requestStartedAt = Date.now();
   let response: Response;
   const startedAt = Date.now();
   const method = (options.method || "GET").toUpperCase();
@@ -222,6 +236,13 @@ async function request(
   } finally {
     clearTimeout(timeout);
   }
+  const responseReceivedAt = Date.now();
+  const clockOffset = estimateServerClockOffset(
+    response.headers.get("date"),
+    requestStartedAt,
+    responseReceivedAt,
+  );
+  if (clockOffset !== null) serverClockObserver?.(clockOffset);
   // An HTTP response, including an authorization or validation response,
   // proves the configured backend is reachable. Business errors must not be
   // mistaken for network failures.
@@ -444,9 +465,30 @@ export async function registerShop(input: {
   address: string;
   whatsapp: string;
   language: string;
+  referralCode?: string;
 }): Promise<Data> {
   await request("/shop/register", { method: "POST", body: JSON.stringify(input) });
   return loadAccount();
+}
+export type ReferralWalletSnapshot = {
+  shopId: string;
+  referralCode: string;
+  referralUrlPath: string;
+  wallet: {
+    balanceMinor: number;
+    availableMinor: number;
+    currency: "INR";
+    items: Array<{ id: string; direction: "credit" | "debit"; amountMinor: number; reason: string; description: string; createdAt: string }>;
+    nextCursor: string | null;
+  };
+  referrals: {
+    counts: { pending: number; rewarded: number; rejected: number };
+    items: Array<{ id: string; role: string; status: string; requiredCustomers: number; rewardMinor: number; qualifiedAt: string | null; createdAt: string }>;
+    nextCursor: string | null;
+  };
+};
+export async function getReferralWalletSnapshot(): Promise<ReferralWalletSnapshot> {
+  return request("/referral/summary?limit=20") as Promise<ReferralWalletSnapshot>;
 }
 export async function logout() {
   const refreshToken = await SecureStore.getItemAsync(REFRESH);
@@ -549,6 +591,7 @@ export async function createSubscriptionCheckout(input: {
   durationMonths: number;
   acceptedPricingVersion: number;
   idempotencyKey: string;
+  useWallet?: boolean;
 }) {
   return request("/subscription/checkout", {
     method: "POST",
@@ -557,6 +600,7 @@ export async function createSubscriptionCheckout(input: {
       planCode: input.planCode,
       durationMonths: input.durationMonths,
       acceptedPricingVersion: input.acceptedPricingVersion,
+      useWallet: input.useWallet === true,
     }),
   });
 }
@@ -569,6 +613,8 @@ export async function getSubscriptionPaymentStatus(orderId: string): Promise<{
   id: string;
   status: "created" | "pending" | "paid" | "failed";
   amountMinor: number;
+  totalAmountMinor?: number;
+  walletAppliedMinor?: number;
   currency: string;
   paymentId?: string | null;
   subscription?: SubscriptionSnapshot["current"];
@@ -706,7 +752,10 @@ export async function syncQueuedChange(change: SyncDelta) {
     delete payload.resolutionVersion;
     const saved = await syncRequest(old ? `/ledger/${encodeURIComponent(entry.id)}` : "/ledger", {
       method: old ? "PATCH" : "POST",
-      headers: old ? {} : { "Idempotency-Key": entry.id },
+      headers: old ? {} : {
+        "Idempotency-Key": entry.id,
+        ...(change.recordedAtAuthority === "server" ? { "X-DK-Recorded-At-Authority": "server" } : {}),
+      },
       body: JSON.stringify({
         ...payload,
         ...(baseRecord ? { baseRecord, ...(baseVersion ? { baseVersion } : {}) } : {}),
@@ -802,7 +851,10 @@ export async function resolveSettingsConflict(conflict: PendingSettingsConflict,
   return result;
 }
 
-export async function syncChange(previous: Data, next: Data) {
+export async function syncChange(previous: Data, next: Data, recordedAtAuthority?: "server") {
   if (!previous.signedIn || !(await SecureStore.getItemAsync(ACCESS))) return;
-  return syncQueuedChange(createSyncDelta(previous, next));
+  return syncQueuedChange({
+    ...createSyncDelta(previous, next),
+    ...(recordedAtAuthority ? { recordedAtAuthority } : {}),
+  });
 }

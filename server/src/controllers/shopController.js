@@ -25,7 +25,7 @@ export const handle_post_shop_register = async (req, res, next) => {
       created: result.created,
     });
   } catch (e) {
-    if (e.status === 409 || e.status === 401) return error(res, e.status, e.message);
+    if ([400, 401, 404, 409].includes(e.status)) return error(res, e.status, e.message);
     next(e);
   }
 };

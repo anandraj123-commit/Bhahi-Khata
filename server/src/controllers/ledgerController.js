@@ -40,6 +40,7 @@ export const handle_post_ledger = async (req, res, next) => {
       shopId: req.shopId,
       actorId: req.user._id,
       entry: parsed.data,
+      useServerRecordedAt: req.get("X-DK-Recorded-At-Authority") === "server",
       audit,
       key,
     });

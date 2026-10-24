@@ -2,6 +2,9 @@ import { formatCurrency, LanguageContext, showLocalizedAlert, t, Text } from "./
 import { apiErrorTranslationKey } from "./src/localization";
 import { isTemporaryBackendFailure } from "./src/startupRecovery";
 import { readLanguagePreference, saveLanguagePreference } from "./src/languagePreference";
+import { localeTag } from "./src/locales";
+import { deviceClockNeedsWarning } from "./src/serverClock";
+import { entryDateTime, formatClockTime, localDateTimeIso, parseClockTime } from "./src/entryPresentation";
 import ErrorBoundary from "./src/ErrorBoundary";
 import React, { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import * as Crypto from "expo-crypto";
@@ -11,6 +14,7 @@ import {
   Alert as NativeAlert,
   BackHandler,
   FlatList,
+  LayoutAnimation,
   KeyboardAvoidingView,
   Linking,
   Modal,
@@ -19,6 +23,7 @@ import {
   ScrollView,
   Share,
   StyleSheet,
+  UIManager,
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -49,6 +54,7 @@ import { CustomerActionGate } from "./src/customerActionGate";
 import { PAGE_SIZE, UserScrollPageGate, nextVisibleCount, visiblePage } from "./src/pagination";
 import {
   customerBalanceDisplay,
+  formatCustomerCreatedAt,
   formatCustomerCreatedOn,
 } from "./src/customerPresentation";
 import {
@@ -153,6 +159,7 @@ type Screen =
   | "help"
   | "subscription"
   | "subscriptionPayments"
+  | "referral"
   | "account"
   | "audit";
 type Route = { screen: Screen; id?: string };
@@ -249,6 +256,7 @@ const titles: Partial<Record<Screen, string>> = {
   help: "Help & Support",
   subscription: "My Subscription",
   subscriptionPayments: "Payment History",
+  referral: "Refer & Earn",
   account: "Account",
   audit: "Activity History",
 };
@@ -268,6 +276,7 @@ const customerDetailsStyles = StyleSheet.create({
   statCard: { padding: 12, gap: 6, borderRadius: 12, minWidth: 0 },
   statValue: { fontSize: 18, lineHeight: 23, flexShrink: 1 },
   primaryActionGroup: { gap: 12, marginBottom: 4 },
+  equalRowButton: { flex: 1 },
   actionGroup: { gap: 12, marginTop: 4 },
   actionButton: {
     alignSelf: "stretch",
@@ -523,6 +532,22 @@ function AppContent() {
     setListPage({ key: current.key, count: nextCount, loading: false });
   };
   const [form, setForm] = useState<Record<string, string>>({});
+  const [transactionDateTimeEdited, setTransactionDateTimeEdited] = useState(false);
+  const [dateTimePickerVisible, setDateTimePickerVisible] = useState(false);
+  const [dateTimePickerDate, setDateTimePickerDate] = useState("");
+  const [dateTimePickerTime, setDateTimePickerTime] = useState("");
+  const [dateTimePickerMonth, setDateTimePickerMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  const [homeRecentLimit, setHomeRecentLimit] = useState(10);
+  const [homePendingCustomersLimit, setHomePendingCustomersLimit] = useState(10);
+  const [homeRecentSort, setHomeRecentSort] = useState<"date-desc" | "date-asc" | "name-asc" | "name-desc">("date-desc");
+  const [homePendingCustomersSort, setHomePendingCustomersSort] = useState<"date-desc" | "date-asc" | "name-asc" | "name-desc">("date-desc");
+  const [referralCodeFromLink, setReferralCodeFromLink] = useState("");
+  const [referralSnapshot, setReferralSnapshot] = useState<api.ReferralWalletSnapshot | null>(null);
+  const [referralLoading, setReferralLoading] = useState(false);
+  const [referralLoadError, setReferralLoadError] = useState("");
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState("");
   const [otpHint, setOtpHint] = useState<{ key: string; parameters?: Record<string, string | number> } | null>(null);
@@ -537,12 +562,34 @@ function AppContent() {
     mobileConflicts: number;
   } | null>(null);
   const [connectivityStatus, setConnectivityStatus] = useState<ConnectivityStatus>("checking");
+  const [serverClockOffsetMs, setServerClockOffsetMs] = useState<number | null>(null);
   const [networkDiagnosticsVisible, setNetworkDiagnosticsVisible] = useState(false);
   const [networkDiagnosticsRetrying, setNetworkDiagnosticsRetrying] = useState(false);
   const [storageRetrying, setStorageRetrying] = useState(false);
   const [, setNetworkDiagnosticsRevision] = useState(0);
   const networkDiagnostics = currentConnectivityDetails();
   const networkBuildInfo = connectivityBuildInfo();
+  useEffect(() => {
+    api.setServerClockObserver(setServerClockOffsetMs);
+    return () => api.setServerClockObserver(null);
+  }, []);
+  useEffect(() => {
+    const acceptUrl = (url: string | null) => {
+      if (!url) return;
+      try {
+        const parsed = new URL(url);
+        const candidate = parsed.searchParams.get("ref") || parsed.pathname.match(/\/refer\/([A-Fa-f0-9]{10})/)?.[1] ||
+          (parsed.hostname === "refer" ? parsed.pathname.match(/^\/([A-Fa-f0-9]{10})$/)?.[1] : null);
+        if (!candidate || !/^[A-Fa-f0-9]{10}$/.test(candidate)) return;
+        const code = candidate.toUpperCase();
+        setReferralCodeFromLink(code);
+        setForm((current) => ({ ...current, referralCode: current.referralCode || code }));
+      } catch { /* Ignore unrelated or malformed deep links. */ }
+    };
+    void Linking.getInitialURL().then(acceptUrl).catch(() => {});
+    const listener = Linking.addEventListener("url", ({ url }) => acceptUrl(url));
+    return () => listener.remove();
+  }, []);
   const storageDiagnostics = offlineStorageDiagnostics();
   const retryNetworkDiagnostics = async () => {
     setNetworkDiagnosticsRetrying(true);
@@ -575,6 +622,7 @@ function AppContent() {
   const subscriptionHistoryLock = useRef(false);
   const [subscriptionLoadError, setSubscriptionLoadError] = useState("");
   const [subscriptionDuration, setSubscriptionDuration] = useState("1");
+  const [useWalletForPurchase, setUseWalletForPurchase] = useState(false);
   const [subscriptionPaymentLoading, setSubscriptionPaymentLoading] = useState(false);
   const subscriptionPaymentLock = useRef(false);
   const pendingPaymentCheck = useRef<string | null>(null);
@@ -755,6 +803,10 @@ function AppContent() {
     const months = selected?.durations.some((item) => item.months === selectedMonths)
       ? selectedMonths
       : selected?.durations[0]?.months ?? 0;
+    const checkoutPrice = selected?.durations.find((item) => item.months === months);
+    const availableWalletMinor = referralSnapshot && subscriptionSnapshot?.current.shopId && referralSnapshot.shopId === subscriptionSnapshot.current.shopId
+      ? referralSnapshot.wallet.availableMinor : 0;
+    const canPayFullyFromWallet = useWalletForPurchase && !!checkoutPrice && availableWalletMinor >= checkoutPrice.finalAmountMinor;
     if (subscriptionPaymentLock.current) return;
     if (!accountId || !selected || selected.code === "free") {
       Alert.alert("Choose a paid plan", "The Free plan is already available without checkout.");
@@ -769,7 +821,7 @@ function AppContent() {
       Alert.alert("Subscription unavailable", "Refresh your subscription details before starting a payment.");
       return;
     }
-    if (isExpoGo) {
+    if (isExpoGo && !canPayFullyFromWallet) {
       Alert.alert("Development build required", "Cashfree uses native payment modules and cannot run in Expo Go. Install an Android or iOS development build first.");
       return;
     }
@@ -781,7 +833,7 @@ function AppContent() {
     setSubscriptionPaymentLoading(true);
     const pendingKey = `dk.subscription.pending.${accountId}`;
     const acceptedPricingVersion = acceptedPricingVersionOverride ?? selected.pricingVersion;
-    let pending: { idempotencyKey?: string; orderId?: string; planCode?: string; months?: number; shopId?: string; pricingVersion?: number } | null = null;
+    let pending: { idempotencyKey?: string; orderId?: string; planCode?: string; months?: number; shopId?: string; pricingVersion?: number; useWallet?: boolean } | null = null;
     let orderId: string | undefined;
     try {
       const raw = await SecureStore.getItemAsync(pendingKey);
@@ -792,14 +844,14 @@ function AppContent() {
         Alert.alert("Payment pending verification", "This payment belongs to another shop. Sign in to that shop to verify it before starting another payment.");
         return;
       }
-      if (pending?.orderId && pending.planCode === selected.code && pending.months === months) {
+      if (pending?.orderId && pending.planCode === selected.code && pending.months === months && (pending.useWallet === true) === useWalletForPurchase) {
         orderId = pending.orderId;
         const status = await api.getSubscriptionPaymentStatus(orderId);
         if (status.status === "paid") {
           const refreshed = await refreshSubscriptionInfo(accountId);
           if (refreshed) {
             await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-            Alert.alert("Subscription active", "Cashfree confirmed your payment and the subscription is active.");
+            Alert.alert("Subscription active", status.walletAppliedMinor ? "The wallet payment was verified and the subscription is active." : "Cashfree confirmed your payment and the subscription is active.");
           } else {
             Alert.alert("Payment pending verification", "Cashfree confirmed payment. The app will refresh the subscription entitlement when the connection is available.");
           }
@@ -810,25 +862,35 @@ function AppContent() {
           pending = null;
           orderId = undefined;
         }
-      } else if (pending && (pending.planCode !== selected.code || pending.months !== months)) {
+      } else if (pending && (pending.planCode !== selected.code || pending.months !== months || (pending.useWallet === true) !== useWalletForPurchase)) {
         Alert.alert("Payment still processing", "Finish or verify the existing subscription payment before starting another one.");
         return;
       }
       const idempotencyKey = pending?.idempotencyKey || Crypto.randomUUID();
       if (!pending?.idempotencyKey) {
-        pending = { idempotencyKey, planCode: selected.code, months, shopId: currentShopId, pricingVersion: acceptedPricingVersion };
+        pending = { idempotencyKey, planCode: selected.code, months, shopId: currentShopId, pricingVersion: acceptedPricingVersion, useWallet: useWalletForPurchase };
       }
-      pending = { ...pending, idempotencyKey, planCode: selected.code, months, shopId: currentShopId, pricingVersion: acceptedPricingVersion };
+      pending = { ...pending, idempotencyKey, planCode: selected.code, months, shopId: currentShopId, pricingVersion: acceptedPricingVersion, useWallet: useWalletForPurchase };
       await SecureStore.setItemAsync(pendingKey, JSON.stringify(pending));
       const checkout = await api.createSubscriptionCheckout({
         planCode: selected.code as "pro" | "business",
         durationMonths: months,
         acceptedPricingVersion,
         idempotencyKey,
+        useWallet: useWalletForPurchase,
       });
       orderId = checkout.orderId;
-      pending = { idempotencyKey, planCode: selected.code, months, orderId, shopId: currentShopId };
+      pending = { idempotencyKey, planCode: selected.code, months, orderId, shopId: currentShopId, useWallet: useWalletForPurchase };
       await SecureStore.setItemAsync(pendingKey, JSON.stringify(pending));
+      if (checkout.status === "paid" && checkout.amountMinor === 0) {
+        const refreshed = await refreshSubscriptionInfo(accountId);
+        if (refreshed) {
+          await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
+          await api.getReferralWalletSnapshot().then(setReferralSnapshot).catch(() => undefined);
+          Alert.alert("Subscription active", "Your wallet payment was applied and the subscription is active.");
+        } else Alert.alert("Payment applied", "Wallet payment was accepted. Refresh subscription details when connected to update this device.");
+        return;
+      }
       try {
         await launchCashfreeCheckout({
           paymentSessionId: checkout.paymentSessionId,
@@ -842,7 +904,7 @@ function AppContent() {
         const refreshed = await refreshSubscriptionInfo(accountId);
         if (refreshed) {
           await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-          Alert.alert("Subscription active", "Cashfree confirmed your payment and the subscription is active.");
+          Alert.alert("Subscription active", checkout.walletAppliedMinor ? "Your wallet contribution and verified Cashfree payment activated the subscription." : "Cashfree confirmed your payment and the subscription is active.");
         } else {
           Alert.alert("Payment pending verification", "Cashfree confirmed payment. The app will refresh the subscription entitlement when the connection is available.");
         }
@@ -890,7 +952,7 @@ function AppContent() {
             const refreshed = await refreshSubscriptionInfo(accountId);
             if (refreshed) {
               await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-              Alert.alert("Subscription active", "Cashfree confirmed your payment and the subscription is active.");
+              Alert.alert("Subscription active", status.walletAppliedMinor ? "Your wallet contribution and verified Cashfree payment activated the subscription." : "Cashfree confirmed your payment and the subscription is active.");
             } else {
               Alert.alert("Payment pending verification", "Cashfree confirmed payment. The app will refresh the subscription entitlement when the connection is available.");
             }
@@ -1221,6 +1283,26 @@ function AppContent() {
   }, [data.signedIn, data.shopExists]);
   useEffect(() => observeConnectivity(setConnectivityStatus), []);
   useEffect(() => {
+    if (route.screen !== "referral" || !data.signedIn || data.shopExists === false) return;
+    let live = true;
+    setReferralSnapshot(null);
+    if (connectivityStatus === "offline") {
+      setReferralLoading(false);
+      setReferralLoadError("Internet connection is required to refresh referral status and wallet balance. Existing offline records remain available.");
+      return () => { live = false; };
+    }
+    setReferralLoading(true);
+    setReferralLoadError("");
+    void api.getReferralWalletSnapshot().then((snapshot) => {
+      if (live) setReferralSnapshot(snapshot);
+    }).catch((problem) => {
+      if (live) setReferralLoadError(errorMessage(problem, "Unable to load referral and wallet information."));
+    }).finally(() => {
+      if (live) setReferralLoading(false);
+    });
+    return () => { live = false; };
+  }, [route.screen, data.signedIn, data.shopExists, data.shop.phone, connectivityStatus]);
+  useEffect(() => {
     const id = offlineAccountRef.current;
     if (!data.signedIn || !id || !offlineStorageAvailable()) return;
     let live = true;
@@ -1287,17 +1369,20 @@ function AppContent() {
   }, [data.signedIn]);
   useEffect(() => {
     void refreshSyncStatus();
-  }, [data.signedIn, data.shop.phone, route.screen]);
+  }, [data.signedIn, data.shop.phone, route.screen, connectivityStatus]);
   useEffect(() => {
     const id = offlineAccountRef.current;
     if (!data.signedIn || !id || !["subscription", "subscriptionPayments"].includes(route.screen)) return;
     void refreshSubscriptionInfo(id, route.screen === "subscription");
-  }, [data.signedIn, data.shop.phone, route.screen]);
+    if (connectivityStatus !== "offline")
+      void api.getReferralWalletSnapshot().then(setReferralSnapshot).catch(() => undefined);
+  }, [data.signedIn, data.shop.phone, route.screen, connectivityStatus]);
   useEffect(() => {
     if (data.signedIn) return;
     subscriptionAccountRef.current = null;
     setSubscriptionSnapshot(null);
     setSubscriptionLoadError("");
+    setReferralSnapshot(null);
   }, [data.signedIn]);
   useEffect(() => {
     subscriptionSnapshotRef.current = subscriptionSnapshot;
@@ -1374,7 +1459,7 @@ function AppContent() {
     const sub = BackHandler.addEventListener("hardwareBackPress", back);
     return () => sub.remove();
   }, [history, route, data.signedIn]);
-  function commit(next: Data, previousOverride?: Data): Promise<boolean> {
+  function commit(next: Data, previousOverride?: Data, recordedAtAuthority?: "server"): Promise<boolean> {
     if (loadError) return Promise.resolve(false);
     const previous = previousOverride || dataRef.current;
     dataRef.current = next;
@@ -1400,11 +1485,16 @@ function AppContent() {
         } else if (persisted?.signedIn) {
           const accountId = offlineAccountRef.current;
           if (accountId && offlineStorageAvailable()) {
-            const operationId = await saveLocalChange(accountId, previous, next);
+            const operationId = await saveLocalChange(
+              accountId,
+              previous,
+              next,
+              currentConnectivity() === "online" ? recordedAtAuthority : undefined,
+            );
             if (operationId === null) {
               if ((await checkConnectivity(true)) !== "online")
                 throw new Error("OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE");
-              await api.syncChange(persisted, next);
+              await api.syncChange(persisted, next, recordedAtAuthority);
               persistedRef.current = next;
               if (dataRef.current === next) setData(next);
               return true;
@@ -1443,7 +1533,7 @@ function AppContent() {
               throw new Error("OFFLINE_AUTHORIZATION_UNAVAILABLE");
             throw new Error("OFFLINE_ENCRYPTED_STORAGE_UNAVAILABLE");
           }
-          await api.syncChange(persisted, next);
+          await api.syncChange(persisted, next, recordedAtAuthority);
           persistedRef.current = next;
         }
         if (dataRef.current === next) setData(next);
@@ -1467,12 +1557,12 @@ function AppContent() {
     writeQueue.current = operation;
     return operation;
   }
-  async function save(next: Data, done: () => void) {
+  async function save(next: Data, done: () => void, recordedAtAuthority?: "server") {
     if (lock.current) return;
     lock.current = true;
     setBusy(true);
     try {
-      if (await commit(next)) done();
+      if (await commit(next, undefined, recordedAtAuthority)) done();
     } finally {
       lock.current = false;
       setBusy(false);
@@ -1516,9 +1606,13 @@ function AppContent() {
         address: String(form.address || "").trim(),
         whatsapp: String(form.whatsapp || "").trim(),
         language: data.language,
+        ...(form.referralCode?.trim() || referralCodeFromLink
+          ? { referralCode: String(form.referralCode || referralCodeFromLink).trim().toUpperCase() }
+          : {}),
       }));
       if (!registered.shopExists)
         throw new Error("Shop registration could not be confirmed. Please retry.");
+      setReferralCodeFromLink("");
       const accountId = accountKey(registered.shop.phone);
       offlineAccountRef.current = offlineStorageAvailable() ? accountId : null;
       dataRef.current = registered;
@@ -1736,7 +1830,7 @@ function AppContent() {
     const localCustomer = dataRef.current.customers.find((item) => item.id === conflict.local.customerId);
     const serverCustomer = serverEntry ? dataRef.current.customers.find((item) => item.id === serverEntry.customerId) : undefined;
     const describe = (entry: NonNullable<PendingConflict["server"]>, name?: string) =>
-      `${money(entry.amount)} ${entryLabel(entry.type)} · ${name || "customer"} · ${entry.date}${entry.note ? ` · ${entry.note}` : ""}`;
+      `${money(entry.amount)} ${entryLabel(entry.type)} · ${name || "customer"} · ${entryDateTime(entry, localeTag(dataRef.current.language))}${entry.note ? ` · ${entry.note}` : ""}`;
     const localText = conflict.localDeleted ? "Deleted on this phone" : describe(conflict.local, localCustomer?.name);
     const serverText = serverEntry ? describe(serverEntry, serverCustomer?.name) : "Deleted on server";
     const localAmount = money(conflict.local.amount);
@@ -1797,6 +1891,38 @@ function AppContent() {
       [...buttons, { text: "Resolve Later", style: "cancel" as const, onPress: () => { promptingConflict.current = null; } }],
     );
   }
+  function transactionDefaultValues() {
+    const now = Date.now() + (
+      currentConnectivity() === "online" && serverClockOffsetMs !== null
+        ? serverClockOffsetMs
+        : 0
+    );
+    const date = new Date(now);
+    return {
+      date: date.toLocaleDateString("en-CA"),
+      time: formatClockTime(date),
+    };
+  }
+  function openDateTimePicker() {
+    const defaults = transactionDefaultValues();
+    const selectedDate = validDate(form.date) ? form.date : defaults.date;
+    const parsedDate = new Date(`${selectedDate}T12:00:00`);
+    setDateTimePickerDate(selectedDate);
+    setDateTimePickerMonth(new Date(parsedDate.getFullYear(), parsedDate.getMonth(), 1));
+    setDateTimePickerTime(parseClockTime(form.time || "") ? form.time : defaults.time);
+    setDateTimePickerVisible(true);
+  }
+  function shiftDateTimePickerMonth(amount: number) {
+    setDateTimePickerMonth((current) => new Date(current.getFullYear(), current.getMonth() + amount, 1));
+  }
+  function adjustDateTimePicker(fieldName: "hour" | "minute" | "period", amount: number) {
+    const current = parseClockTime(dateTimePickerTime) || parseClockTime(formatClockTime(new Date()))!;
+    const next = { ...current };
+    if (fieldName === "hour") next.hour = ((current.hour - 1 + amount + 12) % 12) + 1;
+    else if (fieldName === "minute") next.minute = (current.minute + amount + 60) % 60;
+    else next.period = current.period === "AM" ? "PM" : "AM";
+    setDateTimePickerTime(`${next.hour}:${String(next.minute).padStart(2, "0")} ${next.period}`);
+  }
   function go(screen: Screen, id?: string, reset = false) {
     setHistory(reset ? [] : [...history, route]);
     setRoute({ screen, id });
@@ -1833,10 +1959,13 @@ function AppContent() {
       screen === "refund" ||
       screen === "editTransaction"
     ) {
+      setTransactionDateTimeEdited(false);
       const e =
         screen === "editTransaction"
           ? data.entries.find((x) => x.id === id)
           : undefined;
+      const defaults = transactionDefaultValues();
+      const existingTimestamp = e?.recordedAt || e?.createdAt;
       setForm({
         customerId:
           e?.customerId ||
@@ -1844,8 +1973,11 @@ function AppContent() {
           (screen === "credit" ? "" : data.customers[0]?.id) ||
           "",
         amount: e ? String(e.amount) : "",
-        date: e?.date || today(),
-        recordedAt: e?.recordedAt || new Date().toISOString(),
+        date: e?.date || defaults.date,
+        time: existingTimestamp && Number.isFinite(Date.parse(existingTimestamp))
+          ? formatClockTime(new Date(existingTimestamp))
+          : defaults.time,
+        recordedAt: e?.recordedAt || "",
         note: e?.note || "",
         method: e?.method || data.defaultMethod,
         reference: e?.reference || "",
@@ -1857,6 +1989,7 @@ function AppContent() {
       address: data.shop.address,
       phone: data.shop.phone,
       whatsapp: data.shop.whatsapp,
+      referralCode: data.shopExists === false ? referralCodeFromLink : "",
     });
     if (screen === "share" && id) setForm({ message: statementText(id) });
     if (screen === "statement" && id) {
@@ -1866,8 +1999,10 @@ function AppContent() {
       else if (month > today().slice(0, 7)) setMonth(today().slice(0, 7));
     }
   }
-  const f = (key: string, value: string) =>
+  const f = (key: string, value: string) => {
+    if (key === "date" || key === "time") setTransactionDateTimeEdited(true);
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
   const field = (
     label: string,
     key: string,
@@ -1975,14 +2110,15 @@ function AppContent() {
   const actions = (id?: string, compact = false) => {
     if (id && !isActiveCustomer(data.customers.find((item) => item.id === id) || {})) return null;
     const buttonStyle = compact ? customerDetailsStyles.actionButton : undefined;
+    const equalRowButtonStyle = [buttonStyle, customerDetailsStyles.equalRowButton];
     const actionContent = (
       <>
         <View style={compact ? customerDetailsStyles.actionRow : s.split}>
           <View style={{ flex: 1 }}>
-            <Button style={buttonStyle} icon="arrow-up-outline" title="+ Give Udhari" danger onPress={() => go("credit", id)} />
+            <Button style={equalRowButtonStyle} icon="arrow-up-outline" title="+ Give Udhari" danger onPress={() => go("credit", id)} />
           </View>
           <View style={{ flex: 1 }}>
-            <Button style={buttonStyle} icon="arrow-down-outline" title="Receive Money / Add Advance" onPress={() => go("payment", id)} />
+            <Button style={equalRowButtonStyle} icon="arrow-down-outline" title="Receive Money / Add Advance" onPress={() => go("payment", id)} />
           </View>
         </View>
         {id && balance(data, id) < 0 && (
@@ -1992,7 +2128,17 @@ function AppContent() {
     );
     return compact ? <View style={customerDetailsStyles.primaryActionGroup}>{actionContent}</View> : actionContent;
   };
-  const customerRow = (c: Customer) => {
+  const clockReminder = deviceClockNeedsWarning(serverClockOffsetMs) ? (
+    <Card style={{ padding: 12, backgroundColor: colors.amberBg, borderColor: colors.amberBorder }}>
+      <Row
+        icon="time-outline"
+        title={t("Phone date/time differs from server.", data.language)}
+        subtitle={t("Check automatic date and time for accurate timestamps. You can continue using Digital-Khata offline.", data.language)}
+        color={colors.orange}
+      />
+    </Card>
+  ) : null;
+  const customerRow = (c: Customer, includeCreatedTime = false) => {
     const signedBalance = balance(data, c.id);
     const { tone, label } = customerBalanceDisplay(signedBalance, money);
     return (
@@ -2013,7 +2159,7 @@ function AppContent() {
               <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>
               {c.address ? <Text style={s.small}>{c.address}</Text> : null}
               <Text style={s.small}>
-                Created On: {formatCustomerCreatedOn(c.createdAt)}
+                Created On: {includeCreatedTime ? formatCustomerCreatedAt(c.createdAt) : formatCustomerCreatedOn(c.createdAt)}
               </Text>
             </View>
             <Text style={{ color: financialPalette[tone].text, fontWeight: "700" }}>
@@ -2044,21 +2190,21 @@ function AppContent() {
         </View>
         <Text style={{ color: financialPalette[tone].text, fontWeight: "700", marginTop: 8 }}>{label}</Text>
         <View style={[s.split, { marginTop: 8 }]}>
-          <View style={{ flex: 1 }}><Button icon="person-outline" title="View Customer" secondary onPress={() => go("customer", c.id)} /></View>
-          <View style={{ flex: 1 }}><Button icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", c.id)} /></View>
+          <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="person-outline" title="View Customer" secondary onPress={() => go("customer", c.id)} /></View>
+          <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", c.id)} /></View>
         </View>
         {state === "active" ? (
           <>
             <View style={s.split}>
-              <View style={{ flex: 1 }}><Button icon="create-outline" title="Edit Customer" disabled={Boolean(saving)} secondary onPress={() => go("customerForm", c.id)} /></View>
-              <View style={{ flex: 1 }}><Button icon="person-remove-outline" title="Disable Customer" loading={saving === "disabled"} disabled={Boolean(saving)} secondary onPress={() => changeCustomerLifecycle(c, "disabled")} /></View>
+              <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="create-outline" title="Edit Customer" disabled={Boolean(saving)} secondary onPress={() => go("customerForm", c.id)} /></View>
+              <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="person-remove-outline" title="Disable Customer" loading={saving === "disabled"} disabled={Boolean(saving)} secondary onPress={() => changeCustomerLifecycle(c, "disabled")} /></View>
             </View>
             <Button icon="trash-outline" title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} />
           </>
         ) : state === "disabled" ? (
           <View style={s.split}>
-            <View style={{ flex: 1 }}><Button icon="person-add-outline" title="Enable Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} /></View>
-            <View style={{ flex: 1 }}><Button icon="trash-outline" title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} /></View>
+            <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="person-add-outline" title="Enable Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} /></View>
+            <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="trash-outline" title="Remove Customer" loading={saving === "removed"} disabled={Boolean(saving)} danger onPress={() => changeCustomerLifecycle(c, "removed")} /></View>
           </View>
         ) : (
           <Button icon="refresh-outline" title="Restore Customer" loading={saving === "active"} disabled={Boolean(saving)} onPress={() => changeCustomerLifecycle(c, "active")} />
@@ -2091,7 +2237,7 @@ function AppContent() {
               {data.customers.find((c) => c.id === e.customerId)?.name}
             </Text>
             <Text style={s.small}>
-              {entryLabel(e.type)} • {e.date}
+              {entryLabel(e.type)} • {entryDateTime(e, localeTag(data.language))}
             </Text>
           </View>
           <Text
@@ -2325,6 +2471,9 @@ function AppContent() {
         "Invalid date",
         "Use a valid date in YYYY-MM-DD format.",
       );
+    const selectedRecordedAt = localDateTimeIso(form.date, form.time || "");
+    if (!selectedRecordedAt)
+      return Alert.alert("Invalid time", "Enter a valid time in h:mm AM/PM format, such as 3:45 PM.");
     const amountPaise = Math.round(amount * 100);
     const oldSignedPaise = old
       ? Math.round(old.amount * 100) * (old.type === "payment" ? -1 : 1)
@@ -2350,7 +2499,10 @@ function AppContent() {
       type,
       amount: Math.round(amount * 100) / 100,
       date: form.date,
-      recordedAt: old?.recordedAt || form.recordedAt || new Date().toISOString(),
+      createdAt: old?.createdAt,
+      recordedAt: old && !transactionDateTimeEdited
+        ? old.recordedAt || old.createdAt
+        : selectedRecordedAt,
       note: form.note.trim(),
       method: form.method,
       reference: form.reference?.trim() || "",
@@ -2376,7 +2528,8 @@ function AppContent() {
         ...data.audit,
       ],
     };
-    const apply = () => save(next, () => go("customer", c.id, true));
+    const useServerTimestamp = !old && !transactionDateTimeEdited && currentConnectivity() === "online";
+    const apply = () => save(next, () => go("customer", c.id, true), useServerTimestamp ? "server" : undefined);
     if (type === "payment") {
       Alert.alert(
         "Confirm money received",
@@ -2452,7 +2605,7 @@ function AppContent() {
         return `"${safe.replace(/"/g, '""')}"`;
       };
       const csv = [
-        "Customer,Type,Amount,Date,Description,Method",
+        "Customer,Type,Amount,Date & Time,Description,Method",
         ...data.customers
           .filter((c) => c.opening !== 0)
           .map((c) =>
@@ -2465,7 +2618,7 @@ function AppContent() {
             data.customers.find((c) => c.id === e.customerId)?.name,
             e.type,
             e.amount,
-            e.date,
+            entryDateTime(e, localeTag(data.language)),
             e.note,
             e.method,
           ]
@@ -2838,6 +2991,11 @@ function AppContent() {
             maxLength: 10,
             placeholder: "98XXXXXXXX",
           })}
+          {data.shopExists === false ? field("Referral code (optional)", "referralCode", {
+            autoCapitalize: "characters",
+            maxLength: 10,
+            placeholder: "Enter a friend’s referral code",
+          }) : null}
           <Title>Language</Title>
           <LanguagePicker value={data.language} onChange={selectLanguage} />
           <Button
@@ -2880,8 +3038,68 @@ function AppContent() {
       );
       break;
     case "home":
+      {
+      const compareNames = (left: string, right: string, direction: "name-asc" | "name-desc") =>
+        direction === "name-asc"
+          ? left.localeCompare(right, undefined, { sensitivity: "base" })
+          : right.localeCompare(left, undefined, { sensitivity: "base" });
+      const transactionCreatedAt = (entry: Entry) => entry.createdAt || entry.recordedAt || `${entry.date}T00:00:00.000Z`;
+      const currentMonthName = new Intl.DateTimeFormat(localeTag(data.language), { month: "long" }).format(new Date());
+      const customerNames = new Map(data.customers.map((customer) => [customer.id, customer.name]));
+      const homeRecentTransactions = data.entries
+        .slice()
+        .sort((a, b) => homeRecentSort === "date-desc" || homeRecentSort === "date-asc"
+          ? (homeRecentSort === "date-desc"
+              ? transactionCreatedAt(b).localeCompare(transactionCreatedAt(a))
+              : transactionCreatedAt(a).localeCompare(transactionCreatedAt(b))) || a.id.localeCompare(b.id)
+          : compareNames(
+              customerNames.get(a.customerId) || "",
+              customerNames.get(b.customerId) || "",
+              homeRecentSort,
+            ) || transactionCreatedAt(b).localeCompare(transactionCreatedAt(a)) || a.id.localeCompare(b.id));
+      const homePendingCustomers = data.customers
+        .filter((c) => isActiveCustomer(c) && balance(data, c.id) > 0)
+        .slice()
+        .sort((a, b) => homePendingCustomersSort === "date-desc" || homePendingCustomersSort === "date-asc"
+          ? (homePendingCustomersSort === "date-desc"
+              ? (b.createdAt || "").localeCompare(a.createdAt || "")
+              : (a.createdAt || "").localeCompare(b.createdAt || "")) || a.id.localeCompare(b.id)
+          : compareNames(a.name, b.name, homePendingCustomersSort) || (b.createdAt || "").localeCompare(a.createdAt || "") || a.id.localeCompare(b.id));
+      const homeSortControls = (
+        selected: "date-desc" | "date-asc" | "name-asc" | "name-desc",
+        setSelected: React.Dispatch<React.SetStateAction<"date-desc" | "date-asc" | "name-asc" | "name-desc">>,
+      ) => (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8, marginBottom: 4 }}>
+          {([
+            ["date-desc", "arrow-down-outline", "Date ↓"],
+            ["date-asc", "arrow-up-outline", "Date ↑"],
+            ["name-asc", "arrow-up-outline", "Name A–Z"],
+            ["name-desc", "arrow-down-outline", "Name Z–A"],
+          ] as const).map(([value, icon, label]) => {
+            const active = selected === value;
+            return (
+              <Pressable
+                key={value}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active }}
+                onPress={() => setSelected(value)}
+                style={{ flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 18, borderWidth: 1, borderColor: active ? colors.green : colors.border, backgroundColor: active ? colors.greenBg : "white" }}
+              >
+                <Icon name={icon} size={15} color={active ? colors.green : colors.muted} />
+                <Text style={{ color: active ? colors.green : colors.muted, fontSize: 12, fontWeight: active ? "700" : "500" }}>{label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      );
+      const animateHomeListExpansion = () => {
+        if (Platform.OS === "android")
+          UIManager.setLayoutAnimationEnabledExperimental?.(true);
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+      };
       content = (
         <>
+          {clockReminder}
           <View style={[s.split, { alignItems: "center" }]}>
             <View style={{ flex: 1 }}>
               <Text style={[s.heading, { fontSize: 23 }]}>
@@ -2922,14 +3140,14 @@ function AppContent() {
           {actions()}
           <View style={s.split}>
             {stat(
-              "This month’s udhari",
+              `${t("This month’s udhari", data.language)} (${currentMonthName})`,
               money(periodUdhari(data, today().slice(0, 7))),
               "blue",
               true,
               "arrow-up-outline",
             )}
             {stat(
-              "This month’s collection",
+              `${t("This month’s collection", data.language)} (${currentMonthName})`,
               money(periodReceived(data, today().slice(0, 7))),
               "green",
               true,
@@ -2940,11 +3158,10 @@ function AppContent() {
             <Icon name="time-outline" size={18} color={colors.dark} style={{ width: 18, height: 18, flexShrink: 0 }} />
             <Title>Recent Transactions</Title>
           </View>
-          {data.entries.length ? (
-            data.entries
-              .slice()
-              .sort((a, b) => b.date.localeCompare(a.date))
-              .slice(0, 4)
+          {homeSortControls(homeRecentSort, setHomeRecentSort)}
+          {homeRecentTransactions.length ? (
+            homeRecentTransactions
+              .slice(0, homeRecentLimit)
               .map((entry) => entryRow(entry))
           ) : (
             <Empty
@@ -2952,14 +3169,39 @@ function AppContent() {
               description="Add your first customer, then record udhari or a payment."
             />
           )}
+          {homeRecentTransactions.length > homeRecentLimit ? (
+            <Button
+              icon="chevron-down-circle-outline"
+              title={t("Load more", data.language)}
+              style={{ backgroundColor: "#FACC15", borderColor: "#FACC15" }}
+              onPress={() => {
+                animateHomeListExpansion();
+                setHomeRecentLimit((current) => Math.min(current + 10, homeRecentTransactions.length));
+              }}
+            />
+          ) : null}
           <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
             <Icon name="people-outline" size={18} color={colors.dark} style={{ width: 18, height: 18, flexShrink: 0 }} />
             <Title>Customers With Pending Balance</Title>
           </View>
-          {data.customers
-            .filter((c) => isActiveCustomer(c) && balance(data, c.id) > 0)
-            .slice(0, 4)
-            .map(customerRow)}
+          {homeSortControls(homePendingCustomersSort, setHomePendingCustomersSort)}
+          {homePendingCustomers
+            .slice(0, homePendingCustomersLimit)
+            .map((customer) => customerRow(customer, true))}
+          {homePendingCustomers.length > homePendingCustomersLimit ? (
+            <>
+              <Hint>{`Showing ${homePendingCustomersLimit} of ${homePendingCustomers.length} customers with pending balance`}</Hint>
+              <Button
+                icon="chevron-down-circle-outline"
+                title={t("Load more customers", data.language)}
+                style={{ backgroundColor: "#FACC15", borderColor: "#FACC15" }}
+                onPress={() => {
+                  animateHomeListExpansion();
+                  setHomePendingCustomersLimit((current) => Math.min(current + 10, homePendingCustomers.length));
+                }}
+              />
+            </>
+          ) : null}
           <Button
             icon="person-add-outline"
             title="+ Add Customer"
@@ -2969,6 +3211,7 @@ function AppContent() {
         </>
       );
       break;
+      }
     case "customers": {
       const list = matchingCustomers;
       const page = pageRecords(list);
@@ -3137,10 +3380,10 @@ function AppContent() {
             <View style={customerDetailsStyles.actionGroup}>
               <View style={customerDetailsStyles.actionRow}>
                 {customerLifecycleState(customer) === "active" ? <View style={{ flex: 1 }}>
-                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.outlinedActionButton]} icon="person-outline" title="View Customer" secondary onPress={() => go("viewCustomer", customer.id)} />
+                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.equalRowButton, customerDetailsStyles.outlinedActionButton]} icon="person-outline" title="View Customer" secondary onPress={() => go("viewCustomer", customer.id)} />
                 </View> : null}
                 <View style={{ flex: 1 }}>
-                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.outlinedActionButton]} icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", customer.id)} />
+                  <Button style={[customerDetailsStyles.actionButton, customerDetailsStyles.equalRowButton, customerDetailsStyles.outlinedActionButton]} icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", customer.id)} />
                 </View>
               </View>
               {customerLifecycleState(customer) === "active" ? <View style={customerDetailsStyles.actionRow}>
@@ -3341,6 +3584,17 @@ function AppContent() {
               {field("Date (YYYY-MM-DD) *", "date", {
                 placeholder: "2026-10-13",
               })}
+              {field("Time (h:mm AM/PM) *", "time", {
+                placeholder: "3:45 PM",
+                autoCapitalize: "characters",
+              })}
+              <Button
+                icon="calendar-outline"
+                title="Choose date and time"
+                secondary
+                onPress={openDateTimePicker}
+              />
+              {clockReminder}
               {route.screen !== "credit" && entry?.type !== "credit" ? (
                 <>
                   <Title>Payment Method</Title>
@@ -3381,6 +3635,107 @@ function AppContent() {
                   onPress={() => deleteEntry(entry)}
                 />
               )}
+              <Modal
+                visible={dateTimePickerVisible}
+                transparent
+                animationType="slide"
+                onRequestClose={() => setDateTimePickerVisible(false)}
+              >
+                <View style={{ flex: 1, justifyContent: "center", padding: 16, backgroundColor: "rgba(0,0,0,0.42)" }}>
+                  <Card style={{ maxHeight: "92%", padding: 16 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                      <Text style={s.heading}>Choose date and time</Text>
+                      <Pressable accessibilityRole="button" accessibilityLabel="Close date and time picker" onPress={() => setDateTimePickerVisible(false)} style={{ padding: 8 }}>
+                        <Icon name="close-outline" size={22} color={colors.dark} />
+                      </Pressable>
+                    </View>
+                    <ScrollView keyboardShouldPersistTaps="handled">
+                      <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                        <Pressable accessibilityRole="button" accessibilityLabel="Previous month" onPress={() => shiftDateTimePickerMonth(-1)} style={{ padding: 10 }}>
+                          <Icon name="chevron-back-outline" size={20} color={colors.green} />
+                        </Pressable>
+                        <Text style={s.rowTitle}>{dateTimePickerMonth.toLocaleDateString(localeTag(data.language), { month: "long", year: "numeric" })}</Text>
+                        <Pressable accessibilityRole="button" accessibilityLabel="Next month" onPress={() => shiftDateTimePickerMonth(1)} style={{ padding: 10 }}>
+                          <Icon name="chevron-forward-outline" size={20} color={colors.green} />
+                        </Pressable>
+                      </View>
+                      <View style={{ flexDirection: "row" }}>
+                        {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => (
+                          <View key={`${day}-${index}`} style={{ flex: 1, alignItems: "center", paddingVertical: 6 }}>
+                            <Text style={s.small}>{day}</Text>
+                          </View>
+                        ))}
+                      </View>
+                      <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: 14 }}>
+                        {Array.from({ length: new Date(dateTimePickerMonth.getFullYear(), dateTimePickerMonth.getMonth(), 1).getDay() }, (_, index) => (
+                          <View key={`empty-${index}`} style={{ width: "14.2857%", height: 42 }} />
+                        ))}
+                        {Array.from({ length: new Date(dateTimePickerMonth.getFullYear(), dateTimePickerMonth.getMonth() + 1, 0).getDate() }, (_, index) => {
+                          const day = index + 1;
+                          const candidate = `${dateTimePickerMonth.getFullYear()}-${String(dateTimePickerMonth.getMonth() + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+                          const selected = candidate === dateTimePickerDate;
+                          return (
+                            <Pressable
+                              key={candidate}
+                              accessibilityRole="button"
+                              accessibilityLabel={candidate}
+                              accessibilityState={{ selected }}
+                              onPress={() => setDateTimePickerDate(candidate)}
+                              style={{ width: "14.2857%", height: 42, alignItems: "center", justifyContent: "center" }}
+                            >
+                              <View style={{ width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: selected ? colors.green : "transparent" }}>
+                                <Text style={{ color: selected ? "white" : colors.dark, fontWeight: selected ? "700" : "500" }}>{day}</Text>
+                              </View>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                      <Text style={s.label}>Time · AM/PM</Text>
+                      <Field
+                        label="Enter time manually"
+                        value={dateTimePickerTime}
+                        onChangeText={setDateTimePickerTime}
+                        placeholder="3:45 PM"
+                        autoCapitalize="characters"
+                      />
+                      {(() => {
+                        const parts = parseClockTime(dateTimePickerTime) || parseClockTime(formatClockTime(new Date()))!;
+                        const control = (label: string, value: string, fieldName: "hour" | "minute", amount: number) => (
+                          <View style={{ flex: 1, alignItems: "center", gap: 4 }}>
+                            <Text style={s.small}>{label}</Text>
+                            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                              <Pressable accessibilityRole="button" accessibilityLabel={`Decrease ${label.toLowerCase()}`} onPress={() => adjustDateTimePicker(fieldName, -amount)} style={{ padding: 9 }}><Icon name="remove-circle-outline" size={20} /></Pressable>
+                              <Text style={s.rowTitle}>{value}</Text>
+                              <Pressable accessibilityRole="button" accessibilityLabel={`Increase ${label.toLowerCase()}`} onPress={() => adjustDateTimePicker(fieldName, amount)} style={{ padding: 9 }}><Icon name="add-circle-outline" size={20} /></Pressable>
+                            </View>
+                          </View>
+                        );
+                        return (
+                          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                            {control("Hour", String(parts.hour).padStart(2, "0"), "hour", 1)}
+                            {control("Minute", String(parts.minute).padStart(2, "0"), "minute", 1)}
+                            <Pressable accessibilityRole="button" accessibilityLabel="Toggle AM or PM" onPress={() => adjustDateTimePicker("period", 1)} style={{ paddingHorizontal: 12, paddingVertical: 10, borderRadius: 9, backgroundColor: colors.greenBg }}>
+                              <Text style={{ color: colors.green, fontWeight: "700" }}>{parts.period}</Text>
+                            </Pressable>
+                          </View>
+                        );
+                      })()}
+                      <View style={{ flexDirection: "row", gap: 10 }}>
+                        <View style={{ flex: 1 }}><Button title="Cancel" secondary onPress={() => setDateTimePickerVisible(false)} /></View>
+                        <View style={{ flex: 1 }}><Button title="Use date and time" onPress={() => {
+                          if (!localDateTimeIso(dateTimePickerDate, dateTimePickerTime)) {
+                            Alert.alert("Invalid time", "Enter a valid time in h:mm AM/PM format, such as 3:45 PM.");
+                            return;
+                          }
+                          f("date", dateTimePickerDate);
+                          f("time", dateTimePickerTime);
+                          setDateTimePickerVisible(false);
+                        }} /></View>
+                      </View>
+                    </ScrollView>
+                  </Card>
+                </View>
+              </Modal>
             </>
           )}
         </>
@@ -3402,7 +3757,7 @@ function AppContent() {
               </Title>
               <View style={customerDetailsStyles.transactionTitleRow}>
                 <Icon name="calendar-outline" size={16} color={colors.muted} />
-                <Hint>{entry.date}</Hint>
+                <Hint>{entryDateTime(entry, localeTag(data.language))}</Hint>
               </View>
             </Card>
             <Title>Description</Title>
@@ -3454,7 +3809,7 @@ function AppContent() {
                 <Row
                   key={entry.id}
                   title={entry.note || entryLabel(entry.type)}
-                  subtitle={entry.date}
+                  subtitle={entryDateTime(entry, localeTag(data.language))}
                   value={transactionAmountText(entry, money)}
                   color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
                   onPress={() => go("transaction", entry.id)}
@@ -3494,7 +3849,7 @@ function AppContent() {
           renderItem: (e) => (
             <Row
               title={e.note || entryLabel(e.type)}
-              subtitle={e.date}
+              subtitle={entryDateTime(e, localeTag(data.language))}
               value={transactionAmountText(e, money)}
               color={financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text}
               onPress={() => go("transaction", e.id)}
@@ -3730,6 +4085,7 @@ function AppContent() {
               "settings",
               "help",
               "subscription",
+              "referral",
               "audit",
               "account",
             ] as Screen[]
@@ -3737,7 +4093,7 @@ function AppContent() {
             <Row
               key={screen}
               title={titles[screen] || screen}
-              icon={screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "notifications" ? "notifications-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
+              icon={screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "notifications" ? "notifications-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "referral" ? "gift-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
               onPress={() => go(screen)}
             />
           ))}
@@ -3998,6 +4354,13 @@ function AppContent() {
         : selected?.durations[0]?.months ?? requestedDuration;
       const price = selected?.durations.find((item) => item.months === duration);
       const asRupees = (minor?: number | null) => money((minor || 0) / 100);
+      const walletAvailableMinor = referralSnapshot && current?.shopId && referralSnapshot.shopId === current.shopId ? referralSnapshot.wallet.availableMinor : 0;
+      const walletAppliedEstimate = price && useWalletForPurchase
+        ? walletAvailableMinor >= price.finalAmountMinor
+          ? price.finalAmountMinor
+          : Math.min(walletAvailableMinor, Math.max(0, price.finalAmountMinor - 100))
+        : 0;
+      const estimatedCashPayableMinor = price ? Math.max(0, price.finalAmountMinor - walletAppliedEstimate) : 0;
       const remainingText = current?.expiresAt
         ? current.remainingMilliseconds !== null && current.remainingMilliseconds < 86400000
           ? t("{{hours}} hours {{minutes}} minutes remaining", data.language, { hours: Math.max(0, Math.floor(current.remainingMilliseconds / 3600000)), minutes: Math.max(0, Math.floor((current.remainingMilliseconds % 3600000) / 60000)) })
@@ -4103,9 +4466,26 @@ function AppContent() {
               )}
             </Card>
           )}
+          {selected && selected.code !== "free" && price && (
+            <Card>
+              <Toggle
+                label={`Use wallet balance${referralSnapshot && current?.shopId && referralSnapshot.shopId === current.shopId ? ` · ${asRupees(walletAvailableMinor)} available` : " · refresh online to load"}`}
+                value={useWalletForPurchase}
+                onChange={setUseWalletForPurchase}
+                disabled={walletAvailableMinor <= 0 || subscriptionPaymentLoading}
+              />
+              {useWalletForPurchase && (
+                <>
+                  <Row icon="wallet-outline" title="Wallet applied (estimate)" value={asRupees(walletAppliedEstimate)} />
+                  <Row icon="card-outline" title="Remaining to pay" value={asRupees(estimatedCashPayableMinor)} />
+                  <Hint>The server checks your available wallet balance again when creating the order. Any remainder is paid through Cashfree.</Hint>
+                </>
+              )}
+            </Card>
+          )}
           <Button
-            icon="card-outline"
-            title={subscriptionPaymentLoading ? "Contacting Cashfree…" : `Pay securely with Cashfree${price ? ` • ${asRupees(price.finalAmountMinor)}` : ""}`}
+            icon={useWalletForPurchase && estimatedCashPayableMinor === 0 ? "wallet-outline" : "card-outline"}
+            title={subscriptionPaymentLoading ? "Processing securely…" : useWalletForPurchase && estimatedCashPayableMinor === 0 ? `Buy with wallet · ${asRupees(price?.finalAmountMinor)}` : useWalletForPurchase ? `Use wallet + Cashfree · ${asRupees(estimatedCashPayableMinor)}` : `Pay securely with Cashfree${price ? ` • ${asRupees(price.finalAmountMinor)}` : ""}`}
             loading={subscriptionPaymentLoading}
             disabled={!subscriptionSnapshot?.checkoutEnabled || !selected || selected.code === "free" || !price}
             onPress={() => void purchaseSubscription()}
@@ -4137,6 +4517,8 @@ function AppContent() {
             <Row icon="pricetag-outline" title="Discount" value={money((payment.pricing?.discountAmountMinor || 0) / 100)} />
             <Row icon="receipt-outline" title="Tax" value={money((payment.pricing?.taxAmountMinor || 0) / 100)} />
             <Row icon="card-outline" title="Amount paid" value={money((payment.amountMinor || 0) / 100)} />
+            {(payment.walletAppliedMinor || 0) > 0 && <Row icon="wallet-outline" title="Wallet used" value={money(payment.walletAppliedMinor / 100)} />}
+            {(payment.cashPaidMinor || 0) > 0 && payment.walletAppliedMinor > 0 && <Row icon="card-outline" title="Cashfree paid" value={money(payment.cashPaidMinor / 100)} />}
             <Row icon="calendar-outline" title="Date" value={new Date(payment.createdAt).toLocaleString("en-IN")} />
             <Row icon={payment.status === "paid" ? "checkmark-circle-outline" : payment.status === "failed" ? "close-circle-outline" : payment.status === "refunded" || payment.status === "partially_refunded" ? "refresh-outline" : "time-outline"} title="Status" value={payment.status} />
             {payment.gatewayPaymentId && <Row icon="receipt-outline" title="Payment reference" value={payment.gatewayPaymentId} />}
@@ -4173,6 +4555,64 @@ function AppContent() {
       };
       break;
       }
+    case "referral": {
+      const referralBase = (process.env.EXPO_PUBLIC_REFERRAL_BASE_URL || "").replace(/\/+$/, "");
+      const referralLink = referralSnapshot && referralBase
+        ? `${referralBase}${referralSnapshot.referralUrlPath}`
+        : referralSnapshot ? `digitalkhata://refer/${referralSnapshot.referralCode}` : "";
+      content = (
+        <>
+          <Card style={{ padding: 14, gap: 10 }}>
+            <View style={customerDetailsStyles.transactionTitleRow}>
+              <Icon name="gift-outline" size={20} color={colors.green} />
+              <Title>Refer & Earn</Title>
+            </View>
+            <Hint>Invite a new shopkeeper to Digital Khata. Once they create their shop and add the customer count set by the administrator, both shops receive wallet credit.</Hint>
+            {referralLoading ? <ActivityIndicator color={colors.green} /> : null}
+            {referralLoadError ? <Hint>{referralLoadError}</Hint> : null}
+            {referralSnapshot ? (
+              <>
+                <Row icon="pricetag-outline" title="Your referral code" value={referralSnapshot.referralCode} />
+                <Button
+                  icon="share-social-outline"
+                  title="Share referral link"
+                  disabled={connectivityStatus === "offline" && !referralSnapshot.referralCode}
+                  onPress={() => {
+                    const message = `Join me on Digital Khata to manage shop customers and udhari. Use my referral code ${referralSnapshot.referralCode}${referralLink ? `\n${referralLink}` : ""}`;
+                    void Share.share({ message }).catch(() => Alert.alert("Unable to share referral", "Please try again."));
+                  }}
+                />
+                {!referralBase ? <Hint>Configure EXPO_PUBLIC_REFERRAL_BASE_URL in the mobile build to share the public referral landing page. The code can still be shared for manual entry.</Hint> : null}
+              </>
+            ) : !referralLoading && !referralLoadError ? <Hint>Referral and wallet information has not been loaded yet.</Hint> : null}
+          </Card>
+          {referralSnapshot ? (
+            <>
+              <Card style={{ padding: 14, gap: 8 }}>
+                <View style={customerDetailsStyles.transactionTitleRow}><Icon name="wallet-outline" size={20} color={colors.green} /><Title>Subscription Wallet</Title></View>
+                <Text style={[s.amount, { color: colors.green }]}>{money(referralSnapshot.wallet.availableMinor / 100)}</Text>
+                <Hint>Available to use toward eligible subscription purchases. Wallet balance and spending are confirmed by the server.</Hint>
+              </Card>
+              <Title>Referral Progress</Title>
+              <Card style={{ padding: 14, gap: 8 }}>
+                <Row icon="time-outline" title="Pending" value={String(referralSnapshot.referrals.counts.pending)} />
+                <Row icon="checkmark-circle-outline" title="Rewarded" value={String(referralSnapshot.referrals.counts.rewarded)} />
+                {referralSnapshot.referrals.items.length ? referralSnapshot.referrals.items.slice(0, 8).map((item) => (
+                  <Row key={item.id} icon={item.status === "rewarded" ? "checkmark-circle-outline" : "time-outline"} title={item.role === "referred" ? "Referred shop" : "Your referral"} subtitle={`${item.status} • ${item.requiredCustomers} eligible customers required`} value={item.status === "rewarded" ? money(item.rewardMinor / 100) : "—"} />
+                )) : <Hint>No referrals yet. Share your code to invite a new shopkeeper.</Hint>}
+              </Card>
+              <Title>Wallet Activity</Title>
+              <Card style={{ padding: 14, gap: 8 }}>
+                {referralSnapshot.wallet.items.length ? referralSnapshot.wallet.items.slice(0, 10).map((item) => (
+                  <Row key={item.id} icon={item.direction === "credit" ? "add-circle-outline" : "remove-circle-outline"} title={item.description} subtitle={new Date(item.createdAt).toLocaleDateString("en-IN")} value={`${item.direction === "credit" ? "+" : "−"}${money(item.amountMinor / 100)}`} color={item.direction === "credit" ? colors.green : colors.red} />
+                )) : <Hint>Wallet rewards and subscription spending will appear here.</Hint>}
+              </Card>
+            </>
+          ) : null}
+        </>
+      );
+      break;
+    }
     case "account":
       content = (
         <>
@@ -4246,13 +4686,13 @@ function AppContent() {
               <Hint>{new Date(a.date).toLocaleString("en-IN")}</Hint>
               {a.before && typeof a.before.amount === "number" && (
                 <Hint>
-                  Before: {money(a.before.amount)} • {a.before.date} •{" "}
+                  Before: {money(a.before.amount)} • {entryDateTime(a.before, localeTag(data.language))} •{" "}
                   {a.before.note}
                 </Hint>
               )}
               {a.after && typeof a.after.amount === "number" && (
                 <Hint>
-                  After: {money(a.after.amount)} • {a.after.date} •{" "}
+                  After: {money(a.after.amount)} • {entryDateTime(a.after, localeTag(data.language))} •{" "}
                   {a.after.note}
                 </Hint>
               )}

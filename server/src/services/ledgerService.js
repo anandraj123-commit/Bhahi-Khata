@@ -3,6 +3,7 @@ import { Customer, Entry, FinancialResolution, Idempotency } from "../models.js"
 import { digest } from "../utils/hashing.js";
 import { paise } from "../utils/money.js";
 import { entryOut, financialAuditOut } from "../utils/serializers.js";
+import { ledgerRecordedAt } from "../utils/ledgerTimestamp.js";
 import { sameEntryValues } from "../utils/records.js";
 import { saveAudit } from "./auditService.js";
 
@@ -128,10 +129,14 @@ export async function listLedger({ shopId, customerId, month, cursorId, limit })
   };
 }
 
-export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) {
+export async function createLedgerEntry({ shopId, actorId, entry, audit, key, useServerRecordedAt = false }) {
   if (key && key.length > 128)
     throw serviceError("Invalid idempotency key", 400);
   const requestHash = digest(JSON.stringify(entry));
+  const storedEntry = {
+    ...entry,
+    recordedAt: ledgerRecordedAt(entry.recordedAt, useServerRecordedAt).toISOString(),
+  };
   if (key) {
     const existing = await Idempotency.findOne({ shopId, key }).lean();
     if (existing) {
@@ -150,7 +155,10 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
         clientId: entry.id,
       }).session(session);
       if (doc) {
-        if (doc.deletedAt || !sameEntryValues(entryOut(doc), entry))
+        const comparableEntry = useServerRecordedAt
+          ? { ...storedEntry, recordedAt: doc.recordedAt?.toISOString?.() || storedEntry.recordedAt }
+          : storedEntry;
+        if (doc.deletedAt || !sameEntryValues(entryOut(doc), comparableEntry))
           throw serviceError("Transaction identifier already exists", 409);
         response = entryOut(doc);
         duplicate = true;
@@ -172,7 +180,7 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key }) 
             type: entry.type,
             amountPaise: paise(entry.amount),
             date: entry.date,
-            recordedAt: entry.recordedAt ? new Date(entry.recordedAt) : new Date(),
+            recordedAt: storedEntry.recordedAt ? new Date(storedEntry.recordedAt) : new Date(),
             note: entry.note,
             method: entry.method,
             reference: entry.reference || "",
@@ -282,6 +290,7 @@ export async function updateLedgerEntry({
           type: value.type,
           amountPaise: paise(value.amount),
           date: value.date,
+          ...(value.recordedAt ? { recordedAt: new Date(value.recordedAt) } : {}),
           reference: value.reference || "",
           note: value.note,
           method: value.method,
