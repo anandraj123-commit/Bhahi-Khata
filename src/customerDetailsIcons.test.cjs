@@ -171,3 +171,12 @@ test("filter chips render all five intended icons with compact accessible stylin
   assert.match(uiSource, /chipContent: \{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 \}/);
   assert.match(uiSource, /chipIcon: \{ width: 17, height: 17, flexShrink: 0 \}/);
 });
+
+test("Customers Add Customer action stays once in the virtualized list footer", () => {
+  const customersStart = appSource.indexOf('case "customers": {');
+  const manageStart = appSource.indexOf('case "manageCustomers": {', customersStart);
+  const customersSource = appSource.slice(customersStart, manageStart);
+  assert.match(customersSource, /footer: <>[\s\S]*?listFooter\(page\.hasMore, "Loading more customers\.\.\."\)[\s\S]*?icon="person-add-outline" title="\+ Add Customer" onPress=\{\(\) => go\("customerForm"\)\}/);
+  assert.equal((customersSource.match(/title="\+ Add Customer"/g) || []).length, 1);
+  assert.doesNotMatch(customersSource, /virtualizedTop/);
+});
