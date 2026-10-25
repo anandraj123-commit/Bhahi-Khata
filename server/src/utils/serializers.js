@@ -8,6 +8,7 @@ export const customerOut = (d) => ({
     d.createdAt?.toISOString?.().slice(0, 10),
   name: d.name,
   phone: d.phoneNormalized || d.phone || "",
+  whatsappNumber: d.whatsappNumber || "",
   address: d.address,
   opening: d.openingPaise / 100,
   openingAdvance: (d.openingAdvancePaise || 0) / 100,

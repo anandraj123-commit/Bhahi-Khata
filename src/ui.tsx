@@ -112,12 +112,15 @@ export function Button({
     </Pressable>
   );
 }
-export function Field({ label, ...props }: TextInputProps & { label: string }) {
+export function Field({ label, icon, ...props }: TextInputProps & { label: string; icon?: React.ComponentProps<typeof Icon>["name"] }) {
   const language = React.useContext(LanguageContext);
   const numericInput = ["phone-pad", "numeric", "decimal-pad"].includes(String(props.keyboardType || ""));
   return (
     <View style={s.field}>
-      <Text style={s.label}>{label}</Text>
+      {icon ? <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+        <Icon name={icon} size={18} color={colors.muted} />
+        <Text style={s.label}>{label}</Text>
+      </View> : <Text style={s.label}>{label}</Text>}
       <TextInput
         accessibilityLabel={translate(label, language)}
         placeholderTextColor="#9AA49F"
@@ -149,20 +152,32 @@ export function Chips({
   items,
   value,
   onChange,
+  equalWidth = false,
+  style,
 }: {
   items: string[];
   value: string;
   onChange: (s: string) => void;
+  equalWidth?: boolean;
+  style?: any;
 }) {
   const filterIcons: Partial<Record<string, { name: React.ComponentProps<typeof Icon>["name"]; color: string }>> = {
     All: { name: "grid-outline", color: colors.neutral },
+    "Outstanding Dues": { name: "arrow-up-circle-outline", color: colors.red },
+    "No Dues": { name: "checkmark-circle-outline", color: colors.green },
+    "Total Udhari": { name: "receipt-outline", color: colors.blue },
+    "Total Money Received": { name: "cash-outline", color: colors.green },
+    "Udhari Recovered": { name: "checkmark-circle-outline", color: colors.green },
+    "Available Advances": { name: "wallet-outline", color: colors.green },
+    "Advance Deposited": { name: "download-outline", color: colors.blue },
+    "Advance Refunded": { name: "push-outline", color: colors.orange },
     Udhari: { name: "arrow-up-circle-outline", color: colors.red },
     Payment: { name: "wallet-outline", color: colors.green },
     Due: { name: "time-outline", color: colors.orange },
     Paid: { name: "checkmark-circle-outline", color: colors.green },
   };
   return (
-    <View style={s.chips}>
+    <View style={[s.chips, style, equalWidth && { flexWrap: "nowrap", width: "100%" }]}>
       {items.map((item) => (
         <Pressable
           key={item}
@@ -170,7 +185,7 @@ export function Chips({
           accessibilityLabel={item}
           accessibilityState={{ selected: value === item }}
           onPress={() => onChange(item)}
-          style={[s.chip, value === item && s.chipActive]}
+          style={[s.chip, equalWidth && { flex: 1, minWidth: 0, paddingHorizontal: 6 }, value === item && s.chipActive]}
         >
           <View style={s.chipContent}>
             {filterIcons[item] ? (
@@ -185,6 +200,8 @@ export function Chips({
               style={{
                 color: value === item ? "white" : colors.muted,
                 fontWeight: "600",
+                textAlign: "center",
+                flexShrink: equalWidth ? 1 : 0,
               }}
             >
               {item}

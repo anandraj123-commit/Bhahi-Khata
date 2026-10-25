@@ -53,6 +53,7 @@ const customerSchema = new Schema(
       name: { type: String, required: true, trim: true, maxlength: 120 },
       nameFolded: { type: String, required: true },
       phone: { type: String, default: "", maxlength: 20 },
+      whatsappNumber: { type: String, default: "", match: /^(?:[6-9]\d{9})?$/ },
       phoneNormalized: { type: String, maxlength: 10 },
       phoneActive: { type: Boolean, default: false },
       address: { type: String, default: "", maxlength: 500 },

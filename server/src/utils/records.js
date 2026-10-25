@@ -1,7 +1,8 @@
+// Omitted WhatsApp fields from older clients preserve the server value; empty strings remove it.
 export const sameCustomerValues = (left, right) =>
   ["id", "name", "phone", "address", "opening", "openingAdvance", "openingDate", "limit", "reminder"].every(
     (key) => left[key] === right[key],
-  );
+  ) && (right.whatsappNumber === undefined || (left.whatsappNumber || "") === right.whatsappNumber);
 export const sameEntryValues = (left, right) =>
   ["id", "customerId", "type", "amount", "date", "note", "method", "reference"].every(
     (key) => left[key] === right[key],

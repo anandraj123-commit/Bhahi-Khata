@@ -45,6 +45,7 @@ export async function restoreBackup({ shopId, user, data }) {
               name: customer.name,
               nameFolded: customer.name.toLocaleLowerCase("en"),
               phone: customer.phone,
+              ...(customer.whatsappNumber !== undefined ? { whatsappNumber: customer.whatsappNumber } : {}),
               ...(customer.phone ? { phoneNormalized: customer.phone } : {}),
               phoneActive: Boolean(customer.phone),
               address: customer.address,

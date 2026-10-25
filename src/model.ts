@@ -14,6 +14,7 @@ export type Customer = {
   openingDate?: string;
   name: string;
   phone: string;
+  whatsappNumber?: string;
   address: string;
   opening: number;
   openingAdvance?: number;
@@ -352,6 +353,7 @@ export function validBackup(value: unknown): value is Data {
         (c.createdAt === undefined || typeof c.createdAt === "string") &&
         typeof c.name === "string" &&
         typeof c.phone === "string" &&
+        (c.whatsappNumber === undefined || (typeof c.whatsappNumber === "string" && /^(?:[6-9]\d{9})?$/.test(c.whatsappNumber))) &&
         typeof c.address === "string" &&
         Number.isFinite(c.opening) &&
         c.opening >= 0 &&

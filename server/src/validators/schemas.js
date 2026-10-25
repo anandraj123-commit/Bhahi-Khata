@@ -31,6 +31,11 @@ export const customerSchema = z
         "Enter a valid 10-digit Indian mobile number")
       .transform((value) => normalizeCustomerMobile(value) || "")
       .default(""),
+    whatsappNumber: z.string().max(32)
+      .refine((value) => normalizeCustomerMobile(value) !== null,
+        "Enter a valid 10-digit Indian WhatsApp number beginning with 6–9")
+      .transform((value) => normalizeCustomerMobile(value) || "")
+      .optional(),
     address: z.string().max(500).default(""),
     opening: moneySchema(),
     openingAdvance: moneySchema().default(0),

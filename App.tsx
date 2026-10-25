@@ -1,3 +1,7 @@
+import { TransactionTypeBadge } from "./src/TransactionTypeBadge";
+import { CustomerContactInfo } from "./src/CustomerContactInfo";
+import { openCustomerContact } from "./src/customerContactActions";
+import { updateCustomerContactForm } from "./src/customerContactForm";
 import { formatCurrency, LanguageContext, showLocalizedAlert, t, Text } from "./src/i18n";
 import { apiErrorTranslationKey } from "./src/localization";
 import { isTemporaryBackendFailure } from "./src/startupRecovery";
@@ -59,7 +63,6 @@ import {
 } from "./src/customerPresentation";
 import {
   khataBalanceDisplay,
-  khataCustomerMatchesSearch,
   khataEntriesForTab,
   transactionAmountText,
 } from "./src/khataPresentation";
@@ -405,35 +408,96 @@ function AppContent() {
   const [history, setHistory] = useState<Route[]>([]);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("All");
+  const [customerListSort, setCustomerListSort] = useState<HomeCustomerSort>("date-desc");
+  const [customerCreationDateFilter, setCustomerCreationDateFilter] = useState("");
+  const [khataCustomerSort, setKhataCustomerSort] = useState<HomeCustomerSort>("date-desc");
+  const [khataCustomerDateFilter, setKhataCustomerDateFilter] = useState("");
+  const [khataDatePickerVisible, setKhataDatePickerVisible] = useState(false);
+  const [khataDatePickerMonth, setKhataDatePickerMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  const [customerDatePickerVisible, setCustomerDatePickerVisible] = useState(false);
+  const [customerDatePickerMonth, setCustomerDatePickerMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
   const [manageCustomerFilter, setManageCustomerFilter] = useState("All");
   const customerActionGate = useRef(new CustomerActionGate());
   const [savingCustomers, setSavingCustomers] = useState<Record<string, CustomerLifecycleState>>({});
   const [customerPagePending, startCustomerPageTransition] = useTransition();
   const customerPageRequest = useRef<{ key: string; count: number } | null>(null);
   const [month, setMonth] = useState(today().slice(0, 7));
+  const customerFinancialById = useMemo(
+    () => new Map(data.customers.map((item) => [item.id, financialSummary(data, item.id)] as const)),
+    [data],
+  );
   const matchingCustomers = useMemo(() => {
-    if (route.screen === "customers")
-      return data.customers.filter((c) => isActiveCustomer(c) &&
-        (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search)) &&
-        (filter === "All" || (filter === "Due" && balance(data, c.id) > 0) || (filter === "Paid" && balance(data, c.id) <= 0)),
-      );
+    if (route.screen === "customers") {
+      const query = search.trim().toLocaleLowerCase();
+      return data.customers
+        .filter((c) => {
+          if (!isActiveCustomer(c)) return false;
+          const createdDate = (c.createdAt || "").slice(0, 10);
+          const searchMatches = !query || [c.name, c.phone, c.address, createdDate].some((value) => value.toLocaleLowerCase().includes(query));
+          const dateMatches = !customerCreationDateFilter || createdDate === customerCreationDateFilter;
+          // Keep dues filtering aligned with the exact balance shown in each customer row.
+          const currentBalance = balance(data, c.id);
+          const summary = customerFinancialById.get(c.id);
+          const categoryMatches = filter === "All"
+            || (filter === "Outstanding Dues" && currentBalance > 0)
+            || (filter === "No Dues" && currentBalance <= 0)
+            || (filter === "Total Udhari" && (summary?.totalUdhariPaise || 0) > 0)
+            || (filter === "Total Money Received" && (summary?.totalReceivedPaise || 0) > 0)
+            || (filter === "Udhari Recovered" && (summary?.totalUdhariRecoveredPaise || 0) > 0)
+            || (filter === "Available Advances" && (summary?.availableAdvancePaise || 0) > 0)
+            || (filter === "Advance Deposited" && (summary?.totalAdvanceDepositedPaise || 0) > 0)
+            || (filter === "Advance Refunded" && (summary?.totalAdvanceRefundedPaise || 0) > 0);
+          return searchMatches && dateMatches && categoryMatches;
+        })
+        .slice()
+        .sort((left, right) => customerListSort === "date-desc" || customerListSort === "date-asc"
+          ? (customerListSort === "date-desc"
+              ? (right.createdAt || "").localeCompare(left.createdAt || "")
+              : (left.createdAt || "").localeCompare(right.createdAt || "")) || left.id.localeCompare(right.id)
+          : customerListSort === "name-asc"
+            ? left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id)
+            : right.name.localeCompare(left.name, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id));
+    }
     if (["credit", "payment", "refund"].includes(route.screen))
       return data.customers.filter((c) => isActiveCustomer(c) && (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search)));
     return [];
-  }, [data, route.screen, search, filter]);
+  }, [data, route.screen, search, filter, customerListSort, customerCreationDateFilter, customerFinancialById]);
   const managedCustomers = useMemo(() => data.customers.filter((c) => {
     const tabMatches = matchesCustomerLifecycleFilter(c, manageCustomerFilter as "All" | "Disabled" | "Removed");
     return tabMatches && (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search));
   }), [data.customers, search, manageCustomerFilter]);
+  const matchingKhataCustomers = useMemo(() => {
+    if (route.screen !== "khata") return [];
+    const query = search.trim().toLocaleLowerCase();
+    return data.customers
+      .filter((customer) => {
+        const createdDate = (customer.createdAt || "").slice(0, 10);
+        const searchMatches = !query || [customer.name, customer.phone, customer.address, createdDate]
+          .some((value) => value.toLocaleLowerCase().includes(query));
+        return searchMatches && (!khataCustomerDateFilter || createdDate === khataCustomerDateFilter);
+      })
+      .slice()
+      .sort((left, right) => khataCustomerSort === "date-desc" || khataCustomerSort === "date-asc"
+        ? (khataCustomerSort === "date-desc"
+            ? (right.createdAt || "").localeCompare(left.createdAt || "")
+            : (left.createdAt || "").localeCompare(right.createdAt || "")) || left.id.localeCompare(right.id)
+        : khataCustomerSort === "name-asc"
+          ? left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id)
+          : right.name.localeCompare(left.name, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id));
+  }, [data.customers, route.screen, search, khataCustomerDateFilter, khataCustomerSort]);
   const khataRows = useMemo(() => {
     if (route.screen !== "khata") return [];
-    return data.customers
-      .filter((customer) => khataCustomerMatchesSearch(customer.name, search))
-      .flatMap((customer) => {
-        const summary = monthly(data, customer.id, month);
-        return khataEntriesForTab(summary.entries, filter, month).map((entry) => ({ customer, summary, entry }));
-      });
-  }, [data, route.screen, search, filter, month]);
+    return matchingKhataCustomers.flatMap((customer) => {
+      const summary = monthly(data, customer.id, month);
+      return khataEntriesForTab(summary.entries, filter, month).map((entry) => ({ customer, summary, entry }));
+    });
+  }, [data, route.screen, filter, month, matchingKhataCustomers]);
   const [listPage, setListPage] = useState({ key: "", count: PAGE_SIZE, loading: false });
   const listPageRef = useRef({ key: "", count: PAGE_SIZE, total: 0, loading: false });
   const listPageCounts = useRef(new Map<string, number>());
@@ -444,7 +508,7 @@ function AppContent() {
   const customerScrollGate = useRef(new UserScrollPageGate());
   const customerScrollStartedForKey = useRef("");
   const customerDragStartOffset = useRef(0);
-  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${manageCustomerFilter}:${month}`;
+  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${manageCustomerFilter}:${month}:${route.screen === "customers" ? `${customerListSort}:${customerCreationDateFilter}` : route.screen === "khata" ? `${khataCustomerSort}:${khataCustomerDateFilter}` : ""}`;
   const listPageKeyRef = useRef(listPageKey);
   listPageKeyRef.current = listPageKey;
   const rememberPageCount = (key: string, count: number) => {
@@ -507,12 +571,12 @@ function AppContent() {
       void loadMoreSubscriptionHistory();
     if (listHasScrolled.current && nearBottom && route.screen === "subscriptionPayments" && subscriptionSnapshot?.paymentsNextCursor)
       void loadMoreSubscriptionPayments();
-    if (route.screen === "customers" || route.screen === "manageCustomers" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "customers" || route.screen === "manageCustomers" || route.screen === "khata" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     requestNextVisiblePage();
   };
   const requestNextVisiblePage = () => {
     const current = listPageRef.current;
-    if (!listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "khata" || !listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     const nextCount = nextVisibleCount(current.count, current.total);
     if (route.screen === "manageCustomers") {
       if (customerPageRequest.current?.key === current.key) return;
@@ -543,6 +607,7 @@ function AppContent() {
     return new Date(now.getFullYear(), now.getMonth(), 1);
   });
   const [homeRecentLimit, setHomeRecentLimit] = useState(10);
+  const [khataCustomerTransactionLimits, setKhataCustomerTransactionLimits] = useState<Record<string, number>>({});
   const [homeCustomerListLimits, setHomeCustomerListLimits] = useState<Record<HomeCustomerListKey, number>>({
     outstanding: 10, udhari: 10, received: 10, recovered: 10,
     availableAdvance: 10, deposited: 10, refunded: 10, customers: 10,
@@ -1963,6 +2028,8 @@ function AppContent() {
           ? {
               name: c.name,
               phone: c.phone,
+              whatsappNumber: c.whatsappNumber || "",
+              sameAsMobile: "false",
               address: c.address,
               opening: String(c.opening),
               openingAdvance: String(c.openingAdvance || 0),
@@ -1972,6 +2039,8 @@ function AppContent() {
           : {
               name: "",
               phone: "",
+              whatsappNumber: "",
+              sameAsMobile: "false",
               address: "",
               opening: "0",
               openingAdvance: "0",
@@ -2028,7 +2097,9 @@ function AppContent() {
   }
   const f = (key: string, value: string) => {
     if (key === "date" || key === "time") setTransactionDateTimeEdited(true);
-    setForm((prev) => ({ ...prev, [key]: value }));
+    setForm((prev) => route.screen === "customerForm"
+      ? updateCustomerContactForm(prev, key, value)
+      : { ...prev, [key]: value });
   };
   const field = (
     label: string,
@@ -2049,10 +2120,6 @@ function AppContent() {
     0,
   );
   const financial = financialSummary(data);
-  const customerFinancialById = useMemo(
-    () => new Map(data.customers.map((item) => [item.id, financialSummary(data, item.id)] as const)),
-    [data],
-  );
   const monthEntries = data.entries.filter((e) => e.date.startsWith(month));
   const totalCredit = periodUdhari(data, month);
   const totalPayment = periodReceived(data, month);
@@ -2188,14 +2255,11 @@ function AppContent() {
             <View style={{ flex: 1 }}>
               <Text style={s.rowTitle}>{c.name}</Text>
               {includeCreatedTime
-                ? c.phone ? <Text style={s.small}>{c.phone}</Text> : null
-                : <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>}
-              {c.address ? <Text style={s.small}>{c.address}</Text> : null}
-              {includeCreatedTime
                 ? c.createdAt && formatCustomerCreatedAt(c.createdAt) !== "Not available"
-                  ? <Text style={s.small}>Created On: {formatCustomerCreatedAt(c.createdAt)}</Text>
+                  ? <View style={{ alignSelf: "flex-start", marginTop: 4, marginBottom: 2, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, backgroundColor: colors.greenBg }}><Text style={{ fontSize: 10, color: colors.green, fontWeight: "600" }}>{t("Khata Created On", data.language)}: {formatCustomerCreatedAt(c.createdAt)}</Text></View>
                   : null
-                : <Text style={s.small}>Created On: {formatCustomerCreatedOn(c.createdAt)}</Text>}
+                : <View style={{ alignSelf: "flex-start", marginTop: 4, marginBottom: 2, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, backgroundColor: colors.greenBg }}><Text style={{ fontSize: 10, color: colors.green, fontWeight: "600" }}>{t("Khata Created On", data.language)}: {formatCustomerCreatedOn(c.createdAt)}</Text></View>}
+              <CustomerContactInfo customer={c} compact />
             </View>
             <Text style={{ color: financialPalette[rightValue?.tone || tone].text, fontWeight: "700" }}>
               {rightValue?.text || label}
@@ -2214,8 +2278,7 @@ function AppContent() {
         <View style={[s.split, { alignItems: "center" }]}>
           <View style={{ flex: 1 }}>
             <Text style={s.rowTitle}>{c.name}</Text>
-            <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>
-            {c.address ? <Text style={s.small}>{c.address}</Text> : null}
+            <CustomerContactInfo customer={c} compact />
           </View>
           <View style={[s.badge, { backgroundColor: state === "removed" ? colors.redBg : state === "disabled" ? colors.neutralBg : colors.greenBg }]}>
             <Text style={{ color: state === "removed" ? colors.red : state === "disabled" ? colors.neutral : colors.green, fontWeight: "700" }}>
@@ -2271,11 +2334,12 @@ function AppContent() {
             </View>
             <View style={{ flex: 1, minWidth: 0 }}>
               <Text style={s.rowTitle}>{customer?.name || "Customer"}</Text>
-              <Text style={s.small}>{entryLabel(e.type)}</Text>
+              {showHomeCustomerDetails
+                ? <TransactionTypeBadge label={entryLabel(e.type)} compact />
+                : <Text style={s.small}>{entryLabel(e.type)}</Text>}
               {showHomeCustomerDetails ? (
                 <View style={{ gap: 3, marginTop: 4 }}>
-                  {customer?.phone ? <Text style={s.small}>{customer.phone}</Text> : null}
-                  {customer?.address ? <Text style={s.small}>{customer.address}</Text> : null}
+                  {customer ? <CustomerContactInfo customer={customer} compact /> : null}
                   <Text style={s.small}>Created on: {entryDateTime(e, localeTag(data.language))}</Text>
                 </View>
               ) : (
@@ -2302,6 +2366,7 @@ function AppContent() {
       return Alert.alert("Cannot edit this customer", "Enable or restore this customer before editing.");
     const name = form.name?.trim();
     const normalizedPhone = normalizeCustomerMobile(form.phone);
+    const whatsappNumber = normalizeCustomerMobile(form.whatsappNumber);
     const opening = Number(form.opening || 0),
       openingAdvance = Number(form.openingAdvance || 0),
       limit = Number(form.limit || 0);
@@ -2312,6 +2377,8 @@ function AppContent() {
         "Invalid phone",
         "Enter a valid Indian mobile number, such as 9876543210 or +91 9876543210.",
       );
+    if (whatsappNumber === null)
+      return Alert.alert("Invalid WhatsApp number", "Enter a 10-digit Indian WhatsApp mobile number beginning with 6–9, or leave it empty.");
     if (normalizedPhone) {
       const duplicate = data.customers.find((item) =>
         item.id !== route.id && normalizeCustomerMobile(item.phone) === normalizedPhone,
@@ -2355,6 +2422,7 @@ function AppContent() {
         (!route.id ? today() : undefined),
       name,
       phone: normalizedPhone || "",
+      whatsappNumber: whatsappNumber || "",
       address: form.address.trim(),
       opening: Math.round(opening * 100) / 100,
       openingAdvance: Math.round(openingAdvance * 100) / 100,
@@ -2770,25 +2838,26 @@ function AppContent() {
     }
   }
   async function sendStatement() {
-    if (!customer?.phone)
+    if (!customer) return;
+    const number = normalizeCustomerMobile(channel === "WhatsApp" ? customer.whatsappNumber : customer.phone);
+    if (!number)
       return Alert.alert(
-        "Phone number required",
-        "Edit the customer and add a valid mobile number first.",
+        channel === "WhatsApp" ? "WhatsApp number required" : "Phone number required",
+        "Edit the customer and add a valid number first.",
       );
     if (!customer.reminder)
       return Alert.alert(
         "Customer opted out",
         "This customer has disabled WhatsApp/SMS reminders.",
       );
+    if (channel === "WhatsApp") {
+      await openCustomerContact("whatsapp", customer.whatsappNumber, form.message);
+      return;
+    }
     try {
-      const message = encodeURIComponent(form.message);
-      await Linking.openURL(
-        channel === "WhatsApp"
-          ? `https://wa.me/91${customer.phone}?text=${message}`
-          : `sms:+91${customer.phone}?body=${message}`,
-      );
+      await Linking.openURL(`sms:+91${number}?body=${encodeURIComponent(form.message)}`);
     } catch {
-      Alert.alert("Unable to open app", `Please install or enable ${channel}.`);
+      Alert.alert("Unable to open app", "Please install or enable SMS.");
     }
   }
   let content: React.ReactNode = null;
@@ -3457,24 +3526,155 @@ function AppContent() {
       virtualizedRows = {
         data: page.items,
         keyExtractor: (customer) => customer.id,
-        renderItem: (customer) => customerRow(customer),
+        renderItem: (customer) => {
+          const summary = customerFinancialById.get(customer.id);
+          const selectedMetric = filter === "Total Udhari"
+            ? { amountPaise: summary?.totalUdhariPaise || 0, tone: "blue" as const }
+            : filter === "Total Money Received"
+              ? { amountPaise: summary?.totalReceivedPaise || 0, tone: "green" as const }
+              : filter === "Udhari Recovered"
+                ? { amountPaise: summary?.totalUdhariRecoveredPaise || 0, tone: "green" as const }
+                : filter === "Available Advances"
+                  ? { amountPaise: summary?.availableAdvancePaise || 0, tone: "green" as const }
+                  : filter === "Advance Deposited"
+                    ? { amountPaise: summary?.totalAdvanceDepositedPaise || 0, tone: "blue" as const }
+                    : filter === "Advance Refunded"
+                      ? { amountPaise: summary?.totalAdvanceRefundedPaise || 0, tone: "amber" as const }
+                      : null;
+          return selectedMetric
+            ? customerRow(customer, false, { text: money(selectedMetric.amountPaise / 100), tone: selectedMetric.tone })
+            : customerRow(customer);
+        },
         header: <>
-          <Field
-            label="Search customers"
-            placeholder="Search name or phone"
-            value={search}
-            onChangeText={setSearch}
+          <Button
+            icon="person-add-outline"
+            title="+ Add Customer"
+            onPress={() => go("customerForm")}
+            style={{ marginTop: 4, marginBottom: 12 }}
           />
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4, marginBottom: 4 }}>
+            {([
+              ["date-desc", "arrow-down-outline", "Date ↓"],
+              ["date-asc", "arrow-up-outline", "Date ↑"],
+              ["name-asc", "arrow-up-outline", "Name A–Z"],
+              ["name-desc", "arrow-down-outline", "Name Z–A"],
+            ] as const).map(([value, icon, label]) => {
+              const active = customerListSort === value;
+              return (
+                <Pressable
+                  key={value}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                  onPress={() => setCustomerListSort(value)}
+                  style={{ flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 18, borderWidth: 1, borderColor: active ? colors.green : colors.border, backgroundColor: active ? colors.greenBg : "white" }}
+                >
+                  <Icon name={icon} size={15} color={active ? colors.green : colors.muted} />
+                  <Text style={{ color: active ? colors.green : colors.muted, fontSize: 12, fontWeight: active ? "700" : "500" }}>{label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <View>
+            <TextInput
+              accessibilityLabel="Search customers by name, mobile number, address or creation date"
+              placeholder="Search name, mobile, address or date"
+              placeholderTextColor="#9AA49F"
+              value={search}
+              onChangeText={setSearch}
+              style={[s.input, { paddingRight: 52, minHeight: 48, paddingVertical: 10, marginBottom: 0 }]}
+              returnKeyType="search"
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={customerCreationDateFilter ? `Choose customer creation date, currently ${customerCreationDateFilter}` : "Choose customer creation date"}
+              onPress={() => {
+                const initial = customerCreationDateFilter ? new Date(`${customerCreationDateFilter}T12:00:00`) : new Date();
+                setCustomerDatePickerMonth(new Date(initial.getFullYear(), initial.getMonth(), 1));
+                setCustomerDatePickerVisible(true);
+              }}
+              style={{ position: "absolute", right: 8, top: 5, width: 38, height: 38, alignItems: "center", justifyContent: "center" }}
+            >
+              <Icon name="calendar-outline" size={20} color={customerCreationDateFilter ? colors.green : colors.muted} />
+            </Pressable>
+            {customerCreationDateFilter ? (
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+                <Text style={s.small}>Created on: {new Date(`${customerCreationDateFilter}T12:00:00`).toLocaleDateString(localeTag(data.language))}</Text>
+                <Pressable accessibilityRole="button" accessibilityLabel="Clear customer creation date filter" onPress={() => setCustomerCreationDateFilter("")} style={{ padding: 4 }}>
+                  <Icon name="close-circle-outline" size={18} color={colors.muted} />
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
           <Chips
-            items={["All", "Due", "Paid"]}
+            items={["All", "Outstanding Dues", "No Dues"]}
             value={filter}
             onChange={setFilter}
+            equalWidth
+            style={{ marginTop: 12, marginBottom: 4 }}
           />
+          <Chips
+            items={[
+              "Total Udhari",
+              "Total Money Received",
+              "Udhari Recovered",
+              "Available Advances",
+              "Advance Deposited",
+              "Advance Refunded",
+            ]}
+            value={filter}
+            onChange={setFilter}
+            style={{ marginTop: 8, marginBottom: 4 }}
+          />
+          <Modal
+            visible={customerDatePickerVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setCustomerDatePickerVisible(false)}
+          >
+            <View style={{ flex: 1, justifyContent: "center", padding: 16, backgroundColor: "rgba(0,0,0,0.42)" }}>
+              <Card style={{ padding: 16 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <Text style={s.heading}>Filter by customer creation date</Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Close date picker" onPress={() => setCustomerDatePickerVisible(false)} style={{ padding: 8 }}>
+                    <Icon name="close-outline" size={22} color={colors.dark} />
+                  </Pressable>
+                </View>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Previous month" onPress={() => setCustomerDatePickerMonth((value) => new Date(value.getFullYear(), value.getMonth() - 1, 1))} style={{ padding: 10 }}>
+                    <Icon name="chevron-back-outline" size={20} color={colors.green} />
+                  </Pressable>
+                  <Text style={s.rowTitle}>{customerDatePickerMonth.toLocaleDateString(localeTag(data.language), { month: "long", year: "numeric" })}</Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Next month" onPress={() => setCustomerDatePickerMonth((value) => new Date(value.getFullYear(), value.getMonth() + 1, 1))} style={{ padding: 10 }}>
+                    <Icon name="chevron-forward-outline" size={20} color={colors.green} />
+                  </Pressable>
+                </View>
+                <View style={{ flexDirection: "row" }}>
+                  {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => <View key={`${day}-${index}`} style={{ flex: 1, alignItems: "center", paddingVertical: 6 }}><Text style={s.small}>{day}</Text></View>)}
+                </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: 12 }}>
+                  {Array.from({ length: customerDatePickerMonth.getDay() }, (_, index) => <View key={`empty-${index}`} style={{ width: "14.2857%", height: 42 }} />)}
+                  {Array.from({ length: new Date(customerDatePickerMonth.getFullYear(), customerDatePickerMonth.getMonth() + 1, 0).getDate() }, (_, index) => {
+                    const day = index + 1;
+                    const candidate = `${customerDatePickerMonth.getFullYear()}-${String(customerDatePickerMonth.getMonth() + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+                    const selected = candidate === customerCreationDateFilter;
+                    return (
+                      <Pressable key={candidate} accessibilityRole="button" accessibilityLabel={candidate} accessibilityState={{ selected }} onPress={() => { setCustomerCreationDateFilter(candidate); setCustomerDatePickerVisible(false); }} style={{ width: "14.2857%", height: 42, alignItems: "center", justifyContent: "center" }}>
+                        <View style={{ width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: selected ? colors.green : "transparent" }}>
+                          <Text style={{ color: selected ? "white" : colors.dark, fontWeight: selected ? "700" : "500" }}>{day}</Text>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                <View style={{ flexDirection: "row", gap: 10 }}>
+                  <View style={{ flex: 1 }}><Button title="Clear date" secondary onPress={() => { setCustomerCreationDateFilter(""); setCustomerDatePickerVisible(false); }} /></View>
+                  <View style={{ flex: 1 }}><Button title="Cancel" onPress={() => setCustomerDatePickerVisible(false)} /></View>
+                </View>
+              </Card>
+            </View>
+          </Modal>
         </>,
-        footer: <>
-          {listFooter(page.hasMore, "Loading more customers...")}
-          <Button icon="person-add-outline" title="+ Add Customer" onPress={() => go("customerForm")} />
-        </>,
+        footer: listFooter(page.hasMore, "Loading more customers..."),
         empty: !list.length ? <Empty title="No customers found" description="Add a customer or try a different search." /> : null,
       };
       break;
@@ -3505,10 +3705,23 @@ function AppContent() {
             placeholder: "98XXXXXXXX",
             editable: !route.id || isActiveCustomer(customer || {}),
           })}
+          {field("WhatsApp Number (Optional)", "whatsappNumber", {
+            icon: "logo-whatsapp",
+            keyboardType: "phone-pad",
+            maxLength: 32,
+            placeholder: "98XXXXXXXX",
+            editable: form.sameAsMobile !== "true" && (!route.id || isActiveCustomer(customer || {})),
+          })}
+          <Toggle
+            label="Same as Mobile Number"
+            value={form.sameAsMobile === "true"}
+            onChange={(value) => f("sameAsMobile", String(value))}
+            disabled={!!route.id && !isActiveCustomer(customer || {})}
+          />
           {field("Address", "address", { placeholder: "Delhi", multiline: true, editable: !route.id || isActiveCustomer(customer || {}) })}
           {route.id && customer ? (
             <Field
-              label="Created On"
+              label={t("Khata Created On", data.language)}
               value={formatCustomerCreatedOn(customer.createdAt)}
               editable={false}
             />
@@ -3575,10 +3788,7 @@ function AppContent() {
           keyExtractor: (item) => item.id,
           renderItem: (item) => item.element,
           header: <View style={customerDetailsStyles.headerContent}>
-            <Hint>
-              {customer.phone || "No phone number"} •{" "}
-              {customer.address || "No address"}
-            </Hint>
+            <CustomerContactInfo customer={customer} />
             <Card style={[customerDetailsStyles.balanceCard, { backgroundColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].background, borderColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].border }]}>
               <View style={customerDetailsStyles.balanceLabelRow}>
                 <Icon name="wallet-outline" size={18} style={customerDetailsStyles.summaryIcon} color={financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text} />
@@ -3653,15 +3863,8 @@ function AppContent() {
             <Title>Personal Information</Title>
             <Card>
               <Row icon="person-outline" title="Customer Name" value={customer.name} />
-              <Row icon="call-outline" title="Mobile Number" value={customer.phone || "Not provided"} />
-              <View style={s.row}>
-                <Icon name="location-outline" color={colors.muted} size={18} />
-                <View style={{ flex: 1 }}>
-                  <Text style={s.rowTitle}>Address</Text>
-                  <Text style={s.small}>{customer.address || "Not provided"}</Text>
-                </View>
-              </View>
-              <Row icon="calendar-outline" title="Created On" value={formatCustomerCreatedOn(customer.createdAt)} />
+              <CustomerContactInfo customer={customer} />
+              <Row icon="calendar-outline" title={t("Khata Created On", data.language)} value={formatCustomerCreatedOn(customer.createdAt)} />
               <Row title="Credit Limit" value={money(Math.abs(customer.limit || 0))} />
               <Row title="Reminders" value={customer.reminder ? "Allowed" : "Off"} />
             </Card>
@@ -3759,20 +3962,7 @@ function AppContent() {
                           >
                             {c.name}
                           </Text>
-                          <Text
-                            style={{
-                              color:
-                                form.customerId === c.id
-                                  ? "#E7FFF0"
-                                  : colors.muted,
-                              fontSize: 12,
-                              marginTop: 5,
-                            }}
-                          >
-                            {[c.phone, c.address]
-                              .filter(Boolean)
-                              .join(" • ")}
-                          </Text>
+                          <CustomerContactInfo customer={c} compact inverse={form.customerId === c.id} />
                         </View>
                         <Text
                           style={{
@@ -4038,9 +4228,8 @@ function AppContent() {
       }
       break;
     case "khata": {
-      const transactionPage = pageRecords(khataRows);
       const groups = new Map<string, { customer: Customer; summary: ReturnType<typeof monthly>; entries: Entry[] }>();
-      for (const row of transactionPage.items) {
+      for (const row of khataRows) {
         const group = groups.get(row.customer.id);
         if (group) group.entries.push(row.entry);
         else groups.set(row.customer.id, { customer: row.customer, summary: row.summary, entries: [row.entry] });
@@ -4048,45 +4237,160 @@ function AppContent() {
       virtualizedRows = {
         data: [...groups.values()],
         keyExtractor: (group) => group.customer.id,
-        renderItem: ({ customer: c, summary: m, entries }) => (
-          <Pressable accessibilityRole="button" onPress={() => go("statement", c.id)}>
+        renderItem: ({ customer: c, summary: m, entries }) => {
+          const limitKey = `${month}:${filter}:${search.trim()}:${c.id}`;
+          const limit = khataCustomerTransactionLimits[limitKey] || 10;
+          return (
             <Card>
-              <Title>{c.name}</Title>
-              {khataBalanceCard("Opening Balance", m.opening)}
-              <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
-              <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
-              {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
-              {khataBalanceCard("Closing Balance", m.closing)}
-              {entries.map((entry: Entry) => (
-                <Row
-                  key={entry.id}
-                  title={entry.note || entryLabel(entry.type)}
-                  subtitle={entryDateTime(entry, localeTag(data.language))}
-                  value={transactionAmountText(entry, money)}
-                  color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
-                  onPress={() => go("transaction", entry.id)}
+              <Pressable accessibilityRole="button" onPress={() => go("statement", c.id)}>
+                <Title>{c.name}</Title>
+                {c.createdAt && formatCustomerCreatedAt(c.createdAt) !== "Not available" ? (
+                  <View style={{ alignSelf: "flex-start", marginTop: 2, marginBottom: 6, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, backgroundColor: colors.greenBg }}>
+                    <Text style={{ fontSize: 10, color: colors.green, fontWeight: "600" }}>{t("Khata Created On", data.language)}: {formatCustomerCreatedAt(c.createdAt)}</Text>
+                  </View>
+                ) : null}
+                <CustomerContactInfo customer={c} compact />
+                {khataBalanceCard("Opening Balance", m.opening)}
+                <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
+                <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
+                {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
+                {khataBalanceCard("Closing Balance", m.closing)}
+                {entries.slice(0, limit).map((entry: Entry) => (
+                  <Row
+                    key={entry.id}
+                    title={entry.note || entryLabel(entry.type)}
+                    subtitle={entryDateTime(entry, localeTag(data.language))}
+                    value={transactionAmountText(entry, money)}
+                    color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
+                    onPress={() => go("transaction", entry.id)}
+                  />
+                ))}
+              </Pressable>
+              {entries.length > limit ? (
+                <Button
+                  icon="chevron-down-circle-outline"
+                  title={t("Load more", data.language)}
+                  style={{ backgroundColor: "#FACC15", borderColor: "#FACC15", marginTop: 8 }}
+                  onPress={() => setKhataCustomerTransactionLimits((previous) => ({
+                    ...previous,
+                    [limitKey]: Math.min((previous[limitKey] || 10) + 10, entries.length),
+                  }))}
                 />
-              ))}
+              ) : null}
             </Card>
-          </Pressable>
-        ),
+          );
+        },
         header: <>
           {monthPicker()}
-          <Field
-            label="Search customer"
-            value={search}
-            onChangeText={setSearch}
-            placeholder="Customer name"
-          />
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4, marginBottom: 4 }}>
+            {([
+              ["date-desc", "arrow-down-outline", "Date ↓"],
+              ["date-asc", "arrow-up-outline", "Date ↑"],
+              ["name-asc", "arrow-up-outline", "Name A–Z"],
+              ["name-desc", "arrow-down-outline", "Name Z–A"],
+            ] as const).map(([value, icon, label]) => {
+              const active = khataCustomerSort === value;
+              return (
+                <Pressable
+                  key={value}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                  onPress={() => setKhataCustomerSort(value)}
+                  style={{ flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 18, borderWidth: 1, borderColor: active ? colors.green : colors.border, backgroundColor: active ? colors.greenBg : "white" }}
+                >
+                  <Icon name={icon} size={15} color={active ? colors.green : colors.muted} />
+                  <Text style={{ color: active ? colors.green : colors.muted, fontSize: 12, fontWeight: active ? "700" : "500" }}>{label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <View>
+            <TextInput
+              accessibilityLabel="Search Khata customers by name, mobile number, address or creation date"
+              placeholder="Search name, mobile, address or date"
+              placeholderTextColor="#9AA49F"
+              value={search}
+              onChangeText={setSearch}
+              style={[s.input, { paddingRight: 52, minHeight: 48, paddingVertical: 10, marginBottom: 0 }]}
+              returnKeyType="search"
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={khataCustomerDateFilter ? `Choose Khata customer date, currently ${khataCustomerDateFilter}` : "Choose Khata customer date"}
+              onPress={() => {
+                const initial = khataCustomerDateFilter ? new Date(`${khataCustomerDateFilter}T12:00:00`) : new Date();
+                setKhataDatePickerMonth(new Date(initial.getFullYear(), initial.getMonth(), 1));
+                setKhataDatePickerVisible(true);
+              }}
+              style={{ position: "absolute", right: 8, top: 5, width: 38, height: 38, alignItems: "center", justifyContent: "center" }}
+            >
+              <Icon name="calendar-outline" size={20} color={khataCustomerDateFilter ? colors.green : colors.muted} />
+            </Pressable>
+            {khataCustomerDateFilter ? (
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+                <Text style={s.small}>Khata created on: {new Date(`${khataCustomerDateFilter}T12:00:00`).toLocaleDateString(localeTag(data.language))}</Text>
+                <Pressable accessibilityRole="button" accessibilityLabel="Clear Khata customer date filter" onPress={() => setKhataCustomerDateFilter("")} style={{ padding: 4 }}>
+                  <Icon name="close-circle-outline" size={18} color={colors.muted} />
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
           <Chips
             items={["All", "Udhari", "Payment"]}
             value={filter}
             onChange={setFilter}
           />
+          <Modal
+            visible={khataDatePickerVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setKhataDatePickerVisible(false)}
+          >
+            <View style={{ flex: 1, justifyContent: "center", padding: 16, backgroundColor: "rgba(0,0,0,0.42)" }}>
+              <Card style={{ padding: 16 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <Text style={s.heading}>Filter by Khata creation date</Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Close date picker" onPress={() => setKhataDatePickerVisible(false)} style={{ padding: 8 }}>
+                    <Icon name="close-outline" size={22} color={colors.dark} />
+                  </Pressable>
+                </View>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Previous month" onPress={() => setKhataDatePickerMonth((value) => new Date(value.getFullYear(), value.getMonth() - 1, 1))} style={{ padding: 10 }}>
+                    <Icon name="chevron-back-outline" size={20} color={colors.green} />
+                  </Pressable>
+                  <Text style={s.rowTitle}>{khataDatePickerMonth.toLocaleDateString(localeTag(data.language), { month: "long", year: "numeric" })}</Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Next month" onPress={() => setKhataDatePickerMonth((value) => new Date(value.getFullYear(), value.getMonth() + 1, 1))} style={{ padding: 10 }}>
+                    <Icon name="chevron-forward-outline" size={20} color={colors.green} />
+                  </Pressable>
+                </View>
+                <View style={{ flexDirection: "row" }}>
+                  {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => <View key={`${day}-${index}`} style={{ flex: 1, alignItems: "center", paddingVertical: 6 }}><Text style={s.small}>{day}</Text></View>)}
+                </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: 12 }}>
+                  {Array.from({ length: khataDatePickerMonth.getDay() }, (_, index) => <View key={`empty-${index}`} style={{ width: "14.2857%", height: 42 }} />)}
+                  {Array.from({ length: new Date(khataDatePickerMonth.getFullYear(), khataDatePickerMonth.getMonth() + 1, 0).getDate() }, (_, index) => {
+                    const day = index + 1;
+                    const candidate = `${khataDatePickerMonth.getFullYear()}-${String(khataDatePickerMonth.getMonth() + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+                    const selected = candidate === khataCustomerDateFilter;
+                    return (
+                      <Pressable key={candidate} accessibilityRole="button" accessibilityLabel={candidate} accessibilityState={{ selected }} onPress={() => { setKhataCustomerDateFilter(candidate); setKhataDatePickerVisible(false); }} style={{ width: "14.2857%", height: 42, alignItems: "center", justifyContent: "center" }}>
+                        <View style={{ width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: selected ? colors.green : "transparent" }}>
+                          <Text style={{ color: selected ? "white" : colors.dark, fontWeight: selected ? "700" : "500" }}>{day}</Text>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                <View style={{ flexDirection: "row", gap: 10 }}>
+                  <View style={{ flex: 1 }}><Button title="Clear date" secondary onPress={() => { setKhataCustomerDateFilter(""); setKhataDatePickerVisible(false); }} /></View>
+                  <View style={{ flex: 1 }}><Button title="Cancel" onPress={() => setKhataDatePickerVisible(false)} /></View>
+                </View>
+              </Card>
+            </View>
+          </Modal>
         </>,
-        footer: listFooter(transactionPage.hasMore),
-        empty: !data.customers.some((customer) => khataCustomerMatchesSearch(customer.name, search))
-          ? <Empty title={data.customers.length ? "No matching customers" : "Your monthly khata"} description={data.customers.length ? "Try a different customer search." : "Customer balances will appear here after you add customers."} />
+        empty: !matchingKhataCustomers.length
+          ? <Empty title={data.customers.length ? "No matching customers" : "Your monthly khata"} description={data.customers.length ? "Try another name, mobile number, address or creation date." : "Customer balances will appear here after you add customers."} />
           : <Empty title="No matching transactions" description={t("No {{items}} for this customer search and month.", data.language, { items: t(filter === "All" ? "transactions" : filter === "Udhari" ? "Udhari transactions" : "payments", data.language) })} />,
       };
       break;
@@ -4116,6 +4420,7 @@ function AppContent() {
               <Title>{data.shop.name}</Title>
               <Hint>{data.shop.address}</Hint>
               <Text style={s.rowTitle}>{customer.name}</Text>
+              <CustomerContactInfo customer={customer} compact />
               {khataBalanceCard("Opening Balance", m.opening)}
             </Card>
           </>,
