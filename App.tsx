@@ -23,7 +23,7 @@ import {
   ScrollView,
   Share,
   StyleSheet,
-  UIManager,
+  TextInput,
   View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -163,6 +163,8 @@ type Screen =
   | "account"
   | "audit";
 type Route = { screen: Screen; id?: string };
+type HomeCustomerListKey = "outstanding" | "udhari" | "received" | "recovered" | "availableAdvance" | "deposited" | "refunded" | "customers";
+type HomeCustomerSort = "date-desc" | "date-asc" | "name-asc" | "name-desc";
 const subscriptionShopBindingKey = (accountId: string) => `dk.subscription.shop.${accountId}`;
 const subscriptionClockAnchorKey = (accountId: string) => `dk.subscription.clock.${accountId}`;
 async function markSubscriptionClock(accountId: string, shopId: string) {
@@ -541,9 +543,34 @@ function AppContent() {
     return new Date(now.getFullYear(), now.getMonth(), 1);
   });
   const [homeRecentLimit, setHomeRecentLimit] = useState(10);
-  const [homePendingCustomersLimit, setHomePendingCustomersLimit] = useState(10);
+  const [homeCustomerListLimits, setHomeCustomerListLimits] = useState<Record<HomeCustomerListKey, number>>({
+    outstanding: 10, udhari: 10, received: 10, recovered: 10,
+    availableAdvance: 10, deposited: 10, refunded: 10, customers: 10,
+  });
   const [homeRecentSort, setHomeRecentSort] = useState<"date-desc" | "date-asc" | "name-asc" | "name-desc">("date-desc");
-  const [homePendingCustomersSort, setHomePendingCustomersSort] = useState<"date-desc" | "date-asc" | "name-asc" | "name-desc">("date-desc");
+  const [homeRecentSearch, setHomeRecentSearch] = useState("");
+  const [homeRecentFilterDate, setHomeRecentFilterDate] = useState("");
+  const [homeRecentDatePickerVisible, setHomeRecentDatePickerVisible] = useState(false);
+  const [homeRecentDatePickerMonth, setHomeRecentDatePickerMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  const [homeCustomerListFilters, setHomeCustomerListFilters] = useState<Record<HomeCustomerListKey, { search: string; date: string; sort: HomeCustomerSort }>>({
+    outstanding: { search: "", date: "", sort: "date-desc" },
+    udhari: { search: "", date: "", sort: "date-desc" },
+    received: { search: "", date: "", sort: "date-desc" },
+    recovered: { search: "", date: "", sort: "date-desc" },
+    availableAdvance: { search: "", date: "", sort: "date-desc" },
+    deposited: { search: "", date: "", sort: "date-desc" },
+    refunded: { search: "", date: "", sort: "date-desc" },
+    customers: { search: "", date: "", sort: "date-desc" },
+  });
+  const [homeRecentDatePickerTarget, setHomeRecentDatePickerTarget] = useState<"recent" | HomeCustomerListKey>("recent");
+  const updateHomeCustomerFilter = (key: HomeCustomerListKey, patch: Partial<{ search: string; date: string; sort: HomeCustomerSort }>) => {
+    setHomeCustomerListFilters((previous) => ({ ...previous, [key]: { ...previous[key], ...patch } }));
+    if (patch.search !== undefined || patch.date !== undefined)
+      setHomeCustomerListLimits((previous) => ({ ...previous, [key]: 10 }));
+  };
   const [referralCodeFromLink, setReferralCodeFromLink] = useState("");
   const [referralSnapshot, setReferralSnapshot] = useState<api.ReferralWalletSnapshot | null>(null);
   const [referralLoading, setReferralLoading] = useState(false);
@@ -2022,6 +2049,10 @@ function AppContent() {
     0,
   );
   const financial = financialSummary(data);
+  const customerFinancialById = useMemo(
+    () => new Map(data.customers.map((item) => [item.id, financialSummary(data, item.id)] as const)),
+    [data],
+  );
   const monthEntries = data.entries.filter((e) => e.date.startsWith(month));
   const totalCredit = periodUdhari(data, month);
   const totalPayment = periodReceived(data, month);
@@ -2138,7 +2169,7 @@ function AppContent() {
       />
     </Card>
   ) : null;
-  const customerRow = (c: Customer, includeCreatedTime = false) => {
+  const customerRow = (c: Customer, includeCreatedTime = false, rightValue?: { text: string; tone: FinancialTone }) => {
     const signedBalance = balance(data, c.id);
     const { tone, label } = customerBalanceDisplay(signedBalance, money);
     return (
@@ -2156,14 +2187,18 @@ function AppContent() {
             </View>
             <View style={{ flex: 1 }}>
               <Text style={s.rowTitle}>{c.name}</Text>
-              <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>
+              {includeCreatedTime
+                ? c.phone ? <Text style={s.small}>{c.phone}</Text> : null
+                : <Text style={s.small}>{c.phone || t("No phone added", data.language)}</Text>}
               {c.address ? <Text style={s.small}>{c.address}</Text> : null}
-              <Text style={s.small}>
-                Created On: {includeCreatedTime ? formatCustomerCreatedAt(c.createdAt) : formatCustomerCreatedOn(c.createdAt)}
-              </Text>
+              {includeCreatedTime
+                ? c.createdAt && formatCustomerCreatedAt(c.createdAt) !== "Not available"
+                  ? <Text style={s.small}>Created On: {formatCustomerCreatedAt(c.createdAt)}</Text>
+                  : null
+                : <Text style={s.small}>Created On: {formatCustomerCreatedOn(c.createdAt)}</Text>}
             </View>
-            <Text style={{ color: financialPalette[tone].text, fontWeight: "700" }}>
-              {label}
+            <Text style={{ color: financialPalette[rightValue?.tone || tone].text, fontWeight: "700" }}>
+              {rightValue?.text || label}
             </Text>
           </View>
         </Card>
@@ -2212,46 +2247,55 @@ function AppContent() {
       </Card>
     );
   };
-  const entryRow = (e: Entry, compact = false) => (
-    <Pressable
-      key={e.id}
-      accessibilityRole="button"
-      onPress={() => go("transaction", e.id)}
-    >
-      <Card style={compact ? customerDetailsStyles.transactionCard : undefined}>
-        <View style={[s.split, { alignItems: "center" }]}>
-          <View style={compact ? [s.avatar, customerDetailsStyles.transactionAvatar] : s.avatar}>
-            <Icon
-              name={
-                e.type === "credit"
-                  ? "arrow-up-outline"
-                  : e.type === "refund"
-                    ? "refresh-outline"
-                    : "arrow-down-outline"
-              }
-              size={20}
-            />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={s.rowTitle}>
-              {data.customers.find((c) => c.id === e.customerId)?.name}
+  const entryRow = (e: Entry, compact = false, showHomeCustomerDetails = false) => {
+    const customer = data.customers.find((item) => item.id === e.customerId);
+    return (
+      <Pressable
+        key={e.id}
+        accessibilityRole="button"
+        onPress={() => go("transaction", e.id)}
+      >
+        <Card style={compact ? customerDetailsStyles.transactionCard : undefined}>
+          <View style={[s.split, { alignItems: "center" }]}>
+            <View style={compact ? [s.avatar, customerDetailsStyles.transactionAvatar] : s.avatar}>
+              <Icon
+                name={
+                  e.type === "credit"
+                    ? "arrow-up-outline"
+                    : e.type === "refund"
+                      ? "refresh-outline"
+                      : "arrow-down-outline"
+                }
+                size={20}
+              />
+            </View>
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={s.rowTitle}>{customer?.name || "Customer"}</Text>
+              <Text style={s.small}>{entryLabel(e.type)}</Text>
+              {showHomeCustomerDetails ? (
+                <View style={{ gap: 3, marginTop: 4 }}>
+                  {customer?.phone ? <Text style={s.small}>{customer.phone}</Text> : null}
+                  {customer?.address ? <Text style={s.small}>{customer.address}</Text> : null}
+                  <Text style={s.small}>Created on: {entryDateTime(e, localeTag(data.language))}</Text>
+                </View>
+              ) : (
+                <Text style={s.small}>{entryDateTime(e, localeTag(data.language))}</Text>
+              )}
+            </View>
+            <Text
+              style={{
+                fontWeight: "700",
+                color: financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text,
+                flexShrink: 0,
+              }}
+            >
+              {transactionAmountText(e, money)}
             </Text>
-            <Text style={s.small}>
-              {entryLabel(e.type)} • {entryDateTime(e, localeTag(data.language))}
-            </Text>
           </View>
-          <Text
-            style={{
-              fontWeight: "700",
-              color: financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text,
-            }}
-          >
-            {transactionAmountText(e, money)}
-          </Text>
-        </View>
-      </Card>
-    </Pressable>
-  );
+        </Card>
+      </Pressable>
+    );
+  };
   async function saveCustomer() {
     const editing = data.customers.find((item) => item.id === route.id);
     if (editing && !isActiveCustomer(editing))
@@ -3047,6 +3091,20 @@ function AppContent() {
       const currentMonthName = new Intl.DateTimeFormat(localeTag(data.language), { month: "long" }).format(new Date());
       const customerNames = new Map(data.customers.map((customer) => [customer.id, customer.name]));
       const homeRecentTransactions = data.entries
+        .filter((entry) => {
+          const customer = data.customers.find((item) => item.id === entry.customerId);
+          const query = homeRecentSearch.trim().toLocaleLowerCase();
+          const createdDate = (entry.createdAt || entry.recordedAt || "").slice(0, 10);
+          const queryMatches = !query || [
+            customer?.name,
+            customer?.phone,
+            customer?.address,
+            entry.date,
+            createdDate,
+            entry.reference,
+          ].some((value) => value?.toLocaleLowerCase().includes(query));
+          return queryMatches && (!homeRecentFilterDate || entry.date === homeRecentFilterDate || createdDate === homeRecentFilterDate);
+        })
         .slice()
         .sort((a, b) => homeRecentSort === "date-desc" || homeRecentSort === "date-asc"
           ? (homeRecentSort === "date-desc"
@@ -3057,17 +3115,52 @@ function AppContent() {
               customerNames.get(b.customerId) || "",
               homeRecentSort,
             ) || transactionCreatedAt(b).localeCompare(transactionCreatedAt(a)) || a.id.localeCompare(b.id));
-      const homePendingCustomers = data.customers
-        .filter((c) => isActiveCustomer(c) && balance(data, c.id) > 0)
-        .slice()
-        .sort((a, b) => homePendingCustomersSort === "date-desc" || homePendingCustomersSort === "date-asc"
-          ? (homePendingCustomersSort === "date-desc"
-              ? (b.createdAt || "").localeCompare(a.createdAt || "")
-              : (a.createdAt || "").localeCompare(b.createdAt || "")) || a.id.localeCompare(b.id)
-          : compareNames(a.name, b.name, homePendingCustomersSort) || (b.createdAt || "").localeCompare(a.createdAt || "") || a.id.localeCompare(b.id));
+      const customerMetricAmount = (customer: Customer, key: Exclude<HomeCustomerListKey, "customers">) => {
+        const summary = customerFinancialById.get(customer.id);
+        if (!summary) return 0;
+        switch (key) {
+          case "outstanding": return summary.outstandingPaise;
+          case "udhari": return summary.totalUdhariPaise;
+          case "received": return summary.totalReceivedPaise;
+          case "recovered": return summary.totalUdhariRecoveredPaise;
+          case "availableAdvance": return summary.availableAdvancePaise;
+          case "deposited": return summary.totalAdvanceDepositedPaise;
+          case "refunded": return summary.totalAdvanceRefundedPaise;
+        }
+      };
+      const homeCustomerListDefinitions: { key: HomeCustomerListKey; title: string; tone: FinancialTone }[] = [
+        { key: "outstanding", title: "Customers With Outstanding Dues", tone: "red" },
+        { key: "udhari", title: "Total Udhari", tone: "blue" },
+        { key: "received", title: "Total Money Received", tone: "green" },
+        { key: "recovered", title: "Udhari Recovered", tone: "green" },
+        { key: "availableAdvance", title: "Available Advances", tone: "green" },
+        { key: "deposited", title: "Advance Deposited", tone: "blue" },
+        { key: "refunded", title: "Advance Refunded", tone: "amber" },
+        { key: "customers", title: "Customers", tone: "neutral" },
+      ];
+      const homeCustomerLists = Object.fromEntries(homeCustomerListDefinitions.map(({ key }) => {
+        const filter = homeCustomerListFilters[key];
+        const query = filter.search.trim().toLocaleLowerCase();
+        const customers = data.customers
+          .filter((customer) => {
+            if (!isActiveCustomer(customer)) return false;
+            const createdDate = (customer.createdAt || "").slice(0, 10);
+            const queryMatches = !query || [customer.name, customer.phone, customer.address, createdDate].some((value) => value.toLocaleLowerCase().includes(query));
+            const dateMatches = !filter.date || createdDate === filter.date;
+            const metricMatches = key === "customers" || customerMetricAmount(customer, key) > 0;
+            return queryMatches && dateMatches && metricMatches;
+          })
+          .slice()
+          .sort((a, b) => filter.sort === "date-desc" || filter.sort === "date-asc"
+            ? (filter.sort === "date-desc"
+                ? (b.createdAt || "").localeCompare(a.createdAt || "")
+                : (a.createdAt || "").localeCompare(b.createdAt || "")) || a.id.localeCompare(b.id)
+            : compareNames(a.name, b.name, filter.sort) || (b.createdAt || "").localeCompare(a.createdAt || "") || a.id.localeCompare(b.id));
+        return [key, customers];
+      })) as Record<HomeCustomerListKey, Customer[]>;
       const homeSortControls = (
-        selected: "date-desc" | "date-asc" | "name-asc" | "name-desc",
-        setSelected: React.Dispatch<React.SetStateAction<"date-desc" | "date-asc" | "name-asc" | "name-desc">>,
+        selected: HomeCustomerSort,
+        setSelected: (value: HomeCustomerSort) => void,
       ) => (
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8, marginBottom: 4 }}>
           {([
@@ -3093,9 +3186,85 @@ function AppContent() {
         </View>
       );
       const animateHomeListExpansion = () => {
-        if (Platform.OS === "android")
-          UIManager.setLayoutAnimationEnabledExperimental?.(true);
         LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+      };
+      const activeHomeDateFilter = homeRecentDatePickerTarget === "recent"
+        ? homeRecentFilterDate
+        : homeCustomerListFilters[homeRecentDatePickerTarget].date;
+      const setActiveHomeDateFilter = (date: string) => {
+        if (homeRecentDatePickerTarget === "recent") {
+          setHomeRecentFilterDate(date);
+          setHomeRecentLimit(10);
+        } else updateHomeCustomerFilter(homeRecentDatePickerTarget, { date });
+      };
+      const renderHomeCustomerList = (definition: typeof homeCustomerListDefinitions[number]) => {
+        const list = homeCustomerLists[definition.key];
+        const limit = homeCustomerListLimits[definition.key];
+        const filters = homeCustomerListFilters[definition.key];
+        return (
+          <View key={definition.key} style={{ gap: 12 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+              <Icon name={definition.key === "customers" ? "people-outline" : "wallet-outline"} size={18} color={colors.dark} style={{ width: 18, height: 18, flexShrink: 0 }} />
+              <Title>{definition.title}</Title>
+            </View>
+            {homeSortControls(filters.sort, (sort) => updateHomeCustomerFilter(definition.key, { sort }))}
+            <View>
+              <TextInput
+                accessibilityLabel={`Search ${definition.title.toLowerCase()} by name, mobile number, address or creation date`}
+                placeholder="Search name, mobile, address or date"
+                placeholderTextColor="#9AA49F"
+                value={filters.search}
+                onChangeText={(search) => updateHomeCustomerFilter(definition.key, { search })}
+                style={[s.input, { paddingRight: 52, minHeight: 48, paddingVertical: 10, marginBottom: 0 }]}
+                returnKeyType="search"
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={filters.date ? `Choose creation date, currently ${filters.date}` : "Choose creation date"}
+                onPress={() => {
+                  const initial = filters.date ? new Date(`${filters.date}T12:00:00`) : new Date();
+                  setHomeRecentDatePickerTarget(definition.key);
+                  setHomeRecentDatePickerMonth(new Date(initial.getFullYear(), initial.getMonth(), 1));
+                  setHomeRecentDatePickerVisible(true);
+                }}
+                style={{ position: "absolute", right: 8, top: 5, width: 38, height: 38, alignItems: "center", justifyContent: "center" }}
+              >
+                <Icon name="calendar-outline" size={20} color={filters.date ? colors.green : colors.muted} />
+              </Pressable>
+              {filters.date ? (
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+                  <Text style={s.small}>Created on: {new Date(`${filters.date}T12:00:00`).toLocaleDateString(localeTag(data.language))}</Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Clear creation date filter" onPress={() => updateHomeCustomerFilter(definition.key, { date: "" })} style={{ padding: 4 }}>
+                    <Icon name="close-circle-outline" size={18} color={colors.muted} />
+                  </Pressable>
+                </View>
+              ) : null}
+            </View>
+            {list.length ? list.slice(0, limit).map((customer) => {
+              const rightValue = definition.key === "customers"
+                ? undefined
+                : { text: money(customerMetricAmount(customer, definition.key) / 100), tone: definition.tone };
+              return <React.Fragment key={customer.id}>{customerRow(customer, true, rightValue)}</React.Fragment>;
+            }) : <Hint>No customers match these filters.</Hint>}
+            {list.length > limit ? (
+              <>
+                <Hint>{`Showing ${limit} of ${list.length} customers`}</Hint>
+                <Button
+                  icon="chevron-down-circle-outline"
+                  title={t("Load more customers", data.language)}
+                  style={{ backgroundColor: "#FACC15", borderColor: "#FACC15" }}
+                  onPress={() => {
+                    animateHomeListExpansion();
+                    setHomeCustomerListLimits((previous) => ({
+                      ...previous,
+                      [definition.key]: Math.min(previous[definition.key] + 10, list.length),
+                    }));
+                  }}
+                />
+              </>
+            ) : null}
+          </View>
+        );
       };
       content = (
         <>
@@ -3136,6 +3305,13 @@ function AppContent() {
             {stat("Advance Refunded", money(financial.totalAdvanceRefundedPaise / 100), "amber", true, "return-down-back-outline")}
             {stat("Customers", String(data.customers.filter(isActiveCustomer).length), "neutral", true, "people-outline")}
           </View>
+          <Button
+            icon="person-add-outline"
+            title="+ Add Customer"
+            secondary
+            style={{ alignSelf: "stretch", width: "100%" }}
+            onPress={() => go("customerForm")}
+          />
           <Hint>Current outstanding and advances are balances. The other totals show recorded activity.</Hint>
           {actions()}
           <View style={s.split}>
@@ -3159,15 +3335,105 @@ function AppContent() {
             <Title>Recent Transactions</Title>
           </View>
           {homeSortControls(homeRecentSort, setHomeRecentSort)}
+          <View>
+            <TextInput
+              accessibilityLabel="Search recent transactions by customer name, mobile number, address or date"
+              placeholder="Search name, mobile, address or date"
+              placeholderTextColor="#9AA49F"
+              value={homeRecentSearch}
+              onChangeText={(value) => {
+                setHomeRecentSearch(value);
+                setHomeRecentLimit(10);
+              }}
+              style={[s.input, { paddingRight: 52, minHeight: 48, paddingVertical: 10, marginBottom: 0 }]}
+              returnKeyType="search"
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={homeRecentFilterDate ? `Choose transaction date, currently ${homeRecentFilterDate}` : "Choose transaction date"}
+              onPress={() => {
+                const initial = homeRecentFilterDate ? new Date(`${homeRecentFilterDate}T12:00:00`) : new Date();
+                setHomeRecentDatePickerTarget("recent");
+                setHomeRecentDatePickerMonth(new Date(initial.getFullYear(), initial.getMonth(), 1));
+                setHomeRecentDatePickerVisible(true);
+              }}
+              style={{ position: "absolute", right: 8, top: 5, width: 38, height: 38, alignItems: "center", justifyContent: "center" }}
+            >
+              <Icon name="calendar-outline" size={20} color={homeRecentFilterDate ? colors.green : colors.muted} />
+            </Pressable>
+            {homeRecentFilterDate ? (
+              <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 6 }}>
+                <Text style={s.small}>Transaction date: {new Date(`${homeRecentFilterDate}T12:00:00`).toLocaleDateString(localeTag(data.language))}</Text>
+                <Pressable accessibilityRole="button" accessibilityLabel="Clear transaction date filter" onPress={() => setHomeRecentFilterDate("")} style={{ padding: 4 }}>
+                  <Icon name="close-circle-outline" size={18} color={colors.muted} />
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
+          <Modal
+            visible={homeRecentDatePickerVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setHomeRecentDatePickerVisible(false)}
+          >
+            <View style={{ flex: 1, justifyContent: "center", padding: 16, backgroundColor: "rgba(0,0,0,0.42)" }}>
+              <Card style={{ padding: 16 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <Text style={s.heading}>
+                    {homeRecentDatePickerTarget === "recent"
+                      ? "Filter by transaction date"
+                      : `Filter ${homeCustomerListDefinitions.find((item) => item.key === homeRecentDatePickerTarget)?.title || "customer list"} by creation date`}
+                  </Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Close date picker" onPress={() => setHomeRecentDatePickerVisible(false)} style={{ padding: 8 }}>
+                    <Icon name="close-outline" size={22} color={colors.dark} />
+                  </Pressable>
+                </View>
+                <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Previous month" onPress={() => setHomeRecentDatePickerMonth((monthValue) => new Date(monthValue.getFullYear(), monthValue.getMonth() - 1, 1))} style={{ padding: 10 }}>
+                    <Icon name="chevron-back-outline" size={20} color={colors.green} />
+                  </Pressable>
+                  <Text style={s.rowTitle}>{homeRecentDatePickerMonth.toLocaleDateString(localeTag(data.language), { month: "long", year: "numeric" })}</Text>
+                  <Pressable accessibilityRole="button" accessibilityLabel="Next month" onPress={() => setHomeRecentDatePickerMonth((monthValue) => new Date(monthValue.getFullYear(), monthValue.getMonth() + 1, 1))} style={{ padding: 10 }}>
+                    <Icon name="chevron-forward-outline" size={20} color={colors.green} />
+                  </Pressable>
+                </View>
+                <View style={{ flexDirection: "row" }}>
+                  {["S", "M", "T", "W", "T", "F", "S"].map((day, index) => (
+                    <View key={`${day}-${index}`} style={{ flex: 1, alignItems: "center", paddingVertical: 6 }}><Text style={s.small}>{day}</Text></View>
+                  ))}
+                </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: 12 }}>
+                  {Array.from({ length: homeRecentDatePickerMonth.getDay() }, (_, index) => <View key={`blank-${index}`} style={{ width: "14.2857%", height: 42 }} />)}
+                  {Array.from({ length: new Date(homeRecentDatePickerMonth.getFullYear(), homeRecentDatePickerMonth.getMonth() + 1, 0).getDate() }, (_, index) => {
+                    const day = index + 1;
+                    const candidate = `${homeRecentDatePickerMonth.getFullYear()}-${String(homeRecentDatePickerMonth.getMonth() + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+                    return (
+                  <Pressable key={candidate} accessibilityRole="button" accessibilityLabel={candidate} accessibilityState={{ selected: candidate === activeHomeDateFilter }} onPress={() => { setActiveHomeDateFilter(candidate); setHomeRecentDatePickerVisible(false); }} style={{ width: "14.2857%", height: 42, alignItems: "center", justifyContent: "center" }}>
+                    <View style={{ width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center", backgroundColor: candidate === activeHomeDateFilter ? colors.green : "transparent" }}>
+                      <Text style={{ color: candidate === activeHomeDateFilter ? "white" : colors.dark, fontWeight: candidate === activeHomeDateFilter ? "700" : "500" }}>{day}</Text>
+                        </View>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                <View style={{ flexDirection: "row", gap: 10 }}>
+                <View style={{ flex: 1 }}><Button title="Clear date" secondary onPress={() => { setActiveHomeDateFilter(""); setHomeRecentDatePickerVisible(false); }} /></View>
+                  <View style={{ flex: 1 }}><Button title="Cancel" onPress={() => setHomeRecentDatePickerVisible(false)} /></View>
+                </View>
+              </Card>
+            </View>
+          </Modal>
           {homeRecentTransactions.length ? (
             homeRecentTransactions
               .slice(0, homeRecentLimit)
-              .map((entry) => entryRow(entry))
+              .map((entry) => entryRow(entry, false, true))
           ) : (
-            <Empty
-              title="Your khata starts here"
-              description="Add your first customer, then record udhari or a payment."
-            />
+            homeRecentSearch.trim() || homeRecentFilterDate
+              ? <Empty title="No matching transactions" description="Try another name, address, mobile number or date." />
+              : <Empty
+                  title="Your khata starts here"
+                  description="Add your first customer, then record udhari or a payment."
+                />
           )}
           {homeRecentTransactions.length > homeRecentLimit ? (
             <Button
@@ -3180,34 +3446,7 @@ function AppContent() {
               }}
             />
           ) : null}
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <Icon name="people-outline" size={18} color={colors.dark} style={{ width: 18, height: 18, flexShrink: 0 }} />
-            <Title>Customers With Pending Balance</Title>
-          </View>
-          {homeSortControls(homePendingCustomersSort, setHomePendingCustomersSort)}
-          {homePendingCustomers
-            .slice(0, homePendingCustomersLimit)
-            .map((customer) => customerRow(customer, true))}
-          {homePendingCustomers.length > homePendingCustomersLimit ? (
-            <>
-              <Hint>{`Showing ${homePendingCustomersLimit} of ${homePendingCustomers.length} customers with pending balance`}</Hint>
-              <Button
-                icon="chevron-down-circle-outline"
-                title={t("Load more customers", data.language)}
-                style={{ backgroundColor: "#FACC15", borderColor: "#FACC15" }}
-                onPress={() => {
-                  animateHomeListExpansion();
-                  setHomePendingCustomersLimit((current) => Math.min(current + 10, homePendingCustomers.length));
-                }}
-              />
-            </>
-          ) : null}
-          <Button
-            icon="person-add-outline"
-            title="+ Add Customer"
-            secondary
-            onPress={() => go("customerForm")}
-          />
+          {homeCustomerListDefinitions.map(renderHomeCustomerList)}
         </>
       );
       break;
@@ -3743,6 +3982,7 @@ function AppContent() {
       break;
     case "transaction":
       if (entry) {
+        const transactionCustomer = data.customers.find((customer) => customer.id === entry.customerId);
         content = (
           <>
             <Card style={{ alignItems: "center", paddingVertical: 30 }}>
@@ -3752,9 +3992,21 @@ function AppContent() {
                   {entryLabel(entry.type).toUpperCase()}
                 </Text>
               </View>
-              <Title>
-                {data.customers.find((c) => c.id === entry.customerId)?.name}
-              </Title>
+              {transactionCustomer ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`View customer ${transactionCustomer.name}`}
+                  onPress={() => go("viewCustomer", transactionCustomer.id)}
+                  hitSlop={4}
+                >
+                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5 }}>
+                    <Text style={[s.section, { color: colors.green, marginTop: 0, marginBottom: 0 }]}>
+                      {transactionCustomer.name}
+                    </Text>
+                    <Icon name="chevron-forward-outline" size={16} color={colors.green} />
+                  </View>
+                </Pressable>
+              ) : null}
               <View style={customerDetailsStyles.transactionTitleRow}>
                 <Icon name="calendar-outline" size={16} color={colors.muted} />
                 <Hint>{entryDateTime(entry, localeTag(data.language))}</Hint>
