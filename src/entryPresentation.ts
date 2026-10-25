@@ -46,3 +46,7 @@ export function entryDateTime(entry: Pick<Entry, "date" | "recordedAt" | "create
     .replace(/\b(am|pm)\b/i, (period) => period.toUpperCase());
   return `${dateText}, ${timeText}`;
 }
+
+/** Shared presentation labels; never infer a new ledger category from allocations. */
+export const transactionLabel = (type: Entry["type"]) =>
+  type === "credit" ? "Udhari Given" : type === "refund" ? "Advance Refund" : "Payment Received";

@@ -69,6 +69,17 @@ test('missing contacts keep three unavailable buttons in both layouts', () => {
   assert.equal(noWhatsApp[1].props.accessibilityState.disabled, true);
   assert.equal(rows({ customer: { ...customer, phone: 'invalid', whatsappNumber: '123' } })[0].props.accessibilityState.disabled, true);
 });
+test('transaction-details keeps all compact contact icons and disables unavailable actions', () => {
+  const onlyPhone = rows({ customer: { phone: customer.phone, whatsappNumber: '', address: '' }, compact: true });
+  assert.equal(onlyPhone.length, 3);
+  assert.equal(onlyPhone[0].props.children[0].props.name, 'call-outline');
+  assert.equal(onlyPhone[1].props.children[0].props.name, 'logo-whatsapp');
+  assert.equal(onlyPhone[1].props.accessibilityState.disabled, true);
+  assert.equal(onlyPhone[2].props.accessibilityState.disabled, true);
+  const none = rows({ customer: { phone: '', whatsappNumber: '', address: '' }, compact: true });
+  assert.equal(none.length, 3);
+  assert.ok(none.every((action) => action.props.accessibilityState.disabled));
+});
 test('contact taps do not trigger parent navigation or change customer records', async () => {
   fail = () => false; calls.length = 0;
   let stopped = 0;

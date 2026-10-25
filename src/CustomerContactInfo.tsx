@@ -8,6 +8,8 @@ import { customerContactUrls, openCustomerContact } from "./customerContactActio
 type Props = {
   customer: Pick<Customer, "phone" | "whatsappNumber" | "address">;
   compact?: boolean;
+  /** Hide unavailable actions for compact contexts that should show only usable contacts. */
+  hideUnavailable?: boolean;
   /** Contrast for selected customer rows. */
   inverse?: boolean;
 };
@@ -18,16 +20,19 @@ const contactThemes = {
   address: { backgroundColor: "#FFF7ED", borderColor: "#FED7AA", icon: "#EA580C", text: "#9A3412" },
 };
 
-export function CustomerContactInfo({ customer, compact = false, inverse = false }: Props) {
+export function CustomerContactInfo({ customer, compact = false, hideUnavailable = false, inverse = false }: Props) {
   const language = useContext(LanguageContext);
   const fields = [
     { kind: "phone", label: "Mobile Number", shortLabel: "Phone", icon: "call-outline", value: customer.phone },
     { kind: "whatsapp", label: "WhatsApp Number", shortLabel: "WhatsApp", icon: "logo-whatsapp", value: customer.whatsappNumber },
     { kind: "address", label: "Address", shortLabel: "Address", icon: "location-outline", value: customer.address },
   ] as const;
+  const visibleFields = hideUnavailable
+    ? fields.filter(({ kind, value }) => customerContactUrls(kind, value).length > 0)
+    : fields;
   return <View style={styles.container}>
     <View style={styles.actions}>
-    {fields.map(({ kind, label, shortLabel, icon, value }) => {
+    {visibleFields.map(({ kind, label, shortLabel, icon, value }) => {
       const display = typeof value === "string" ? value.trim() : "";
       const enabled = customerContactUrls(kind, value).length > 0;
       const theme = contactThemes[kind];

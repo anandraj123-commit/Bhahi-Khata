@@ -112,6 +112,24 @@ export const backupSchema = z
       )
       .max(5000),
     entries: z.array(entrySchema).max(50000),
+    deletedEntries: z.array(z.object({
+      id: idSchema,
+      customerId: idSchema,
+      type: z.enum(["credit", "payment", "refund"]),
+      amount: moneySchema(0.01),
+      date: daySchema,
+      recordedAt: z.string().datetime().optional(),
+      createdAt: z.string().datetime().optional(),
+      note: z.string().max(1000).default(""),
+      method: z.string().max(50).default("Cash"),
+      reference: z.string().max(120).default(""),
+      appliedToUdhari: z.number().finite().min(0).optional(),
+      addedToAdvance: z.number().finite().min(0).optional(),
+      advanceApplied: z.number().finite().min(0).optional(),
+      serverVersion: z.number().int().min(1).optional(),
+      resolutionVersion: z.number().int().min(1).optional(),
+      deletedAt: z.string().datetime(),
+    }).strict()).max(50000).optional(),
     audit: z
       .array(
         z.object({

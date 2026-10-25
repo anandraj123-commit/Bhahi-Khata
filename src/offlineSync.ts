@@ -21,6 +21,20 @@ import type { Data } from "./model";
 type ActiveSync = { promise: Promise<Data | null>; rerun: boolean; pullRemote: boolean };
 const active = new Map<string, ActiveSync>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const syncStateListeners = new Set<(accountId: string, syncing: boolean) => void>();
+
+function notifySyncState(accountId: string, syncing: boolean) {
+  for (const listener of syncStateListeners) listener(accountId, syncing);
+}
+
+export function isAccountSynchronizing(accountId: string) {
+  return active.has(accountId);
+}
+
+export function subscribeSyncState(listener: (accountId: string, syncing: boolean) => void) {
+  syncStateListeners.add(listener);
+  return () => { syncStateListeners.delete(listener); };
+}
 
 async function runOnce(accountId: string, pullRemote: boolean) {
   const offlineSession = await readOfflineSession();
@@ -37,6 +51,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
         const acknowledged = await api.syncQueuedChange(pending.change);
         await acknowledgeChange(pending.id, acknowledged);
       } catch (error) {
+        const failedChange = pending.change;
         if (
           error instanceof api.ApiError &&
           error.status === 409 &&
@@ -74,7 +89,7 @@ async function runOnce(accountId: string, pullRemote: boolean) {
           error instanceof api.ApiError &&
           error.status === 409 &&
           error.payload?.type === "transaction_conflict" &&
-          pending.change.entries.some((item) => item.operation === "update" || item.operation === "delete" || (item.operation === "create" && error.payload?.code === "CUSTOMER_NOT_ACTIVE"))
+          failedChange.entries.some((item) => item.operation === "update" || item.operation === "delete" || (item.operation === "create" && error.payload?.code === "CUSTOMER_NOT_ACTIVE") || failedChange.audit.some((event) => event.action === "Restored transaction" && (event.before?.id === (item.after || item.before)?.id || event.after?.id === (item.after || item.before)?.id)))
         ) {
           await markConflict(pending.id, pending.change, error.payload?.current ?? null, error.payload?.serverVersion, error.payload?.resolutionVersion);
           pending = await readNextChange(accountId);
@@ -146,8 +161,12 @@ export function synchronizeAccount(
     }
   })();
   active.set(accountId, state);
+  notifySyncState(accountId, true);
   return state.promise.finally(() => {
-    if (active.get(accountId) === state) active.delete(accountId);
+    if (active.get(accountId) === state) {
+      active.delete(accountId);
+      notifySyncState(accountId, false);
+    }
     void nextPendingRetryAt(accountId).then((retryAt) => {
       if (retryTimers.has(accountId)) {
         clearTimeout(retryTimers.get(accountId)!);

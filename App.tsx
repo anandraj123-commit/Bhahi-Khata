@@ -8,9 +8,11 @@ import { isTemporaryBackendFailure } from "./src/startupRecovery";
 import { readLanguagePreference, saveLanguagePreference } from "./src/languagePreference";
 import { localeTag } from "./src/locales";
 import { deviceClockNeedsWarning } from "./src/serverClock";
-import { entryDateTime, formatClockTime, localDateTimeIso, parseClockTime } from "./src/entryPresentation";
+import { entryDateTime, formatClockTime, localDateTimeIso, parseClockTime, transactionLabel as entryLabel } from "./src/entryPresentation";
+import { buildTransactionReceipt, authorizeReceiptAccess, receiptAccountIdentity, resolveReceiptAccountId } from "./src/transactionReceipt";
+import { TransactionDetails } from "./src/TransactionDetails";
 import ErrorBoundary from "./src/ErrorBoundary";
-import React, { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import {
@@ -92,6 +94,7 @@ import {
   readPendingSettingsConflicts,
   readOfflineSession,
   readSyncQueueStatus,
+  readReceiptSnapshot,
   retryFailedChanges,
   refreshConflict,
   refreshCustomerConflict,
@@ -101,7 +104,8 @@ import {
   type PendingCustomerConflict,
   type PendingSettingsConflict,
 } from "./src/offlineStore";
-import { synchronizeAccount, synchronizePendingOnly } from "./src/offlineSync";
+import { isAccountSynchronizing, subscribeSyncState, synchronizeAccount, synchronizePendingOnly } from "./src/offlineSync";
+import { syncStatusFromQueue, syncStatusUnavailable, type SyncStatusState } from "./src/syncStatus";
 import {
   checkConnectivity,
   connectivityBuildInfo,
@@ -164,7 +168,8 @@ type Screen =
   | "subscriptionPayments"
   | "referral"
   | "account"
-  | "audit";
+  | "audit"
+  | "deletedTransactions";
 type Route = { screen: Screen; id?: string };
 type HomeCustomerListKey = "outstanding" | "udhari" | "received" | "recovered" | "availableAdvance" | "deposited" | "refunded" | "customers";
 type HomeCustomerSort = "date-desc" | "date-asc" | "name-asc" | "name-desc";
@@ -232,6 +237,27 @@ const errorMessage = (error: unknown, fallback: string) =>
         : "Server unavailable"
     : error instanceof api.ApiError
       ? (() => {
+          const serverMessage = error.payload?.error;
+          if (error.status === 400 && error.payload?.code === "INVALID_TRANSACTION_RESTORATION")
+            return "The restore request is invalid. Refresh Deleted Transactions and try again.";
+          if (error.status === 401)
+            return "Your sign-in has expired. Reconnect and sign in before synchronizing this transaction.";
+          if (error.status === 403 && serverMessage === "Access denied")
+            return "You are not authorized to restore this transaction.";
+          if (error.status === 404 && serverMessage === "Transaction not found")
+            return "Transaction not found in this shop.";
+          if (error.status === 409 && error.payload?.code === "TRANSACTION_ALREADY_ACTIVE")
+            return "This transaction is already active.";
+          if (error.status === 409 && (serverMessage === "Transaction changed on another device" || error.payload?.type === "transaction_conflict"))
+            return "This transaction was modified on another device. Review the conflict before choosing which version to keep.";
+          if (error.status === 409 && serverMessage === "Transaction was deleted on another device")
+            return "This transaction was deleted on another device. Resolve the conflict before editing or deleting it again.";
+          if (error.status === 409 && serverMessage === "Transaction is already active")
+            return "This transaction has already been restored and is active.";
+          if (error.status === 400 && /^Invalid transaction(?: version| restoration)?$/.test(serverMessage || ""))
+            return "Transaction information is invalid. Check the amount, date, and notes, then try again.";
+          if (error.status >= 500)
+            return "Unable to restore this transaction right now. Please try again when the server is available.";
           const code = error.payload?.code;
           return apiErrorTranslationKey(code, error.status);
         })()
@@ -264,10 +290,8 @@ const titles: Partial<Record<Screen, string>> = {
   referral: "Refer & Earn",
   account: "Account",
   audit: "Activity History",
+  deletedTransactions: "Deleted Transactions",
 };
-const entryLabel = (type: Entry["type"]) =>
-  type === "credit" ? "Udhari Given" : type === "refund" ? "Advance Refund" : "Payment Received";
-
 const customerDetailsStyles = StyleSheet.create({
   listContent: {
     paddingHorizontal: 16,
@@ -404,9 +428,31 @@ function AppContent() {
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const writeQueue = useRef<Promise<boolean>>(Promise.resolve(true));
+  const loadTransactionReceipt = useCallback(async (entryId: string) => {
+    const initialData = dataRef.current;
+    const preferredAccountId = offlineAccountRef.current;
+    const session = await readOfflineSession().catch((error) => {
+      if (currentConnectivity() === "online") return null;
+      throw error;
+    });
+    const shopIdentity = receiptAccountIdentity(initialData.shop.phone || "");
+    const requireOfflineSession = currentConnectivity() === "offline";
+    // `offlineAccountRef` tracks the local cache handle; the authenticated shop is authoritative.
+    const accountId = resolveReceiptAccountId(initialData, preferredAccountId, session, requireOfflineSession);
+    // Wait for any in-progress local persistence before taking the read-only snapshot.
+    await writeQueue.current;
+    const authenticatedData = dataRef.current;
+    if (receiptAccountIdentity(authenticatedData.shop.phone || "") !== shopIdentity)
+      throw new Error("The account session changed. Reopen the transaction.");
+    authorizeReceiptAccess(authenticatedData, accountId, session, requireOfflineSession);
+    const allowMissingOfflineSession = currentConnectivity() === "online";
+    const snapshot = await readReceiptSnapshot(accountId, { authenticatedData, allowMissingOfflineSession });
+    return buildTransactionReceipt(snapshot, entryId);
+  }, []);
   const [route, setRoute] = useState<Route>({ screen: "welcome" });
   const [history, setHistory] = useState<Route[]>([]);
   const [search, setSearch] = useState("");
+  const [deletedDateFilter, setDeletedDateFilter] = useState("");
   const [filter, setFilter] = useState("All");
   const [customerListSort, setCustomerListSort] = useState<HomeCustomerSort>("date-desc");
   const [customerCreationDateFilter, setCustomerCreationDateFilter] = useState("");
@@ -508,7 +554,7 @@ function AppContent() {
   const customerScrollGate = useRef(new UserScrollPageGate());
   const customerScrollStartedForKey = useRef("");
   const customerDragStartOffset = useRef(0);
-  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${manageCustomerFilter}:${month}:${route.screen === "customers" ? `${customerListSort}:${customerCreationDateFilter}` : route.screen === "khata" ? `${khataCustomerSort}:${khataCustomerDateFilter}` : ""}`;
+  const listPageKey = `${route.screen}:${route.id || ""}:${search}:${filter}:${manageCustomerFilter}:${month}:${route.screen === "customers" ? `${customerListSort}:${customerCreationDateFilter}` : route.screen === "khata" ? `${khataCustomerSort}:${khataCustomerDateFilter}` : route.screen === "deletedTransactions" ? deletedDateFilter : ""}`;
   const listPageKeyRef = useRef(listPageKey);
   listPageKeyRef.current = listPageKey;
   const rememberPageCount = (key: string, count: number) => {
@@ -647,12 +693,7 @@ function AppContent() {
   const [notices, setNotices] = useState<{id:string;title:string;body:string;read:boolean;date:string}[]>([]);
   const [seconds, setSeconds] = useState(30);
   const [busy, setBusy] = useState(false);
-  const [syncStatus, setSyncStatus] = useState<{
-    pending: number;
-    failed: number;
-    conflicts: number;
-    mobileConflicts: number;
-  } | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatusState | { kind: "loading" }>({ kind: "loading" });
   const [connectivityStatus, setConnectivityStatus] = useState<ConnectivityStatus>("checking");
   const [serverClockOffsetMs, setServerClockOffsetMs] = useState<number | null>(null);
   const [networkDiagnosticsVisible, setNetworkDiagnosticsVisible] = useState(false);
@@ -698,6 +739,7 @@ function AppContent() {
     catch { /* The safe, sanitized result is shown in diagnostics. */ }
     finally {
       setNetworkDiagnosticsRevision((revision) => revision + 1);
+      void refreshSyncStatus();
       setStorageRetrying(false);
     }
   };
@@ -720,14 +762,36 @@ function AppContent() {
   const pendingPaymentCheck = useRef<string | null>(null);
   const reconnectSyncLock = useRef(false);
   async function refreshSyncStatus(accountId = offlineAccountRef.current) {
-    if (!accountId || !offlineStorageAvailable()) {
-      setSyncStatus(null);
+    const current = dataRef.current;
+    if (!current.signedIn) {
+      setSyncStatus(syncStatusUnavailable("not_signed_in"));
+      return;
+    }
+    const authenticatedShopId = accountKey(current.shop.phone || "");
+    if (!authenticatedShopId) {
+      setSyncStatus(syncStatusUnavailable("shop_context"));
+      return;
+    }
+    if (!offlineStorageAvailable()) {
+      setSyncStatus(syncStatusUnavailable("storage"));
+      return;
+    }
+    if (!accountId || accountId !== authenticatedShopId) {
+      setSyncStatus(syncStatusUnavailable("shop_context"));
       return;
     }
     try {
-      setSyncStatus(await readSyncQueueStatus(accountId));
+      const counts = await readSyncQueueStatus(accountId);
+      // An async queue read may finish after a logout or account switch. Never
+      // display another account's status in the current shop's Settings.
+      if (offlineAccountRef.current !== accountId || accountKey(dataRef.current.shop.phone || "") !== accountId) return;
+      setSyncStatus(syncStatusFromQueue(counts, {
+        offline: currentConnectivity() === "offline",
+        syncing: isAccountSynchronizing(accountId),
+      }));
     } catch {
-      setSyncStatus(null);
+      if (offlineAccountRef.current === accountId && accountKey(dataRef.current.shop.phone || "") === accountId)
+        setSyncStatus(syncStatusUnavailable("read"));
     }
   }
   async function refreshSubscriptionInfo(
@@ -1143,7 +1207,17 @@ function AppContent() {
       : key;
     if (syncNotice.current === noticeKey) return;
     syncNotice.current = noticeKey;
-    if (key === "permanent")
+    if (problem instanceof api.ApiError && problem.payload?.code === "INVALID_TRANSACTION_RESTORATION")
+      Alert.alert(
+        "Restore needs attention",
+        `${errorMessage(problem, "Invalid restore request.")} The change remains on this phone and will not retry automatically. Refresh Deleted Transactions or review sync status in Settings.`,
+      );
+    else if (problem instanceof api.ApiError && [401, 403, 404].includes(problem.status))
+      Alert.alert(
+        problem.status === 401 ? "Sign-in required" : problem.status === 403 ? "Not authorized" : "Transaction unavailable",
+        `${errorMessage(problem, "The server rejected this change.")} Your local change remains saved; review sync status in Settings.`,
+      );
+    else if (key === "permanent")
       Alert.alert(
         "Some changes need attention",
         "Your changes remain saved on this phone and will not retry automatically. Open Settings to review the sync status and retry when appropriate.",
@@ -1462,6 +1536,9 @@ function AppContent() {
   useEffect(() => {
     void refreshSyncStatus();
   }, [data.signedIn, data.shop.phone, route.screen, connectivityStatus]);
+  useEffect(() => subscribeSyncState((accountId) => {
+    if (accountId === offlineAccountRef.current) void refreshSyncStatus(accountId);
+  }), []);
   useEffect(() => {
     const id = offlineAccountRef.current;
     if (!data.signedIn || !id || !["subscription", "subscriptionPayments"].includes(route.screen)) return;
@@ -1759,8 +1836,11 @@ function AppContent() {
       await refreshSubscriptionInfo(accountId, false);
       await synchronizeAccount(accountId);
       const status = await readSyncQueueStatus(accountId);
-      setSyncStatus(status);
-      if (status.failed || status.conflicts || status.pending)
+      setSyncStatus(syncStatusFromQueue(status, {
+        offline: currentConnectivity() === "offline",
+        syncing: isAccountSynchronizing(accountId),
+      }));
+      if (status.failed || status.conflicts || status.mobileConflicts || status.pending)
         Alert.alert(
           "Some changes still need attention",
           "Your data remains saved on this phone. Review the sync status and resolve any transaction conflicts.",
@@ -1939,7 +2019,7 @@ function AppContent() {
       try {
         const selectedConflict = await chooseConflictResolution(conflict.queueId, choice);
         const result = await api.resolveFinancialConflict(selectedConflict, choice);
-        await completeConflict(accountId, conflict, result.entry, result.serverVersion, result.resolutionVersion, result.audit);
+        await completeConflict(accountId, conflict, result.entry, result.serverVersion, result.resolutionVersion, result.audit, result.deletedEntry);
         promptingConflict.current = null;
         localRevision.current += 1;
         const cached = await readCachedAccount(accountId);
@@ -2019,6 +2099,7 @@ function AppContent() {
     setHistory(reset ? [] : [...history, route]);
     setRoute({ screen, id });
     setSearch("");
+    setDeletedDateFilter("");
     setFilter("All");
     setFaq("");
     if (screen === "customerForm") {
@@ -2557,6 +2638,8 @@ function AppContent() {
   }
   function saveEntry() {
     const old = route.screen === "editTransaction" ? entry : undefined;
+    if (route.screen === "editTransaction" && !old)
+      return Alert.alert("Transaction unavailable", "This transaction is no longer available in the active ledger. Refresh the account before editing it.");
     const type = old?.type ||
       (route.screen === "credit" ? "credit" : route.screen === "refund" ? "refund" : "payment");
     const amount = Number(form.amount);
@@ -2607,6 +2690,7 @@ function AppContent() {
     const e: Entry = {
       id: old?.id || uid(),
       serverVersion: old?.serverVersion,
+      resolutionVersion: old?.resolutionVersion,
       customerId: c.id,
       type,
       amount: Math.round(amount * 100) / 100,
@@ -2679,32 +2763,58 @@ function AppContent() {
     else apply();
   }
   function deleteEntry(e: Entry) {
+    const customerName = dataRef.current.customers.find((item) => item.id === e.customerId)?.name || "Customer";
+    const type = entryLabel(e.type);
+    const originalDate = entryDateTime(e, localeTag(dataRef.current.language));
     Alert.alert(
-      "Delete transaction?",
-      `Remove this ${money(e.amount)} entry? The change will remain in Activity History.`,
+      "Delete Transaction?",
+      `Transaction: ${type}\nAmount: ${money(e.amount)}\nDate: ${originalDate}\nCustomer: ${customerName}\n\nThis transaction will be removed from active financial records and the customer's balances will be recalculated. You can restore it later from Deleted Transactions.`,
       [
         { text: "Cancel", style: "cancel" },
         {
-          text: "Delete",
+          text: "Delete Transaction",
           style: "destructive",
-          onPress: () =>
-            save(
-              {
-                ...data,
-                entries: data.entries.filter((x) => x.id !== e.id),
-                audit: [
-                  {
-                    id: uid(),
-                    action: "Deleted transaction",
-                    date: new Date().toISOString(),
-                    before: e,
-                  },
-                  ...data.audit,
-                ],
-              },
-              () => go("customer", e.customerId, true),
-            ),
+          onPress: () => {
+            if (lock.current) return;
+            const current = dataRef.current;
+            const active = current.entries.find((item) => item.id === e.id);
+            if (!active) return Alert.alert("Transaction unavailable", "This transaction is no longer active.");
+            const deletedAt = new Date().toISOString();
+            save({
+              ...current,
+              entries: current.entries.filter((item) => item.id !== e.id),
+              deletedEntries: [{ ...active, deletedAt }, ...(current.deletedEntries || []).filter((item) => item.id !== active.id)],
+              audit: [{ id: uid(), action: "Deleted transaction", date: deletedAt, before: active }, ...current.audit],
+            }, () => go("customer", active.customerId, true));
+          },
         },
+      ],
+    );
+  }
+  function restoreEntry(deleted: NonNullable<Data["deletedEntries"]>[number]) {
+    if (lock.current) return;
+    const customerName = dataRef.current.customers.find((item) => item.id === deleted.customerId)?.name || "Customer";
+    Alert.alert(
+      "Restore Transaction?",
+      `Transaction: ${entryLabel(deleted.type)}\nAmount: ${money(deleted.amount)}\nOriginal Date: ${entryDateTime(deleted, localeTag(dataRef.current.language))}\nCustomer: ${customerName}\n\nRestoring this transaction will add it back to the customer's active financial history and recalculate the outstanding balance and available advance.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Restore Transaction", onPress: () => {
+          if (lock.current) return;
+          const current = dataRef.current;
+          const tombstone = current.deletedEntries?.find((item) => item.id === deleted.id);
+          if (!tombstone || current.entries.some((item) => item.id === deleted.id))
+            return Alert.alert("Transaction unavailable", "This transaction is no longer in Deleted Transactions.");
+          const { deletedAt: _deletedAt, ...restored } = tombstone;
+          const restoredAt = new Date().toISOString();
+          const event = { id: uid(), action: "Restored transaction", date: restoredAt, before: restored, after: restored };
+          save({
+            ...current,
+            entries: [restored, ...current.entries],
+            deletedEntries: (current.deletedEntries || []).filter((item) => item.id !== tombstone.id),
+            audit: [event, ...current.audit],
+          }, () => Alert.alert("Transaction restored", "Restored on this device. Synchronization will update the shop when available."));
+        } },
       ],
     );
   }
@@ -4171,62 +4281,28 @@ function AppContent() {
       );
       break;
     case "transaction":
-      if (entry) {
-        const transactionCustomer = data.customers.find((customer) => customer.id === entry.customerId);
-        content = (
-          <>
-            <Card style={{ alignItems: "center", paddingVertical: 30 }}>
-              <Text style={[s.amount, { color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text }]}>{transactionAmountText(entry, money)}</Text>
-              <View style={[s.badge, { backgroundColor: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].background }]}>
-                <Text style={{ color: financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text, fontWeight: "700" }}>
-                  {entryLabel(entry.type).toUpperCase()}
-                </Text>
-              </View>
-              {transactionCustomer ? (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={`View customer ${transactionCustomer.name}`}
-                  onPress={() => go("viewCustomer", transactionCustomer.id)}
-                  hitSlop={4}
-                >
-                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 5 }}>
-                    <Text style={[s.section, { color: colors.green, marginTop: 0, marginBottom: 0 }]}>
-                      {transactionCustomer.name}
-                    </Text>
-                    <Icon name="chevron-forward-outline" size={16} color={colors.green} />
-                  </View>
-                </Pressable>
-              ) : null}
-              <View style={customerDetailsStyles.transactionTitleRow}>
-                <Icon name="calendar-outline" size={16} color={colors.muted} />
-                <Hint>{entryDateTime(entry, localeTag(data.language))}</Hint>
-              </View>
-            </Card>
-            <Title>Description</Title>
-            <Text style={s.rowTitle}>{entry.note || "No description"}</Text>
-            {entry.type !== "credit" && (
-              <Row icon="card-outline" title="Payment Method" value={entry.method} />
-            )}
-            {entry.reference ? <Row icon="pricetag-outline" title="Reference" value={entry.reference} /> : null}
-            {entry.type === "payment" && entry.appliedToUdhari !== undefined && (
-              <>
-                <Row title="Adjusted Against Udhari" value={money(entry.appliedToUdhari)} />
-                <Row title="Added to Advance" value={money(entry.addedToAdvance || 0)} />
-              </>
-            )}
-            {entry.type === "credit" && (entry.advanceApplied || 0) > 0 && (
-              <Row title="Adjusted From Advance" value={money(entry.advanceApplied || 0)} />
-            )}
-            {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button
-              icon="create-outline"
-              title="Edit"
-              onPress={() => go("editTransaction", entry.id)}
-            /> : <Hint>{t("Historical transactions are read-only.", data.language)}</Hint>}
-            {isActiveCustomer(data.customers.find((item) => item.id === entry.customerId) || {}) ? <Button icon="trash-outline" title="Delete" danger onPress={() => deleteEntry(entry)} /> : null}
-          </>
-        );
+      {
+      const selectedEntry = entry || data.deletedEntries?.find((item) => item.id === route.id);
+      if (selectedEntry) {
+        const deletedEntry = data.deletedEntries?.find((item) => item.id === selectedEntry.id);
+        const transactionCustomer = data.customers.find((customer) => customer.id === selectedEntry.customerId);
+        const customerIsActive = !!transactionCustomer && isActiveCustomer(transactionCustomer);
+        content = <TransactionDetails
+          entry={selectedEntry}
+          customer={transactionCustomer || null}
+          editable={!deletedEntry && customerIsActive}
+          deleted={!!deletedEntry}
+          deletedOn={deletedEntry?.deletedAt}
+          actionBusy={busy}
+          loadReceipt={loadTransactionReceipt}
+          onEdit={() => go("editTransaction", selectedEntry.id)}
+          onDelete={() => deleteEntry(selectedEntry)}
+          onRestore={() => { if (deletedEntry) restoreEntry(deletedEntry); }}
+          onViewCustomer={() => { if (transactionCustomer) go("viewCustomer", transactionCustomer.id); }}
+        />;
       }
       break;
+      }
     case "khata": {
       const groups = new Map<string, { customer: Customer; summary: ReturnType<typeof monthly>; entries: Entry[] }>();
       for (const row of khataRows) {
@@ -4699,38 +4775,64 @@ function AppContent() {
             </Hint>
           )}
           <View style={customerDetailsStyles.transactionTitleRow}>
-            <Icon name={!syncStatus ? "help-circle-outline" : syncStatus.pending ? "time-outline" : syncStatus.failed || syncStatus.conflicts || syncStatus.mobileConflicts ? "alert-circle-outline" : "cloud-done-outline"} size={18} color={!syncStatus ? colors.muted : syncStatus.failed || syncStatus.conflicts || syncStatus.mobileConflicts ? colors.orange : colors.green} />
+            <Icon
+              name={syncStatus.kind === "loading" ? "sync-outline"
+                : syncStatus.kind === "unavailable" ? "help-circle-outline"
+                  : syncStatus.status === "synced" ? "cloud-done-outline"
+                    : syncStatus.status === "syncing" ? "sync-outline"
+                      : syncStatus.status === "pending" ? "time-outline"
+                        : syncStatus.status === "offline" ? "cloud-offline-outline" : "alert-circle-outline"}
+              size={18}
+              color={syncStatus.kind === "unavailable" || syncStatus.kind === "loading" || (syncStatus.kind === "available" && syncStatus.status === "offline") ? colors.muted
+                : syncStatus.kind === "available" && ["failed", "conflict"].includes(syncStatus.status) ? colors.orange : colors.green}
+            />
             <Title>SYNC STATUS</Title>
           </View>
-          {!syncStatus ? (
-            <Hint>Sync status is unavailable in this app build.</Hint>
-          ) : syncStatus.failed ? (
+          {syncStatus.kind === "loading" ? <Hint>Reading this shop’s synchronization queue…</Hint> : null}
+          {syncStatus.kind === "unavailable" ? (
             <Hint>
-              {syncStatus.failed} saved change{syncStatus.failed === 1 ? "" : "s"} failed to sync. They remain on this phone and will not retry automatically.
+              {syncStatus.reason === "not_signed_in" ? "Sign in to a shop to view its synchronization queue."
+                : syncStatus.reason === "shop_context" ? "The signed-in shop identity is not available for this queue. Sign in again to refresh it."
+                  : syncStatus.reason === "storage" ? "Encrypted offline storage is unavailable, so the synchronization queue cannot be read. Your local data has not been cleared."
+                    : "Could not read the encrypted synchronization queue. Your local data has not been cleared; check Storage Diagnostics and retry."}
             </Hint>
           ) : null}
-          {!!syncStatus?.conflicts && (
+          {syncStatus.kind === "available" ? (
+            <>
+              <Text style={s.rowTitle} accessibilityRole="text">
+                {syncStatus.status === "synced" ? "Synced"
+                  : syncStatus.status === "pending" ? "Pending Sync"
+                    : syncStatus.status === "syncing" ? "Syncing"
+                      : syncStatus.status === "failed" ? "Sync Failed"
+                        : syncStatus.status === "conflict" ? "Conflict" : "Offline"}
+              </Text>
+              <Hint>{`${syncStatus.counts.pending} pending · ${syncStatus.counts.failed} failed · ${syncStatus.counts.conflicts + syncStatus.counts.mobileConflicts} conflicts`}</Hint>
+            </>
+          ) : null}
+          {syncStatus.kind === "available" && !!syncStatus.counts.conflicts && (
             <Hint>
-              {syncStatus.conflicts} transaction conflict{syncStatus.conflicts === 1 ? " needs" : "s need"} your decision. Both versions remain saved.
+              {syncStatus.counts.conflicts} transaction conflict{syncStatus.counts.conflicts === 1 ? " needs" : "s need"} your decision. Both versions remain saved.
             </Hint>
           )}
-          {!!syncStatus?.mobileConflicts && (
+          {syncStatus.kind === "available" && !!syncStatus.counts.mobileConflicts && (
             <Hint>
-              {syncStatus.mobileConflicts} customer change{syncStatus.mobileConflicts === 1 ? " uses" : "s use"} a mobile number already assigned in this shop. The local customer and its ledger remain saved; no records were merged. Change the number on the local customer, then retry synchronization.
+              {syncStatus.counts.mobileConflicts} customer change{syncStatus.counts.mobileConflicts === 1 ? " uses" : "s use"} a mobile number already assigned in this shop. The local customer and its ledger remain saved; no records were merged. Change the number on the local customer, then retry synchronization.
             </Hint>
           )}
-          {!!syncStatus?.pending && (
+          {syncStatus.kind === "available" && !!syncStatus.counts.pending && (
             <Hint>
-              {syncStatus.pending} saved change{syncStatus.pending === 1 ? " is" : "s are"} waiting to sync.
+              {syncStatus.counts.pending} saved change{syncStatus.counts.pending === 1 ? " is" : "s are"} waiting to sync.
             </Hint>
           )}
-          {syncStatus &&
-            !syncStatus.pending &&
-            !syncStatus.failed &&
-            !syncStatus.conflicts && (
-            <Hint>All saved changes are synchronized.</Hint>
+          {syncStatus.kind === "available" && !!syncStatus.counts.failed && (
+            <Hint>
+              {syncStatus.counts.failed} saved change{syncStatus.counts.failed === 1 ? "" : "s"} failed to sync. They remain on this phone and will not retry automatically.
+            </Hint>
           )}
-          {!!syncStatus?.failed && (
+          {syncStatus.kind === "available" && syncStatus.status === "synced" && (
+            <Hint>There are no pending, failed, or conflicted local operations.</Hint>
+          )}
+          {syncStatus.kind === "available" && !!syncStatus.counts.failed && (
             <Button
               icon="refresh-outline"
               title="Retry failed sync"
@@ -5236,7 +5338,10 @@ function AppContent() {
       virtualizedRows = {
         data: activityPage.items,
         keyExtractor: (activity) => activity.id,
-        header: <Hint>Server-recorded customer and transaction activity for this shop.</Hint>,
+        header: <View style={{ gap: 8 }}>
+          <Hint>Server-recorded customer and transaction activity for this shop.</Hint>
+          <Button icon="trash-outline" title="Restore Deleted Transactions" secondary textColor="#DC2626" iconColor="#DC2626" onPress={() => go("deletedTransactions")} />
+        </View>,
         renderItem: (a) => (
           <Card>
               <Title>{t(lifecycleActivityLabels[a.action] || a.action, data.language)}</Title>
@@ -5271,6 +5376,49 @@ function AppContent() {
         ),
         footer: listFooter(activityPage.hasMore),
         empty: !data.audit.length ? <Empty title="No activity yet" description="Changes you make to this khata will appear here." /> : null,
+      };
+      break;
+      }
+    case "deletedTransactions":
+      {
+      const query = search.trim().toLocaleLowerCase();
+      const deleted = (data.deletedEntries || []).filter((item) => {
+        const customerName = data.customers.find((customer) => customer.id === item.customerId)?.name || "";
+        const matchesSearch = !query || [customerName, item.id, item.type, item.note || ""].some((value) => value.toLocaleLowerCase().includes(query));
+        const matchesDate = !deletedDateFilter || (validDate(deletedDateFilter) && item.deletedAt.startsWith(deletedDateFilter));
+        return matchesSearch && matchesDate && (filter === "All" || entryLabel(item.type) === filter);
+      }).slice().sort((a, b) => b.deletedAt.localeCompare(a.deletedAt) || a.id.localeCompare(b.id));
+      const deletedPage = pageRecords(deleted);
+      virtualizedRows = {
+        data: deletedPage.items,
+        keyExtractor: (item) => item.id,
+        header: <View style={{ gap: 8 }}>
+          <Hint>Deleted transactions are excluded from active balances. Restoring one returns it to the original financial date.</Hint>
+          <Field label="Search customer, transaction ID or type" value={search} onChangeText={setSearch} autoCapitalize="none" />
+          <Field label="Filter by deletion date (YYYY-MM-DD)" value={deletedDateFilter} onChangeText={setDeletedDateFilter} placeholder="2026-10-26" />
+          <Chips items={["All", "Udhari Given", "Payment Received", "Advance Refund"]} value={filter} onChange={setFilter} />
+        </View>,
+        renderItem: (item) => {
+          const customerName = data.customers.find((customer) => customer.id === item.customerId)?.name || "Customer unavailable";
+          return <Card style={{ gap: 6 }}>
+            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Title>{entryLabel(item.type)}</Title>
+                <Hint>Customer: {customerName}</Hint>
+              </View>
+              <Text style={{ fontSize: 17, fontWeight: "700", color: colors.dark }}>{money(item.amount)}</Text>
+            </View>
+            <Hint>Transaction Date: {entryDateTime(item, localeTag(data.language))}</Hint>
+            <Hint>Deleted On: {new Date(item.deletedAt).toLocaleString("en-IN")}</Hint>
+            <Hint>Transaction ID: {item.id}</Hint>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <View style={{ flex: 1 }}><Button icon="eye-outline" title="View Details" secondary onPress={() => go("transaction", item.id)} /></View>
+              <View style={{ flex: 1 }}><Button icon="refresh-outline" title="Restore Transaction" disabled={busy} onPress={() => restoreEntry(item)} /></View>
+            </View>
+          </Card>;
+        },
+        footer: listFooter(deletedPage.hasMore),
+        empty: <Empty title="No deleted transactions" description="Deleted transactions for this shop will appear here." />,
       };
       break;
       }
@@ -5484,7 +5632,7 @@ function AppContent() {
                 {!!storageDiagnostics.errorMessage && <Hint>{`Storage detail: ${storageDiagnostics.errorMessage}`}</Hint>}
                 <Hint>{`Offline database ready: ${storageDiagnostics.readiness === "ready" ? "Yes" : "No"}`}</Hint>
                 <Hint>{`Offline authorization: ${offlineAccountRef.current && data.signedIn ? "Active for this shop (30-day policy)" : "Not active"}`}</Hint>
-                <Hint>{`Sync queue: ${syncStatus ? `${syncStatus.pending} pending, ${syncStatus.failed} failed, ${syncStatus.conflicts} conflicted` : "Unavailable or not initialized"}`}</Hint>
+                <Hint>{`Sync queue: ${syncStatus.kind === "available" ? `${syncStatus.counts.pending} pending, ${syncStatus.counts.failed} failed, ${syncStatus.counts.conflicts + syncStatus.counts.mobileConflicts} conflicted` : syncStatus.kind === "unavailable" ? `Unavailable (${syncStatus.reason})` : "Loading"}`}</Hint>
                 <Hint>{`Last health-check HTTP status: ${networkDiagnostics.healthHttpStatus ?? "Not received"}`}</Hint>
                 <Hint>{`Last API response: ${networkDiagnostics.lastApiResponseStatus === null ? "None" : `HTTP ${networkDiagnostics.lastApiResponseStatus}`}${networkDiagnostics.lastApiResponseAt ? ` at ${new Date(networkDiagnostics.lastApiResponseAt).toLocaleString()}` : ""}`}</Hint>
                 <Hint>{`Last request duration: ${networkDiagnostics.healthDurationMs === null ? "Not available" : `${networkDiagnostics.healthDurationMs} ms`}`}</Hint>

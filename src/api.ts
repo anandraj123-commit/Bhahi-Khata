@@ -143,6 +143,19 @@ export async function probeBackendReachability(): Promise<BackendProbeResult> {
 }
 const ACCESS = "khata.access.v1";
 const REFRESH = "khata.refresh.v1";
+const safeRequestId = (value: string | null) =>
+  value && /^[A-Za-z0-9._:-]{1,80}$/.test(value) ? value : undefined;
+/** Serialize only fields accepted by the strict ledger mutation schema.
+ * createdAt and version fields are server metadata, while recordedAt remains
+ * the transaction's effective timestamp. */
+const ledgerMutationInput = (entry: Data["entries"][number]) => {
+  const value = { ...withoutLegacyDue(entry) } as Data["entries"][number] & { deletedAt?: string };
+  delete value.createdAt;
+  delete value.serverVersion;
+  delete value.resolutionVersion;
+  delete value.deletedAt;
+  return value;
+};
 const auditInput = (audit: Data["audit"][number]) => {
   const normalized = withoutLegacyDueFromAudit(audit);
   const before = normalized.before ? { ...normalized.before } : undefined;
@@ -150,6 +163,14 @@ const auditInput = (audit: Data["audit"][number]) => {
   if (before) delete before.serverVersion;
   if (after) delete after.serverVersion;
   return { ...audit, ...(before ? { before } : {}), ...(after ? { after } : {}) };
+};
+const restoreAuditInput = (audit: Data["audit"][number]) => {
+  const normalized = auditInput(audit);
+  return {
+    ...normalized,
+    ...(normalized.before ? { before: ledgerMutationInput(normalized.before as Data["entries"][number]) } : {}),
+    ...(normalized.after ? { after: ledgerMutationInput(normalized.after as Data["entries"][number]) } : {}),
+  };
 };
 type RefreshResult = "refreshed" | "invalid" | { kind: "unavailable"; status: number; code?: string };
 type RequestOrigin = "foreground" | "session_restore" | "offline_sync";
@@ -201,6 +222,8 @@ async function request(
     responseReceived: boolean;
     status?: number;
     code?: string;
+    requestId?: string;
+    validationDetails?: Array<{ field: string; code: string }>;
     category: string;
   }) => {
     if (__DEV__) console.warn("Digital-Khata API request failed", {
@@ -208,6 +231,8 @@ async function request(
       endpoint,
       status: details.status,
       code: details.code,
+      requestId: details.requestId,
+      validationDetails: details.validationDetails,
       durationMs: Date.now() - startedAt,
       responseReceived: details.responseReceived,
       origin,
@@ -249,10 +274,15 @@ async function request(
   apiResponseObserver?.(response.status);
   if (response.status === 401 && retry && path !== "/auth/refresh") {
     const refreshed = await refresh(origin);
-    if (refreshed instanceof ApiTransportError) throw refreshed;
+    if (refreshed instanceof ApiTransportError) {
+      logFailure({ responseReceived: true, status: response.status, code: "HTTP_401", requestId: safeRequestId(response.headers.get("x-request-id")), category: "authentication" });
+      throw refreshed;
+    }
     if (refreshed === "refreshed") return request(path, options, false, origin);
-    if (typeof refreshed === "object" && refreshed.kind === "unavailable")
+    if (typeof refreshed === "object" && refreshed.kind === "unavailable") {
+      logFailure({ responseReceived: true, status: response.status, code: refreshed.code || "HTTP_401", requestId: safeRequestId(response.headers.get("x-request-id")), category: "authentication" });
       throw new ApiError("Could not validate the server session", refreshed.status, { code: refreshed.code });
+    }
   }
   if (response.status === 204) return undefined;
   const value = await response.json().catch(() => null);
@@ -261,11 +291,23 @@ async function request(
     throw new ApiError("The server returned an invalid response", 502, { code: "INVALID_SERVER_RESPONSE" });
   }
   if (!response.ok) {
-    const code = typeof value?.code === "string" ? value.code : undefined;
+    const code = typeof value?.code === "string" && /^[A-Z0-9_-]{1,40}$/.test(value.code)
+      ? value.code
+      : `HTTP_${response.status}`;
+    const validationDetails = Array.isArray(value?.details)
+      ? value.details.slice(0, 12).map((detail: any) => ({
+          field: typeof detail?.field === "string"
+            ? detail.field.split(".").map((part: string) => /^[A-Za-z][A-Za-z0-9_-]{0,39}$/.test(part) ? part : "field").join(".").slice(0, 120)
+            : "request",
+          code: typeof detail?.code === "string" && /^[a-z_]{1,40}$/.test(detail.code) ? detail.code : "invalid_value",
+        }))
+      : undefined;
     logFailure({
       responseReceived: true,
       status: response.status,
       code,
+      requestId: safeRequestId(response.headers.get("x-request-id")),
+      validationDetails,
       category: response.status === 401 || response.status === 403 ? "authentication"
         : response.status === 409 ? "conflict"
           : response.status === 429 ? "rate_limit"
@@ -388,7 +430,7 @@ export async function loadAccount(origin: RequestOrigin = "foreground"): Promise
   if (!base || typeof base !== "object" || !base.shop || typeof base.shop !== "object")
     throw new ApiError("The server returned invalid account data", 502, { code: "INVALID_SERVER_RESPONSE" });
   if (base.shopExists === false)
-    return normalizeData({ ...base, customers: [], entries: [], audit: [] });
+    return normalizeData({ ...base, customers: [], entries: [], audit: [], deletedEntries: [] });
   const pages = async <T>(path: string): Promise<T[]> => {
     const rows: T[] = [];
     let cursor = "";
@@ -413,13 +455,14 @@ export async function loadAccount(origin: RequestOrigin = "foreground"): Promise
     } while (cursor);
     return rows;
   };
-  const [customers, entries, audit] = await Promise.all([
+  const [customers, entries, audit, deletedEntries] = await Promise.all([
     pages<Data["customers"][number]>("/customers"),
     pages<Data["entries"][number]>("/ledger"),
     pages<Data["audit"][number]>("/activity"),
+    pages<NonNullable<Data["deletedEntries"]>[number]>("/ledger/deleted"),
   ]);
   try {
-    return normalizeData({ ...base, customers, entries, audit });
+    return normalizeData({ ...base, customers, entries, audit, deletedEntries });
   } catch {
     if (__DEV__) console.warn("Digital-Khata account response invalid", {
       method: "GET", endpoint: "/account/normalize", code: "INVALID_SERVER_RESPONSE",
@@ -437,6 +480,7 @@ export function normalizeData(value: Data): Data {
     shop: { ...value.shop, phone: value.shop.phone.replace(/^\+91/, "") },
     entries: value.entries.map((entry) => withoutLegacyDue(entry) as Data["entries"][number]),
     audit: value.audit.map((item) => withoutLegacyDueFromAudit(item)),
+    deletedEntries: (value.deletedEntries || []).map((entry) => withoutLegacyDue(entry) as NonNullable<Data["deletedEntries"]>[number]),
   };
 }
 export async function startOtp(phone: string) {
@@ -632,7 +676,7 @@ export async function getSubscriptionPaymentAttemptStatus(idempotencyKey: string
 }
 export async function syncQueuedChange(change: SyncDelta) {
   change = normalizeSyncDelta(change);
-  const acknowledged: { customers: Data["customers"]; entries: Data["entries"]; settings?: SyncSettings } = {
+  const acknowledged: { customers: Data["customers"]; entries: Array<Data["entries"][number] & { deletedAt?: string }>; settings?: SyncSettings } = {
     customers: [],
     entries: [],
   };
@@ -735,21 +779,32 @@ export async function syncQueuedChange(change: SyncDelta) {
     const action = change.audit.find(
       (audit) => audit.after?.id === (entry || old)?.id || audit.before?.id === (entry || old)?.id,
     );
-    if (!entry) {
-      await syncRequest(`/ledger/${encodeURIComponent(old!.id)}`, {
-        method: "DELETE",
-        body: JSON.stringify({ baseRecord: (() => { const value = { ...old! }; delete value.serverVersion; delete value.resolutionVersion; return value; })(), ...(old?.serverVersion ? { baseVersion: old.serverVersion } : {}), ...(old?.resolutionVersion ? { baseResolutionVersion: old.resolutionVersion } : {}), ...(action ? { audit: auditInput(action) } : {}) }),
-      });
+    if (action?.action === "Restored transaction") {
+      const restored = await syncRequest(`/ledger/${encodeURIComponent((entry || old)!.id)}/restore`, {
+        method: "POST",
+        headers: { "Idempotency-Key": `transaction-restore:${action.id}` },
+        body: JSON.stringify({
+          expectedVersion: old?.serverVersion || entry?.serverVersion || 1,
+          expectedResolutionVersion: old?.resolutionVersion || entry?.resolutionVersion || 1,
+          audit: restoreAuditInput(action),
+        }),
+      }) as Data["entries"][number];
+      acknowledged.entries.push(restored);
       continue;
     }
-    const baseRecord = old ? { ...old } : undefined;
-    const baseVersion = baseRecord?.serverVersion;
-    const baseResolutionVersion = baseRecord?.resolutionVersion;
-    if (baseRecord) delete baseRecord.serverVersion;
-    if (baseRecord) delete baseRecord.resolutionVersion;
-    const payload = { ...withoutLegacyDue(entry) };
-    delete payload.serverVersion;
-    delete payload.resolutionVersion;
+    if (!entry) {
+      const deleted = await syncRequest(`/ledger/${encodeURIComponent(old!.id)}`, {
+        method: "DELETE",
+        headers: { "Idempotency-Key": `transaction-delete:${action?.id || old!.id}` },
+        body: JSON.stringify({ baseRecord: ledgerMutationInput(old!), ...(old?.serverVersion ? { baseVersion: old.serverVersion } : {}), ...(old?.resolutionVersion ? { baseResolutionVersion: old.resolutionVersion } : {}), ...(action ? { audit: auditInput(action) } : {}) }),
+      }) as { entry: Data["entries"][number]; deletedAt: string };
+      acknowledged.entries.push({ ...deleted.entry, deletedAt: deleted.deletedAt });
+      continue;
+    }
+    const baseRecord = old ? ledgerMutationInput(old) : undefined;
+    const baseVersion = old?.serverVersion;
+    const baseResolutionVersion = old?.resolutionVersion;
+    const payload = ledgerMutationInput(entry);
     const saved = await syncRequest(old ? `/ledger/${encodeURIComponent(entry.id)}` : "/ledger", {
       method: old ? "PATCH" : "POST",
       headers: old ? {} : {
@@ -792,7 +847,7 @@ export async function resolveFinancialConflict(
       localDeleted: conflict.localDeleted,
       localAt: conflict.localAt,
     }),
-  }) as Promise<{ entry: PendingConflict["server"]; serverVersion: number; resolutionVersion: number; resolutionId: string; serverAt: string; audit: Data["audit"][number] }>;
+  }) as Promise<{ entry: PendingConflict["server"]; deletedEntry?: NonNullable<Data["deletedEntries"]>[number]; serverVersion: number; resolutionVersion: number; resolutionId: string; serverAt: string; audit: Data["audit"][number] }>;
 }
 
 export async function resolveCustomerConflict(

@@ -8,6 +8,8 @@ import { createSyncDelta, normalizeSyncDelta, type SyncDelta, type SyncSettings 
 import { withoutLegacyDue, withoutLegacyDueFromAudit } from "./ledgerCompatibility";
 import { normalizeCustomerMobile } from "./customerPhone";
 import { normalizeCustomerLifecycle } from "./customerLifecycle";
+import { authorizeReceiptAccess, type ReceiptSnapshot } from "./transactionReceipt";
+import { deletedEntriesFromHistory } from "./transactionLifecycle";
 
 const DATABASE = "digital-khata-offline.db";
 const KEY_NAME = "khata.sqlite.key.v1";
@@ -419,6 +421,7 @@ function preferencesOf(data: Data) {
     reminders: data.reminders,
     defaultMethod: data.defaultMethod,
     read: data.read,
+    deletedEntries: data.deletedEntries || deletedEntriesFromHistory(data.audit, data.entries),
   };
 }
 
@@ -671,13 +674,91 @@ export async function readCachedAccount(accountId: string): Promise<Data | null>
     ),
   ]);
   const preferences = JSON.parse(account.preferences_json);
+  const auditRecords = audit.map((row) => withoutLegacyDueFromAudit(JSON.parse(row.record_json)));
+  const entryRecords = entries.map((row) => withoutLegacyDue(JSON.parse(row.record_json)) as Entry);
   return {
     shop: JSON.parse(account.shop_json),
     customers: customers.map((row) => normalizeCustomerLifecycle(JSON.parse(row.record_json))),
-    entries: entries.map((row) => withoutLegacyDue(JSON.parse(row.record_json)) as Entry),
-    audit: audit.map((row) => withoutLegacyDueFromAudit(JSON.parse(row.record_json))),
+    entries: entryRecords,
+    audit: auditRecords,
     ...preferences,
+    deletedEntries: preferences.deletedEntries || deletedEntriesFromHistory(auditRecords, entryRecords),
   } as Data;
+}
+
+/** Read-only, consistent export snapshot. Reuses the existing offline authorization policy. */
+export async function readReceiptSnapshot(
+  accountId: string,
+  options: { authenticatedData?: Data; allowMissingOfflineSession?: boolean } = {},
+): Promise<ReceiptSnapshot> {
+  const session = await readOfflineSession().catch((error) => {
+    if (options.authenticatedData && options.allowMissingOfflineSession) return null;
+    throw error;
+  });
+  const accountData = options.authenticatedData;
+  if (!accountData && !session) throw new Error("Your offline authorization has expired. Sign in again before exporting a receipt.");
+  if (accountData) {
+    authorizeReceiptAccess(accountData, accountId, session, !options.allowMissingOfflineSession);
+  } else if (session?.accountId !== accountId) {
+    throw new Error("The offline session belongs to a different shop.");
+  }
+  let db: SQLiteTypes.SQLiteDatabase | null;
+  try { db = await openDatabase(); }
+  catch (error) {
+    if (!accountData) throw error;
+    db = null;
+  }
+  if (!db) {
+    if (!accountData) throw new Error("Encrypted local storage is unavailable. Reopen the app in a supported Android build.");
+    const currentSession = await readOfflineSession().catch((error) => {
+      if (options.authenticatedData && options.allowMissingOfflineSession) return null;
+      throw error;
+    });
+    if (session && (!currentSession || currentSession.accountId !== session.accountId))
+      throw new Error("The account session changed. Reopen the transaction.");
+    return { accountId, data: accountData, queue: [], queueAvailable: false };
+  }
+  const snapshot = await withEncryptedTransaction(db, async (tx) => {
+    const account = await tx.getFirstAsync<{ shop_json: string; preferences_json: string }>(
+      "SELECT shop_json, preferences_json FROM local_accounts WHERE account_id = ?", accountId,
+    );
+    if (!account) {
+      if (accountData) return { accountId, data: accountData, queue: [], queueAvailable: false };
+      throw new Error("Shop details are not available in the local cache.");
+    }
+    const customers = await tx.getAllAsync<{ record_json: string }>("SELECT record_json FROM local_customers WHERE account_id = ? ORDER BY rowid", accountId);
+    const entries = await tx.getAllAsync<{ record_json: string }>("SELECT record_json FROM local_ledger WHERE account_id = ? ORDER BY rowid", accountId);
+    const audit = await tx.getAllAsync<{ record_json: string }>("SELECT record_json FROM local_audit WHERE account_id = ? ORDER BY rowid DESC", accountId);
+    const queued = await tx.getAllAsync<{ state: string; change_json: string }>("SELECT state, change_json FROM sync_queue WHERE account_id = ? ORDER BY id", accountId);
+    const entryRecords = entries.map((row) => withoutLegacyDue(JSON.parse(row.record_json)) as Entry);
+    const auditRecords = audit.map((row) => withoutLegacyDueFromAudit(JSON.parse(row.record_json)));
+    const preferences = JSON.parse(account.preferences_json);
+    return {
+      accountId,
+      data: {
+        ...preferences,
+        ...(accountData ? { signedIn: accountData.signedIn, shopExists: accountData.shopExists } : {}),
+        shop: accountData?.shop || JSON.parse(account.shop_json),
+        customers: customers.map((row) => normalizeCustomerLifecycle(JSON.parse(row.record_json))),
+        entries: entryRecords,
+        audit: auditRecords,
+        deletedEntries: preferences.deletedEntries || deletedEntriesFromHistory(auditRecords, entryRecords),
+      } as Data,
+      queue: queued.map((row) => ({ state: row.state, change: parseQueuedChange(row.change_json) })),
+      queueAvailable: true,
+    };
+  });
+  const currentSession = await readOfflineSession().catch((error) => {
+    if (options.authenticatedData && options.allowMissingOfflineSession) return null;
+    throw error;
+  });
+  if (session && (!currentSession || currentSession.accountId !== session.accountId))
+    throw new Error("The account session changed. Reopen the transaction.");
+  if (currentSession && accountData) {
+    authorizeReceiptAccess(accountData, accountId, currentSession, false);
+  } else if (!currentSession && !options.allowMissingOfflineSession)
+    throw new Error("Your offline authorization has expired. Sign in again when connected before exporting a receipt.");
+  return snapshot;
 }
 
 /** Persist a device-local language choice without creating a shop-settings
@@ -1229,7 +1310,7 @@ export async function chooseConflictResolution(id: number, choice: "keep_local" 
   return conflict;
 }
 
-export async function completeConflict(accountId: string, conflict: PendingConflict, authoritative: PendingConflict["server"], serverVersion: number, serverResolutionVersion: number, audit: Audit) {
+export async function completeConflict(accountId: string, conflict: PendingConflict, authoritative: PendingConflict["server"], serverVersion: number, serverResolutionVersion: number, audit: Audit, authoritativeDeleted?: NonNullable<Data["deletedEntries"]>[number]) {
   const db = await openDatabase();
   if (!db) throw new Error("Encrypted offline storage is unavailable");
   await withEncryptedTransaction(db, async (transaction) => {
@@ -1305,6 +1386,19 @@ export async function completeConflict(accountId: string, conflict: PendingConfl
       "INSERT OR IGNORE INTO local_audit (account_id, audit_id, record_json) VALUES (?, ?, ?)",
       accountId, audit.id, JSON.stringify(audit),
     );
+    const account = await transaction.getFirstAsync<{ preferences_json: string }>(
+      "SELECT preferences_json FROM local_accounts WHERE account_id = ?", accountId,
+    );
+    if (account) {
+      const preferences = JSON.parse(account.preferences_json) as ReturnType<typeof preferencesOf>;
+      let deletedEntries = (preferences.deletedEntries || []).filter((item) => item.id !== conflict.entryId);
+      if (!dependent && !authoritative && authoritativeDeleted)
+        deletedEntries = [authoritativeDeleted, ...deletedEntries];
+      await transaction.runAsync(
+        "UPDATE local_accounts SET preferences_json = ?, updated_at = ? WHERE account_id = ?",
+        JSON.stringify({ ...preferences, deletedEntries }), Date.now(), accountId,
+      );
+    }
     const remaining = parseQueuedChange(conflictedRow.change_json);
     remaining.entries = remaining.entries.filter((item) => (item.after || item.before)?.id !== conflict.entryId);
     remaining.audit = remaining.audit.filter((item) => item.before?.id !== conflict.entryId && item.after?.id !== conflict.entryId);
@@ -1363,7 +1457,7 @@ export async function nextPendingRetryAt(accountId: string): Promise<number | nu
 
 export async function acknowledgeChange(
   id: number,
-  acknowledged?: { customers?: Customer[]; entries?: Entry[]; settings?: SyncSettings },
+  acknowledged?: { customers?: Customer[]; entries?: Array<Entry & { deletedAt?: string }>; settings?: SyncSettings },
 ) {
   const db = await openDatabase();
   if (!db) return;
@@ -1423,14 +1517,16 @@ export async function acknowledgeChange(
           row.account_id, id,
         );
         let rebasedNext = false;
+        let hasLaterActive = false;
         for (const nextRow of nextRows) {
           const next = parseQueuedChange(nextRow.change_json);
           const list = kind === "customer" ? next.customers : next.entries;
           const item = list.find((candidate) => (candidate.after || candidate.before)?.id === entityId);
           if (!item) continue;
-        item.before = authoritative as never;
-        if (item.after) item.after.serverVersion = authoritative.serverVersion;
-        if (item.after) item.after.resolutionVersion = authoritative.resolutionVersion;
+          hasLaterActive ||= Boolean(item.after && item.operation !== "delete");
+          item.before = authoritative as never;
+          if (item.after) item.after.serverVersion = authoritative.serverVersion;
+          if (item.after) item.after.resolutionVersion = authoritative.resolutionVersion;
           await transaction.runAsync(
             "UPDATE sync_queue SET change_json = ?, base_version = ? WHERE id = ?",
             JSON.stringify(next), authoritative.serverVersion || 1, nextRow.id,
@@ -1452,6 +1548,19 @@ export async function acknowledgeChange(
           await transaction.runAsync(
             `UPDATE ${table} SET record_json = ? WHERE account_id = ? AND ${idColumn} = ?`,
             JSON.stringify(nextRecord), row.account_id, entityId,
+          );
+        }
+        const account = await transaction.getFirstAsync<{ preferences_json: string }>(
+          "SELECT preferences_json FROM local_accounts WHERE account_id = ?", row.account_id,
+        );
+        if (account) {
+          const preferences = JSON.parse(account.preferences_json) as ReturnType<typeof preferencesOf>;
+          const deletedEntries = (preferences.deletedEntries || []).filter((item) => item.id !== entityId);
+          const deletedAt = (authoritative as Entry & { deletedAt?: string }).deletedAt;
+          if (deletedAt && !hasLaterActive) deletedEntries.unshift({ ...(authoritative as Entry), deletedAt });
+          await transaction.runAsync(
+            "UPDATE local_accounts SET preferences_json = ?, updated_at = ? WHERE account_id = ?",
+            JSON.stringify({ ...preferences, deletedEntries }), Date.now(), row.account_id,
           );
         }
       }

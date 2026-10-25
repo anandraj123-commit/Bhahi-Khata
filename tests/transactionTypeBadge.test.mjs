@@ -44,13 +44,12 @@ test('Home uses existing labels and unchanged amounts, dates and navigation', ()
   const app = readFileSync('App.tsx', 'utf8');
   const start = app.indexOf('  const entryRow =');
   const end = app.indexOf('  async function saveCustomer()', start);
-  const labelStart = app.indexOf('const entryLabel =');
-  const labelEnd = app.indexOf('\n\n', labelStart);
-  const compiled = ts.transpileModule(app.slice(labelStart, labelEnd) + '\n' + app.slice(start, end) + '\nexports.entryRow = entryRow;', { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS } }).outputText;
+  const { transactionLabel: entryLabel } = loadTs('src/entryPresentation.ts');
+  const compiled = ts.transpileModule(app.slice(start, end) + '\nexports.entryRow = entryRow;', { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS } }).outputText;
   const navigations = [];
   const mocked = {
     React, Pressable: 'Pressable', View: 'View', Text: 'Text', Card: 'Card', Icon,
-    TransactionTypeBadge, CustomerContactInfo: 'Contact',
+    TransactionTypeBadge, CustomerContactInfo: 'Contact', entryLabel,
     data: { customers: [{ id: 'c', name: 'A long customer name', phone: '', address: '' }], language: 'en' },
     s: {}, customerDetailsStyles: {}, financialPalette: { red: { text: 'red' }, amber: { text: 'orange' }, green: { text: 'green' } },
     go: (...args) => navigations.push(args),

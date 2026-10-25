@@ -10,7 +10,9 @@ export const handle_post_backup_restore = async (req, res, next) => {
     if (
       new Set(d.customers.map((x) => x.id)).size !== d.customers.length ||
       new Set(d.entries.map((x) => x.id)).size !== d.entries.length ||
-      d.entries.some((x) => !d.customers.some((c) => c.id === x.customerId))
+      d.entries.some((x) => !d.customers.some((c) => c.id === x.customerId)) ||
+      new Set((d.deletedEntries || []).map((x) => x.id)).size !== (d.deletedEntries || []).length ||
+      (d.deletedEntries || []).some((x) => !d.customers.some((c) => c.id === x.customerId) || d.entries.some((entry) => entry.id === x.id))
     )
       return error(
         res,

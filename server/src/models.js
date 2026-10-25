@@ -155,6 +155,7 @@ export const FinancialResolution = mongoose.model(
       previousMissing: { type: Boolean, default: false },
       proposed: { type: Schema.Types.Mixed, required: true },
       selected: Schema.Types.Mixed,
+      selectedDeleted: Schema.Types.Mixed,
       previousVersion: { type: Number, required: true },
       resultingVersion: { type: Number, required: true },
       previousResolutionVersion: { type: Number, default: 1 },

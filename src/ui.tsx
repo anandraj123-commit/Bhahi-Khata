@@ -69,6 +69,8 @@ export function Button({
   disabled = false,
   loading = false,
   style,
+  textColor,
+  iconColor,
 }: {
   title: string;
   icon?: React.ComponentProps<typeof Ionicons>["name"];
@@ -79,6 +81,8 @@ export function Button({
   disabled?: boolean;
   loading?: boolean;
   style?: StyleProp<ViewStyle>;
+  textColor?: string;
+  iconColor?: string;
 }) {
   return (
     <Pressable
@@ -99,13 +103,13 @@ export function Button({
       {loading && <ActivityIndicator size="small" color={secondary && !orange && !danger ? colors.green : "white"} />}
       {icon ? (
         <View style={s.buttonContent}>
-          <Icon name={icon} size={18} color={secondary && !orange && !danger ? colors.green : "white"} />
-          <Text style={[s.buttonText, s.buttonLabel, secondary && !orange && !danger && { color: colors.green }]}>
+          <Icon name={icon} size={18} color={iconColor || (secondary && !orange && !danger ? colors.green : "white")} />
+          <Text style={[s.buttonText, s.buttonLabel, secondary && !orange && !danger && { color: colors.green }, textColor ? { color: textColor } : null]}>
             {title}
           </Text>
         </View>
       ) : (
-        <Text style={[s.buttonText, { flexShrink: 1 }, secondary && !orange && !danger && { color: colors.green }]}>
+        <Text style={[s.buttonText, { flexShrink: 1 }, secondary && !orange && !danger && { color: colors.green }, textColor ? { color: textColor } : null]}>
           {title}
         </Text>
       )}

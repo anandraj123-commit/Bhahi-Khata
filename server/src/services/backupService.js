@@ -87,6 +87,29 @@ export async function restoreBackup({ shopId, user, data }) {
           })),
           { session, ordered: true },
         );
+      if (data.deletedEntries?.length)
+        await Entry.insertMany(
+          data.deletedEntries.map((entry) => ({
+            shopId,
+            clientId: entry.id,
+            customerClientId: entry.customerId,
+            type: entry.type,
+            amountPaise: paise(entry.amount),
+            date: entry.date,
+            ...(entry.recordedAt ? { recordedAt: new Date(entry.recordedAt) } : {}),
+            ...(entry.createdAt ? { createdAt: new Date(entry.createdAt) } : {}),
+            note: entry.note,
+            method: entry.method,
+            reference: entry.reference || "",
+            appliedToUdhariPaise: paise(entry.appliedToUdhari || 0),
+            addedToAdvancePaise: paise(entry.addedToAdvance || 0),
+            advanceAppliedPaise: paise(entry.advanceApplied || 0),
+            serverVersion: entry.serverVersion || 1,
+            resolutionVersion: entry.resolutionVersion || 1,
+            deletedAt: new Date(entry.deletedAt),
+          })),
+          { session, ordered: true },
+        );
       for (const customer of data.customers)
         await reconcileCustomerAllocations(shopId, customer.id, session);
       if (data.audit.length)

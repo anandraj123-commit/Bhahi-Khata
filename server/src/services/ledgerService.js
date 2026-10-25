@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { Customer, Entry, FinancialResolution, Idempotency } from "../models.js";
+import { Audit, Customer, Entry, FinancialResolution, Idempotency } from "../models.js";
 import { digest } from "../utils/hashing.js";
 import { paise } from "../utils/money.js";
 import { entryOut, financialAuditOut } from "../utils/serializers.js";
@@ -215,38 +215,156 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key, us
   return { status: duplicate ? 200 : 201, response };
 }
 
-export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion, baseResolutionVersion, audit }) {
+export async function deleteLedgerEntry({ shopId, actorId, id, base, baseVersion, baseResolutionVersion, audit, key, requestHash }) {
+  if (key) {
+    const prior = await Idempotency.findOne({ shopId, key }).lean();
+    if (prior) {
+      if (prior.requestHash !== requestHash)
+        throw serviceError("Idempotency key was already used for another transaction", 409);
+      return prior.response;
+    }
+  }
   const session = await mongoose.startSession();
+  let response;
   try {
     await session.withTransaction(async () => {
+      if (key) {
+        const repeated = await Idempotency.findOne({ shopId, key }).session(session).lean();
+        if (repeated) {
+          if (repeated.requestHash !== requestHash)
+            throw serviceError("Idempotency key was already used for another transaction", 409);
+          response = repeated.response;
+          return;
+        }
+      }
       const entry = await Entry.findOne({
         shopId,
         clientId: id,
       }).session(session);
-      if (!entry) throw serviceError("Transaction not found", 404);
-      if (entry.deletedAt) return;
-      await lockCustomerFinancials(shopId, entry.customerClientId, session);
-      if (
+      if (!entry) throw serviceError("Transaction not found", 404, { code: "TRANSACTION_NOT_FOUND" });
+      if (!entry.deletedAt) {
+        await lockCustomerFinancials(shopId, entry.customerClientId, session);
+        if (
         ((base?.success && !sameEntryValues(entryOut(entry), base.data)) ||
           (baseVersion && (entry.serverVersion || 1) !== baseVersion) ||
           (baseResolutionVersion && (entry.resolutionVersion || 1) !== baseResolutionVersion))
-      )
-        throw serviceError("Transaction changed on another device", 409, {
-          current: entryOut(entry),
-          serverVersion: entry.serverVersion || 1,
-          resolutionVersion: entry.resolutionVersion || 1,
-        });
-      entry.deletedAt = new Date();
-      entry.serverVersion = (entry.serverVersion || 1) + 1;
-      entry.resolutionVersion = (entry.resolutionVersion || 1) + 1;
-      await entry.save({ session });
-      await reconcileCustomerAllocations(shopId, entry.customerClientId, session);
+        )
+          throw serviceError("Transaction changed on another device", 409, {
+            current: entryOut(entry),
+            serverVersion: entry.serverVersion || 1,
+            resolutionVersion: entry.resolutionVersion || 1,
+          });
+        entry.deletedAt = new Date();
+        entry.serverVersion = (entry.serverVersion || 1) + 1;
+        entry.resolutionVersion = (entry.resolutionVersion || 1) + 1;
+        await entry.save({ session });
+        await reconcileCustomerAllocations(shopId, entry.customerClientId, session);
+      }
       if (audit)
         await saveAudit({ shopId, actorId, session }, audit);
+      response = { entry: entryOut(entry), deletedAt: entry.deletedAt.toISOString() };
+      if (key)
+        await Idempotency.create([{ shopId, key, requestHash, response }], { session });
     });
+  } catch (err) {
+    if (err.code === 11000 && key) {
+      const found = await Idempotency.findOne({ shopId, key }).lean();
+      if (found && found.requestHash === requestHash) return found.response;
+    }
+    throw err;
   } finally {
     await session.endSession();
   }
+  return response;
+}
+
+export async function listDeletedLedger({ shopId, customerId, cursorId, limit = 500 }) {
+  const filter = { shopId, deletedAt: { $type: "date" } };
+  if (customerId) filter.customerClientId = String(customerId).slice(0, 80);
+  if (cursorId) {
+    const cursor = await Entry.findOne({ shopId, clientId: cursorId, deletedAt: { $type: "date" } }).select("_id deletedAt").lean();
+    if (cursor) filter.$or = [
+      { deletedAt: { $lt: cursor.deletedAt } },
+      { deletedAt: cursor.deletedAt, _id: { $lt: cursor._id } },
+    ];
+  }
+  const rows = await Entry.find(filter).sort({ deletedAt: -1, _id: -1 }).limit(limit + 1).lean();
+  const more = rows.length > limit;
+  if (more) rows.pop();
+  return { items: rows.map((row) => ({ ...entryOut(row), deletedAt: row.deletedAt.toISOString() })), nextCursor: more ? rows.at(-1).clientId : null };
+}
+
+export async function restoreLedgerEntry({ shopId, actorId, id, expectedVersion, expectedResolutionVersion, audit, key, requestHash }) {
+  const prior = await Idempotency.findOne({ shopId, key }).lean();
+  if (prior) {
+    if (prior.requestHash !== requestHash)
+      throw serviceError("Idempotency key was already used for another transaction", 409);
+    return prior.response;
+  }
+  const session = await mongoose.startSession();
+  let response;
+  try {
+    await session.withTransaction(async () => {
+      const repeated = await Idempotency.findOne({ shopId, key }).session(session).lean();
+      if (repeated) {
+        if (repeated.requestHash !== requestHash)
+          throw serviceError("Idempotency key was already used for another transaction", 409);
+        response = repeated.response;
+        return;
+      }
+      const entry = await Entry.findOne({ shopId, clientId: id }).session(session);
+      if (!entry) throw serviceError("Transaction not found", 404, { code: "TRANSACTION_NOT_FOUND" });
+      const actualVersion = entry.serverVersion || 1;
+      const actualResolutionVersion = entry.resolutionVersion || 1;
+      if (!entry.deletedAt && audit?.id) {
+        const priorEvent = await Audit.findOne({
+          shopId,
+          clientId: audit.id,
+          action: "Restored transaction",
+          $or: [{ "after.id": id }, { "before.id": id }],
+        }).session(session).lean();
+        if (priorEvent) {
+          // Idempotency records expire. Only acknowledge a replay after that
+          // expiry while the restore remains the latest ledger mutation.
+          if (!entry.deletedAt && actualVersion === expectedVersion + 1 &&
+              actualResolutionVersion === expectedResolutionVersion + 1) {
+            response = entryOut(entry);
+            return;
+          }
+        }
+      }
+      if (actualVersion !== expectedVersion || actualResolutionVersion !== expectedResolutionVersion)
+        throw serviceError("Transaction changed on another device", 409, {
+          code: "TRANSACTION_VERSION_CONFLICT",
+          current: entry.deletedAt ? null : entryOut(entry),
+          serverVersion: actualVersion,
+          resolutionVersion: actualResolutionVersion,
+        });
+      if (!entry.deletedAt)
+        throw serviceError("Transaction is already active", 409, {
+          code: "TRANSACTION_ALREADY_ACTIVE",
+          current: entryOut(entry), serverVersion: actualVersion, resolutionVersion: actualResolutionVersion,
+        });
+      await lockCustomerFinancials(shopId, entry.customerClientId, session);
+      entry.deletedAt = undefined;
+      entry.serverVersion = actualVersion + 1;
+      entry.resolutionVersion = actualResolutionVersion + 1;
+      await entry.save({ session });
+      await reconcileCustomerAllocations(shopId, entry.customerClientId, session);
+      if (audit) await saveAudit({ shopId, actorId, session }, audit);
+      response = entryOut(entry);
+      await Idempotency.create([{ shopId, key, requestHash, response }], { session });
+    });
+  } catch (err) {
+    if (err.code === 11000) {
+      const found = await Idempotency.findOne({ shopId, key }).lean();
+      if (found && found.requestHash === requestHash) return found.response;
+    }
+    throw err;
+  } finally {
+    await session.endSession();
+  }
+  return response;
 }
 
 export async function updateLedgerEntry({
@@ -330,6 +448,7 @@ export async function resolveFinancialConflict({
       throw serviceError("Resolution identifier was already used for another choice", 409);
     return {
       entry: committed.selected,
+      ...(committed.selectedDeleted ? { deletedEntry: committed.selectedDeleted } : {}),
       serverVersion: committed.resultingVersion,
       resolutionVersion: committed.resultingResolutionVersion || 1,
       resolutionId: input.resolutionId,
@@ -439,6 +558,7 @@ export async function resolveFinancialConflict({
         ) {
           response = {
             entry: priorConflict.selected,
+            ...(priorConflict.selectedDeleted ? { deletedEntry: priorConflict.selectedDeleted } : {}),
             serverVersion: priorConflict.resultingVersion,
             resolutionVersion: priorConflict.resultingResolutionVersion || 1,
             resolutionId: priorConflict.resolutionId,
@@ -510,6 +630,9 @@ export async function resolveFinancialConflict({
       selected = input.localDeleted || updatedEntry.deletedAt ? null : entryOut(updatedEntry);
       const resultingVersion = updatedEntry.serverVersion || 1;
       const resultingResolutionVersion = updatedEntry.resolutionVersion || actualResolutionVersion;
+      const selectedDeleted = updatedEntry.deletedAt
+        ? { ...entryOut(updatedEntry), deletedAt: updatedEntry.deletedAt.toISOString() }
+        : undefined;
       const serverAt = new Date();
       const customer = await Customer.findOne({
         shopId,
@@ -532,6 +655,7 @@ export async function resolveFinancialConflict({
             previous,
             proposed: input.proposed,
             selected,
+            ...(selectedDeleted ? { selectedDeleted } : {}),
             previousVersion: actualVersion,
             resultingVersion,
             previousResolutionVersion: actualResolutionVersion,
@@ -546,6 +670,7 @@ export async function resolveFinancialConflict({
       );
       response = {
         entry: selected,
+        ...(selectedDeleted ? { deletedEntry: selectedDeleted } : {}),
         serverVersion: resultingVersion,
         resolutionVersion: resultingResolutionVersion,
         resolutionId: input.resolutionId,

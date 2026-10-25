@@ -27,7 +27,7 @@ test('session restoration accepts lifecycle activity returned by the actual acti
     const restored = await api.restoreSession();
     assert.equal(validBackup(restored), true, 'startup must accept a lifecycle audit without financial snapshot fields');
     assert.equal(restored.audit[0].customerLifecycle.newStatus, 'disabled');
-    assert.deepEqual(calls, ['/auth/refresh', '/bootstrap', '/customers', '/ledger', '/activity']);
+    assert.deepEqual(calls, ['/auth/refresh', '/bootstrap', '/customers', '/ledger', '/activity', '/ledger/deleted']);
   } finally { [Audit.find, FinancialResolution.find] = original; }
 });
 

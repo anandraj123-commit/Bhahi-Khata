@@ -41,6 +41,7 @@ export type Entry = {
   addedToAdvance?: number;
   advanceApplied?: number;
 };
+export type DeletedEntry = Entry & { deletedAt: string };
 export type Shop = {
   serverVersion?: number;
   resolutionVersion?: number;
@@ -81,6 +82,8 @@ export type Data = {
   shopComplete?: boolean;
   customers: Customer[];
   entries: Entry[];
+  /** Account-scoped tombstones cached for offline restoration. */
+  deletedEntries?: DeletedEntry[];
   audit: Audit[];
   signedIn: boolean;
   language: string;
@@ -105,6 +108,7 @@ export const initialData: Data = {
   shopComplete: false,
   customers: [],
   entries: [],
+  deletedEntries: [],
   audit: [],
   signedIn: false,
   language: "English",
@@ -382,6 +386,15 @@ export function validBackup(value: unknown): value is Data {
         typeof e.method === "string",
     ) &&
     new Set(d.entries.map((e) => e.id)).size === d.entries.length &&
+    (d.deletedEntries === undefined || (
+      Array.isArray(d.deletedEntries) &&
+      d.deletedEntries.every((e) => typeof e.id === "string" && d.customers.some((c) => c.id === e.customerId) &&
+        ["credit", "payment", "refund"].includes(e.type) && Number.isFinite(e.amount) && e.amount >= 0.01 && e.amount <= 1e9 &&
+        isDate(e.date) && typeof e.note === "string" && typeof e.method === "string" &&
+        typeof e.deletedAt === "string" && Number.isFinite(Date.parse(e.deletedAt))) &&
+      new Set(d.deletedEntries.map((e) => e.id)).size === d.deletedEntries.length &&
+      d.deletedEntries.every((e) => !d.entries.some((active) => active.id === e.id))
+    )) &&
     Array.isArray(d.audit) &&
     d.audit.every(
       (a) =>
