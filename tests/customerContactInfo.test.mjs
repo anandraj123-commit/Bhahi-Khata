@@ -156,3 +156,11 @@ test('all three equal buttons stay in one row with bounded labels on narrow scre
     }
   }
 });
+
+test('compact contact actions remain visible but disabled when customer contact values are missing or invalid', () => {
+  const missing = rows({ customer: { phone: '', whatsappNumber: '', address: '' }, compact: true });
+  assert.equal(missing.length, 3);
+  assert.deepEqual(missing.map((button) => button.props.accessibilityState.disabled), [true, true, true]);
+  const invalid = rows({ customer: { phone: '123', whatsappNumber: '9876543210', address: '' }, compact: true });
+  assert.deepEqual(invalid.map((button) => button.props.accessibilityState.disabled), [true, false, true]);
+});

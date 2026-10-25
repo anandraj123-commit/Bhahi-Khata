@@ -11,6 +11,8 @@ import { deviceClockNeedsWarning } from "./src/serverClock";
 import { entryDateTime, formatClockTime, localDateTimeIso, parseClockTime, transactionLabel as entryLabel } from "./src/entryPresentation";
 import { buildTransactionReceipt, authorizeReceiptAccess, receiptAccountIdentity, resolveReceiptAccountId } from "./src/transactionReceipt";
 import { TransactionDetails } from "./src/TransactionDetails";
+import { CustomerAccountStatementActions } from "./src/CustomerAccountStatementActions";
+import { buildCustomerAccountStatement } from "./src/customerAccountStatement";
 import ErrorBoundary from "./src/ErrorBoundary";
 import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import * as Crypto from "expo-crypto";
@@ -324,6 +326,8 @@ const customerDetailsStyles = StyleSheet.create({
   transactionCard: { padding: 12, gap: 8, borderRadius: 12 },
   transactionAvatar: { width: 36, height: 36, borderRadius: 18 },
   transactionHeading: { marginTop: 8 },
+  loadMoreContainer: { alignItems: "stretch", width: "100%", paddingTop: 4 },
+  loadMoreButton: { alignSelf: "stretch", width: "100%", minWidth: 0, minHeight: 48, backgroundColor: "#FACC15", borderColor: "#FACC15" },
   statLabelRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   summaryIcon: { width: 18, height: 18, flexShrink: 0 },
   balanceLabelRow: { flexDirection: "row", alignItems: "center", gap: 8 },
@@ -428,7 +432,7 @@ function AppContent() {
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const writeQueue = useRef<Promise<boolean>>(Promise.resolve(true));
-  const loadTransactionReceipt = useCallback(async (entryId: string) => {
+  const loadAuthenticatedReceiptSnapshot = useCallback(async () => {
     const initialData = dataRef.current;
     const preferredAccountId = offlineAccountRef.current;
     const session = await readOfflineSession().catch((error) => {
@@ -446,9 +450,12 @@ function AppContent() {
       throw new Error("The account session changed. Reopen the transaction.");
     authorizeReceiptAccess(authenticatedData, accountId, session, requireOfflineSession);
     const allowMissingOfflineSession = currentConnectivity() === "online";
-    const snapshot = await readReceiptSnapshot(accountId, { authenticatedData, allowMissingOfflineSession });
-    return buildTransactionReceipt(snapshot, entryId);
+    return readReceiptSnapshot(accountId, { authenticatedData, allowMissingOfflineSession });
   }, []);
+  const loadTransactionReceipt = useCallback(async (entryId: string) =>
+    buildTransactionReceipt(await loadAuthenticatedReceiptSnapshot(), entryId), [loadAuthenticatedReceiptSnapshot]);
+  const loadCustomerAccountStatement = useCallback(async (customerId: string) =>
+    buildCustomerAccountStatement(await loadAuthenticatedReceiptSnapshot(), customerId), [loadAuthenticatedReceiptSnapshot]);
   const [route, setRoute] = useState<Route>({ screen: "welcome" });
   const [history, setHistory] = useState<Route[]>([]);
   const [search, setSearch] = useState("");
@@ -545,6 +552,7 @@ function AppContent() {
     });
   }, [data, route.screen, filter, month, matchingKhataCustomers]);
   const [listPage, setListPage] = useState({ key: "", count: PAGE_SIZE, loading: false });
+  const [customerHistoryPage, setCustomerHistoryPage] = useState({ customerId: "", visibleCount: 10 });
   const listPageRef = useRef({ key: "", count: PAGE_SIZE, total: 0, loading: false });
   const listPageCounts = useRef(new Map<string, number>());
   const listScrollOffsets = useRef(new Map<string, number>());
@@ -577,6 +585,9 @@ function AppContent() {
     customerDragStartOffset.current = 0;
     setListPage({ key: listPageKey, count, loading: false });
   }, [listPageKey, route.screen]);
+  useEffect(() => {
+    if (route.screen === "customer") setCustomerHistoryPage({ customerId: route.id || "", visibleCount: 10 });
+  }, [route.screen, route.id]);
   useEffect(() => {
     if (!customerPagePending) customerPageRequest.current = null;
   }, [customerPagePending, listPage]);
@@ -617,12 +628,12 @@ function AppContent() {
       void loadMoreSubscriptionHistory();
     if (listHasScrolled.current && nearBottom && route.screen === "subscriptionPayments" && subscriptionSnapshot?.paymentsNextCursor)
       void loadMoreSubscriptionPayments();
-    if (route.screen === "customers" || route.screen === "manageCustomers" || route.screen === "khata" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "customer" || route.screen === "customers" || route.screen === "manageCustomers" || route.screen === "khata" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     requestNextVisiblePage();
   };
   const requestNextVisiblePage = () => {
     const current = listPageRef.current;
-    if (route.screen === "khata" || !listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "customer" || route.screen === "khata" || !listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     const nextCount = nextVisibleCount(current.count, current.total);
     if (route.screen === "manageCustomers") {
       if (customerPageRequest.current?.key === current.key) return;
@@ -3879,8 +3890,11 @@ function AppContent() {
       if (customer) {
         const entries = data.entries
           .filter((e) => e.customerId === customer.id)
-          .slice()
-          .sort((a, b) => b.date.localeCompare(a.date));
+          .map((entry, index) => ({ entry, index }))
+          .sort((a, b) => b.entry.date.localeCompare(a.entry.date) || a.index - b.index)
+          .map(({ entry }) => entry);
+        const visibleCount = customerHistoryPage.customerId === customer.id ? customerHistoryPage.visibleCount : 10;
+        const visibleEntries = visiblePage(entries, visibleCount);
         const historyItems: { id: string; element: React.ReactElement }[] = [];
         if (customer.opening > 0)
           historyItems.push({ id: "opening-udhari", element: <Row icon="book-outline" title="Opening Udhari" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.opening))} color={colors.red} /> });
@@ -3888,17 +3902,16 @@ function AppContent() {
           historyItems.push({ id: "opening-advance", element: <Row icon="wallet-outline" title="Opening Advance (जमा राशि)" subtitle={customer.openingDate || customer.createdAt?.slice(0, 10)} value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} /> });
         if (customer.opening > 0 && (customer.openingAdvance || 0) > 0)
           historyItems.push({ id: "opening-adjustment", element: <Row icon="swap-horizontal-outline" title="Opening Advance Adjusted Against Udhari" subtitle={t("Remaining advance: {{amount}}", data.language, { amount: money(Math.max(0, customer.openingAdvance! - customer.opening)) })} value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} /> });
-        historyItems.push(...entries.map((entry) => ({ id: entry.id, element: entryRow(entry, true) })));
-        const transactionPage = pageRecords(historyItems);
+        historyItems.push(...visibleEntries.items.map((entry) => ({ id: entry.id, element: entryRow(entry, true) })));
         const customerFinancial = financialSummary(data, customer.id);
         const currentOutstandingPaise = customerFinancial.outstandingPaise;
         const availableAdvancePaise = customerFinancial.availableAdvancePaise;
         virtualizedRows = {
-          data: transactionPage.items,
+          data: historyItems,
           keyExtractor: (item) => item.id,
           renderItem: (item) => item.element,
           header: <View style={customerDetailsStyles.headerContent}>
-            <CustomerContactInfo customer={customer} />
+            <CustomerContactInfo customer={customer} compact />
             <Card style={[customerDetailsStyles.balanceCard, { backgroundColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].background, borderColor: financialPalette[currentOutstandingPaise > 0 ? "red" : availableAdvancePaise > 0 ? "green" : "neutral"].border }]}>
               <View style={customerDetailsStyles.balanceLabelRow}>
                 <Icon name="wallet-outline" size={18} style={customerDetailsStyles.summaryIcon} color={financialPalette[currentOutstandingPaise > 0 ? "red" : "neutral"].text} />
@@ -3951,6 +3964,7 @@ function AppContent() {
                 </View>
               </View> : null}
             </View>
+            <CustomerAccountStatementActions customerId={customer.id} loadStatement={loadCustomerAccountStatement} />
             <View style={customerDetailsStyles.transactionHeading}>
               <View style={customerDetailsStyles.transactionTitleRow}>
                 <Icon name="time-outline" size={18} style={customerDetailsStyles.summaryIcon} color={colors.dark} />
@@ -3958,7 +3972,19 @@ function AppContent() {
               </View>
             </View>
           </View>,
-          footer: listFooter(transactionPage.hasMore),
+          footer: visibleEntries.hasMore ? <View style={customerDetailsStyles.loadMoreContainer}>
+            <Button
+              icon="reload-outline"
+              title={t("Load More", data.language)}
+              style={customerDetailsStyles.loadMoreButton}
+              iconColor="#B45309"
+              textColor="#92400E"
+              onPress={() => setCustomerHistoryPage((previous) => ({
+                customerId: customer.id,
+                visibleCount: nextVisibleCount(previous.customerId === customer.id ? previous.visibleCount : 10, entries.length, 10),
+              }))}
+            />
+          </View> : null,
           empty: !historyItems.length ? <Empty title="No transactions yet" description="Opening outstanding is included in the outstanding amount." /> : null,
         };
       }

@@ -157,8 +157,9 @@ test('sync API sends WhatsApp values, base records and versions, including expli
   }
 });
 
-test('both customer details views show an honest empty state and the form uses phone keyboard', () => {
+test('customer details use compact contact actions while the profile retains full contact details', () => {
   const source = readFileSync('App.tsx', 'utf8');
-  assert.equal((source.match(/<CustomerContactInfo customer=\{customer\} \/>/g) || []).length, 2);
+  assert.match(source, /case "customer":[\s\S]*?<CustomerContactInfo customer=\{customer\} compact \/>/);
+  assert.match(source, /case "viewCustomer":[\s\S]*?<CustomerContactInfo customer=\{customer\} \/>/);
   assert.match(source, /field\("WhatsApp Number \(Optional\)", "whatsappNumber", \{\s*icon: "logo-whatsapp",\s*keyboardType: "phone-pad"/);
 });

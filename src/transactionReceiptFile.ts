@@ -52,11 +52,11 @@ export function isValidGeneratedPdfBase64(value: unknown): value is string {
     && encoded.startsWith("JVBERi0");
 }
 
-export async function generateTransactionReceiptPdf(receipt: TransactionReceipt): Promise<GeneratedReceiptPdf> {
+export async function generateReceiptPdfFromHtml(html: string): Promise<GeneratedReceiptPdf> {
   let result: Awaited<ReturnType<typeof Print.printToFileAsync>>;
   try {
     result = await Print.printToFileAsync({
-      html: transactionReceiptHtml(receipt), width: 595, height: 842,
+      html, width: 595, height: 842,
       margins: { top: 32, bottom: 32, left: 38, right: 38 },
       // expo-print reads the generated cache file natively and returns the bytes
       // with the URI. This avoids a second Android FileSystem read permission path.
@@ -84,6 +84,10 @@ export async function generateTransactionReceiptPdf(receipt: TransactionReceipt)
   const file = new File(uri);
   logReceiptPdf("pdf-validated", { scheme, ...safeMetadata(file), validation: "expo-print-base64-pdf-header" });
   return { file, base64: result.base64 };
+}
+
+export async function generateTransactionReceiptPdf(receipt: TransactionReceipt): Promise<GeneratedReceiptPdf> {
+  return generateReceiptPdfFromHtml(transactionReceiptHtml(receipt));
 }
 
 /** Write verified bytes to a fresh app-cache path exposed to the native share provider. */

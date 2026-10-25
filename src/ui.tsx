@@ -71,6 +71,7 @@ export function Button({
   style,
   textColor,
   iconColor,
+  accessibilityLabel,
 }: {
   title: string;
   icon?: React.ComponentProps<typeof Ionicons>["name"];
@@ -83,10 +84,12 @@ export function Button({
   style?: StyleProp<ViewStyle>;
   textColor?: string;
   iconColor?: string;
+  accessibilityLabel?: string;
 }) {
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || title}
       accessibilityState={{ disabled: disabled || loading, busy: loading }}
       onPress={onPress}
       disabled={disabled || loading}

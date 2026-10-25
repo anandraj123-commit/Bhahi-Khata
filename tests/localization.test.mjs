@@ -100,7 +100,7 @@ test("Batch 2 translations use each locale's writing system for native-script la
 test("Batch 2 locales contain genuine translations for the complete tracked inventory", () => {
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
-  assert.equal(required.length, 428);
+  assert.equal(required.length, 446);
   for (const locale of ["bn", "mr", "ta", "te", "gu", "pa"]) {
     const dictionary = { ...localeDictionaries[locale], ...customerLifecycleTranslations[locale] };
     const missing = required.filter((key) => !dictionary[key]?.trim() || dictionary[key] === key);
@@ -112,7 +112,7 @@ test("Batch 3 locales contain genuine translations for the complete tracked inve
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
   const batch3Locales = ["kn", "ml", "or", "as", "ur", "ne"];
-  assert.equal(required.length, 428);
+  assert.equal(required.length, 446);
   for (const locale of batch3Locales) {
     const dictionary = { ...localeDictionaries[locale], ...customerLifecycleTranslations[locale] };
     const missing = required.filter((key) =>
@@ -183,10 +183,10 @@ test("Batch 4 initial translation group is unique, placeholder-safe and uses the
   for (const locale of locales) assert.match(localeDictionaries[locale].Customers, scripts[locale]);
 });
 
-test("all 23 locales cover the full 428-key inventory without relying on fallback", () => {
+test("all 23 locales cover the full tracked inventory without relying on fallback", () => {
   const required = [...new Set([...APP_STATIC_TRANSLATION_KEYS, ...APP_RUNTIME_TRANSLATION_KEYS])]
     .filter((key) => key !== "98XXXXXXXX");
-  assert.equal(required.length, 428);
+  assert.equal(required.length, 446);
 
   // Hindi's established dictionary is split between i18n.tsx and translations.ts.
   const hindi = { ...localeDictionaries.hi };
@@ -210,7 +210,7 @@ test("all 23 locales cover the full 428-key inventory without relying on fallbac
       : { ...(locale === "hi" ? hindi : localeDictionaries[locale]), ...(customerLifecycleTranslations[locale] || {}) };
     const unchanged = locale === "en" ? new Set(required) : new Set(["SMS", "WhatsApp"]);
     const coverage = measureTranslationCoverage(required, dictionary, locale, unchanged);
-    assert.equal(coverage.translated, 428, `${locale} translated key count`);
+    assert.equal(coverage.translated, required.length, `${locale} translated key count`);
     assert.deepEqual(coverage.missingKeys, [], `${locale} must not rely on English fallback`);
   }
 });
