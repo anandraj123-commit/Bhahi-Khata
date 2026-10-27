@@ -37,6 +37,17 @@ export type CustomerAccountStatement = {
   transactions: CustomerStatementTransaction[];
   runningBalancesAvailable: boolean;
   queueAvailable: boolean;
+  period?: {
+    month: string;
+    openingBalance: number;
+    closingBalance: number;
+    udhariGiven: number;
+    paymentReceived: number;
+    advanceRefunded: number;
+    transactionFilter?: string;
+    customerSearch?: string;
+    customerCreatedDateFilter?: string;
+  };
 };
 
 const isInactiveEntry = (entry: Entry) => {
@@ -61,6 +72,7 @@ export function buildCustomerAccountStatement(
   snapshot: ReceiptSnapshot,
   customerId: string,
   now = new Date(),
+  options: { transactionFilter?: (entry: Entry) => boolean; includeRunningBalances?: boolean } = {},
 ): CustomerAccountStatement {
   authorizeReceiptAccess(snapshot.data, snapshot.accountId, null, false);
   const customers = snapshot.data.customers.filter((customer) => customer.id === customerId);
@@ -88,16 +100,18 @@ export function buildCustomerAccountStatement(
     opening.remainingAdvance = Math.max(0, openingAdvance - customer.opening);
   }
 
-  const ordered = customerEntries.map((entry, index) => ({ entry, index }))
+  const ordered = customerEntries.filter((entry) => options.transactionFilter?.(entry) ?? true).map((entry, index) => ({ entry, index }))
     .sort((left, right) => left.entry.date.localeCompare(right.entry.date) ||
       (left.entry.recordedAt || `${left.entry.date}T00:00:00.000Z`).localeCompare(right.entry.recordedAt || `${right.entry.date}T00:00:00.000Z`) ||
       left.entry.id.localeCompare(right.entry.id) || left.index - right.index)
     .map(({ entry }) => entry);
   const statementSnapshot: ReceiptSnapshot = { ...snapshot, data };
-  const reconstructed = ordered.map((entry) => reconstructReceiptHistory(statementSnapshot, customer, entry));
-  const runningBalancesAvailable = ordered.length > 0 && reconstructed.every((item) => Boolean(item.history));
+  const reconstructed = options.includeRunningBalances === false
+    ? []
+    : ordered.map((entry) => reconstructReceiptHistory(statementSnapshot, customer, entry));
+  const runningBalancesAvailable = options.includeRunningBalances !== false && ordered.length > 0 && reconstructed.every((item) => Boolean(item.history));
   const transactions = ordered.map((entry, index) => {
-    const history = runningBalancesAvailable ? reconstructed[index].history : undefined;
+    const history = runningBalancesAvailable ? reconstructed[index]?.history : undefined;
     return {
       ...entry,
       label: transactionLabel(entry.type),

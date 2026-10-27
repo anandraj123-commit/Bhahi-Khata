@@ -13,6 +13,8 @@ import { buildTransactionReceipt, authorizeReceiptAccess, receiptAccountIdentity
 import { TransactionDetails } from "./src/TransactionDetails";
 import { CustomerAccountStatementActions } from "./src/CustomerAccountStatementActions";
 import { buildCustomerAccountStatement } from "./src/customerAccountStatement";
+import { MonthlyKhataStatementActions } from "./src/MonthlyKhataStatementActions";
+import { buildMonthlyKhataStatement } from "./src/monthlyKhataStatement";
 import ErrorBoundary from "./src/ErrorBoundary";
 import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import * as Crypto from "expo-crypto";
@@ -334,6 +336,33 @@ const customerDetailsStyles = StyleSheet.create({
   transactionTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
 });
 
+const khataStyles = StyleSheet.create({
+  customerGroup: { gap: 10 },
+  customerCard: { padding: 0, overflow: "hidden" },
+  customerHeader: { padding: 14, gap: 9, backgroundColor: "#F0FDF4", borderBottomWidth: 1, borderBottomColor: "#DCFCE7", borderTopLeftRadius: 12, borderTopRightRadius: 12 },
+  customerHeaderTitle: { color: colors.green, fontSize: 11, lineHeight: 15, fontWeight: "700", letterSpacing: 0.7, textTransform: "uppercase" },
+  section: { padding: 14, gap: 10 },
+  sectionDivider: { height: 1, marginHorizontal: 14, backgroundColor: colors.border },
+  infoRow: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 },
+  customerName: { flexGrow: 1, flexBasis: 100, minWidth: 90, paddingVertical: 2 },
+  customerNameText: { color: colors.dark, fontSize: 19, lineHeight: 25, fontWeight: "700", flexShrink: 1 },
+  contacts: { flexGrow: 2, flexBasis: 190, minWidth: 180 },
+  balanceContent: { gap: 10 },
+  balanceRow: { flexDirection: "row", alignItems: "stretch", gap: 8 },
+  balanceColumn: { flex: 1, minWidth: 0, borderWidth: 1, borderRadius: 10, padding: 10, gap: 4 },
+  balanceLabel: { fontSize: 12, color: colors.muted },
+  balanceValue: { fontSize: 18, lineHeight: 24, fontWeight: "700", flexShrink: 1 },
+  openingDetails: { gap: 5, borderTopWidth: 1, borderColor: colors.border, paddingTop: 8 },
+  openingDetail: { flexDirection: "row", justifyContent: "space-between", gap: 8 },
+  openingDetailLabel: { flex: 1, minWidth: 0, fontSize: 12, color: colors.muted },
+  openingDetailValue: { fontSize: 12, fontWeight: "700", color: colors.dark },
+  summaryRow: { paddingVertical: 5 },
+  historyHeader: { flexDirection: "row", alignItems: "center", gap: 8 },
+  historyRows: { paddingHorizontal: 0 },
+  loadMoreContainer: { width: "100%", alignItems: "stretch", paddingTop: 4 },
+  loadMoreButton: { width: "100%", alignSelf: "stretch", minHeight: 48, backgroundColor: "#FACC15", borderColor: "#FACC15" },
+});
+
 async function scheduleSubscriptionNotifications(
   snapshot: SubscriptionSnapshot,
   accountId: string,
@@ -456,6 +485,8 @@ function AppContent() {
     buildTransactionReceipt(await loadAuthenticatedReceiptSnapshot(), entryId), [loadAuthenticatedReceiptSnapshot]);
   const loadCustomerAccountStatement = useCallback(async (customerId: string) =>
     buildCustomerAccountStatement(await loadAuthenticatedReceiptSnapshot(), customerId), [loadAuthenticatedReceiptSnapshot]);
+  const loadMonthlyKhataStatement = useCallback(async (customerId: string, selectedMonth: string, transactionFilter: string, customerSearch: string, customerCreatedDateFilter: string) =>
+    buildMonthlyKhataStatement(await loadAuthenticatedReceiptSnapshot(), customerId, selectedMonth, new Date(), transactionFilter, customerSearch, customerCreatedDateFilter), [loadAuthenticatedReceiptSnapshot]);
   const [route, setRoute] = useState<Route>({ screen: "welcome" });
   const [history, setHistory] = useState<Route[]>([]);
   const [search, setSearch] = useState("");
@@ -546,9 +577,10 @@ function AppContent() {
   }, [data.customers, route.screen, search, khataCustomerDateFilter, khataCustomerSort]);
   const khataRows = useMemo(() => {
     if (route.screen !== "khata") return [];
-    return matchingKhataCustomers.flatMap((customer) => {
+    return matchingKhataCustomers.map((customer) => {
       const summary = monthly(data, customer.id, month);
-      return khataEntriesForTab(summary.entries, filter, month).map((entry) => ({ customer, summary, entry }));
+      const entries = khataEntriesForTab(summary.entries, filter, month);
+      return { customer, summary, entries };
     });
   }, [data, route.screen, filter, month, matchingKhataCustomers]);
   const [listPage, setListPage] = useState({ key: "", count: PAGE_SIZE, loading: false });
@@ -665,6 +697,9 @@ function AppContent() {
   });
   const [homeRecentLimit, setHomeRecentLimit] = useState(10);
   const [khataCustomerTransactionLimits, setKhataCustomerTransactionLimits] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setKhataCustomerTransactionLimits({});
+  }, [month, data.shop.phone]);
   const [homeCustomerListLimits, setHomeCustomerListLimits] = useState<Record<HomeCustomerListKey, number>>({
     outstanding: 10, udhari: 10, received: 10, recovered: 10,
     availableAdvance: 10, deposited: 10, refunded: 10, customers: 10,
@@ -4330,56 +4365,117 @@ function AppContent() {
       break;
       }
     case "khata": {
-      const groups = new Map<string, { customer: Customer; summary: ReturnType<typeof monthly>; entries: Entry[] }>();
-      for (const row of khataRows) {
-        const group = groups.get(row.customer.id);
-        if (group) group.entries.push(row.entry);
-        else groups.set(row.customer.id, { customer: row.customer, summary: row.summary, entries: [row.entry] });
-      }
       virtualizedRows = {
-        data: [...groups.values()],
+        data: khataRows,
         keyExtractor: (group) => group.customer.id,
         renderItem: ({ customer: c, summary: m, entries }) => {
-          const limitKey = `${month}:${filter}:${search.trim()}:${c.id}`;
+          const accountIdentity = receiptAccountIdentity(data.shop.phone || "");
+          const limitKey = `${accountIdentity}:${month}:${filter}:${search.trim()}:${c.id}`;
           const limit = khataCustomerTransactionLimits[limitKey] || 10;
+          const visibleEntries = entries.slice(-limit);
+          const isActive = isActiveCustomer(c);
+          const hasOpeningDetails = c.opening > 0 || (c.openingAdvance || 0) > 0;
+          const openingAdvance = c.openingAdvance || 0;
+          const openingDisplay = khataBalanceDisplay(m.opening);
+          const closingDisplay = khataBalanceDisplay(m.closing);
           return (
-            <Card>
-              <Pressable accessibilityRole="button" onPress={() => go("statement", c.id)}>
-                <Title>{c.name}</Title>
-                {c.createdAt && formatCustomerCreatedAt(c.createdAt) !== "Not available" ? (
-                  <View style={{ alignSelf: "flex-start", marginTop: 2, marginBottom: 6, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, backgroundColor: colors.greenBg }}>
-                    <Text style={{ fontSize: 10, color: colors.green, fontWeight: "600" }}>{t("Khata Created On", data.language)}: {formatCustomerCreatedAt(c.createdAt)}</Text>
+            <View style={khataStyles.customerGroup}>
+              <Card style={khataStyles.customerCard}>
+                <View style={khataStyles.customerHeader}>
+                <Text style={khataStyles.customerHeaderTitle}>{t("Personal Information", data.language)}</Text>
+                <View style={khataStyles.infoRow}>
+                  <Pressable accessibilityRole="button" onPress={() => go("statement", c.id)} style={khataStyles.customerName}>
+                    <Text style={khataStyles.customerNameText}>{c.name}</Text>
+                    {c.createdAt && formatCustomerCreatedAt(c.createdAt) !== "Not available" ? (
+                      <View style={{ alignSelf: "flex-start", marginTop: 4, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, backgroundColor: colors.greenBg }}>
+                        <Text style={{ fontSize: 10, color: colors.green, fontWeight: "600" }}>{t("Khata Created On", data.language)}: {formatCustomerCreatedAt(c.createdAt)}</Text>
+                      </View>
+                    ) : null}
+                    {!isActive ? <View style={[s.badge, { alignSelf: "flex-start", marginTop: 4, backgroundColor: customerLifecycleState(c) === "removed" ? colors.redBg : colors.neutralBg }]}>
+                      <Text style={{ color: customerLifecycleState(c) === "removed" ? colors.red : colors.neutral, fontWeight: "700" }}>{t(customerLifecycleState(c) === "removed" ? "Removed" : "Disabled", data.language)}</Text>
+                    </View> : null}
+                  </Pressable>
+                  <View style={khataStyles.contacts}><CustomerContactInfo customer={c} compact /></View>
+                </View>
+                </View>
+
+                <View style={khataStyles.sectionDivider} />
+                <View style={[khataStyles.section, khataStyles.balanceContent]}>
+                <Title>{t("Account Balance", data.language)}</Title>
+                <View style={khataStyles.balanceRow}>
+                  <View style={[khataStyles.balanceColumn, { backgroundColor: financialPalette[openingDisplay.tone].background, borderColor: financialPalette[openingDisplay.tone].border }]}>
+                    <Text style={khataStyles.balanceLabel}>{t("Opening Balance", data.language)}</Text>
+                    <Text style={[khataStyles.balanceValue, { color: financialPalette[openingDisplay.tone].text }]}>{money(openingDisplay.amount)}</Text>
+                    {openingDisplay.position !== "Settled" ? <Text style={khataStyles.balanceLabel}>{t(openingDisplay.position === "Advance" ? "Available Advance" : "Outstanding", data.language)}</Text> : null}
                   </View>
-                ) : null}
-                <CustomerContactInfo customer={c} compact />
-                {khataBalanceCard("Opening Balance", m.opening)}
-                <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
-                <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
-                {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
-                {khataBalanceCard("Closing Balance", m.closing)}
-                {entries.slice(0, limit).map((entry: Entry) => (
-                  <Row
-                    key={entry.id}
-                    title={entry.note || entryLabel(entry.type)}
-                    subtitle={entryDateTime(entry, localeTag(data.language))}
-                    value={transactionAmountText(entry, money)}
-                    color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
-                    onPress={() => go("transaction", entry.id)}
-                  />
-                ))}
-              </Pressable>
+                  <View style={[khataStyles.balanceColumn, { backgroundColor: financialPalette[closingDisplay.tone].background, borderColor: financialPalette[closingDisplay.tone].border }]}>
+                    <Text style={khataStyles.balanceLabel}>{t("Closing Balance", data.language)}</Text>
+                    <Text style={[khataStyles.balanceValue, { color: financialPalette[closingDisplay.tone].text }]}>{money(closingDisplay.amount)}</Text>
+                    {closingDisplay.position !== "Settled" ? <Text style={khataStyles.balanceLabel}>{t(closingDisplay.position === "Advance" ? "Available Advance" : "Outstanding", data.language)}</Text> : null}
+                  </View>
+                </View>
+                {hasOpeningDetails ? <View style={khataStyles.openingDetails}>
+                  {c.opening > 0 ? <View style={khataStyles.openingDetail}><Text style={khataStyles.openingDetailLabel}>{t("Opening Udhari", data.language)}</Text><Text style={khataStyles.openingDetailValue}>{money(c.opening)}</Text></View> : null}
+                  {openingAdvance > 0 ? <View style={khataStyles.openingDetail}><Text style={khataStyles.openingDetailLabel}>{t("Opening Advance", data.language)}</Text><Text style={khataStyles.openingDetailValue}>{money(openingAdvance)}</Text></View> : null}
+                  {c.opening > 0 && openingAdvance > 0 ? <>
+                    <View style={khataStyles.openingDetail}><Text style={khataStyles.openingDetailLabel}>{t("Opening Advance Adjusted Against Udhari", data.language)}</Text><Text style={khataStyles.openingDetailValue}>{money(Math.min(c.opening, openingAdvance))}</Text></View>
+                    <View style={khataStyles.openingDetail}><Text style={khataStyles.openingDetailLabel}>{t("Remaining advance: {{amount}}", data.language, { amount: money(Math.max(0, openingAdvance - c.opening)) })}</Text></View>
+                  </> : null}
+                </View> : null}
+                <View style={khataStyles.summaryRow}><Row title="Udhari Given" value={money(m.credit)} color={colors.blue} /></View>
+                <View style={khataStyles.summaryRow}><Row title="Payment Received" value={money(m.payment)} color={colors.green} /></View>
+                {m.refund > 0 ? <View style={khataStyles.summaryRow}><Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} /></View> : null}
+                </View>
+
+                <View style={khataStyles.sectionDivider} />
+                <View style={khataStyles.section}>
+                <View style={khataStyles.historyHeader}>
+                  <Icon name="time-outline" size={18} color={colors.dark} />
+                  <Title>{t("Transaction History", data.language)}</Title>
+                </View>
+                <View style={khataStyles.historyRows}>
+                  {!entries.length ? <Hint>{t("No transactions in this period", data.language)}</Hint> : null}
+                  {visibleEntries.map((entry: Entry) => (
+                    <Row
+                      key={entry.id}
+                      title={entry.note || entryLabel(entry.type)}
+                      subtitle={entryDateTime(entry, localeTag(data.language))}
+                      value={transactionAmountText(entry, money)}
+                      color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
+                      onPress={() => go("transaction", entry.id)}
+                    />
+                  ))}
+                </View>
               {entries.length > limit ? (
-                <Button
-                  icon="chevron-down-circle-outline"
-                  title={t("Load more", data.language)}
-                  style={{ backgroundColor: "#FACC15", borderColor: "#FACC15", marginTop: 8 }}
-                  onPress={() => setKhataCustomerTransactionLimits((previous) => ({
-                    ...previous,
-                    [limitKey]: Math.min((previous[limitKey] || 10) + 10, entries.length),
-                  }))}
-                />
+                <View style={khataStyles.loadMoreContainer}>
+                  <Button
+                    icon="chevron-down-circle-outline"
+                    title={t("Load more", data.language)}
+                    style={khataStyles.loadMoreButton}
+                    iconColor="#B45309"
+                    textColor="#92400E"
+                    onPress={() => setKhataCustomerTransactionLimits((previous) => ({
+                      ...previous,
+                      [limitKey]: Math.min((previous[limitKey] || 10) + 10, entries.length),
+                    }))}
+                  />
+                </View>
               ) : null}
-            </Card>
+                </View>
+
+                <View style={khataStyles.sectionDivider} />
+                <View style={khataStyles.section}>
+                  <MonthlyKhataStatementActions
+                    customerId={c.id}
+                    month={month}
+                    transactionFilter={filter}
+                    customerSearch={search}
+                    customerCreatedDateFilter={khataCustomerDateFilter}
+                    loadStatement={loadMonthlyKhataStatement}
+                  />
+                </View>
+              </Card>
+            </View>
           );
         },
         header: <>
@@ -4441,6 +4537,7 @@ function AppContent() {
             items={["All", "Udhari", "Payment"]}
             value={filter}
             onChange={setFilter}
+            style={{ marginTop: 14 }}
           />
           <Modal
             visible={khataDatePickerVisible}

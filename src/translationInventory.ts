@@ -9,6 +9,7 @@ export const APP_STATIC_TRANSLATION_KEYS = [
   "A network is connected, but the Digital-Khata server could not be reached.",
   "A refund cannot exceed the customer’s available advance.",
   "ACCOUNT",
+  "Account Balance",
   "Account updates and delivery activity",
   "Activation",
   "Active",

@@ -7,12 +7,18 @@ const receipt = loadTs('src/transactionReceipt.ts', { './model': model });
 const lifecycle = loadTs('src/customerLifecycle.ts', { './model': model });
 const presentation = loadTs('src/entryPresentation.ts', { './model': model });
 const locales = loadTs('src/locales.ts');
+const khataPresentation = loadTs('src/khataPresentation.ts');
 const statementModule = loadTs('src/customerAccountStatement.ts', {
   './model': model,
   './customerLifecycle': lifecycle,
   './entryPresentation': presentation,
   './locales': locales,
   './transactionReceipt': receipt,
+});
+const monthlyStatementModule = loadTs('src/monthlyKhataStatement.ts', {
+  './model': model,
+  './customerAccountStatement': statementModule,
+  './khataPresentation': khataPresentation,
 });
 const pdfModule = loadTs('src/customerAccountStatementPdf.ts', {
   './receiptBrand': { receiptBrand: { company: 'Apurva Software Solutions', registration: 'MSME Registered', mobile: '+91 6203253537', whatsapp: '+91 8797044416', email: 'supports@apurvasoftwaresolutions.com', website: 'www.apurvasoftwaresolutions.com' } },
@@ -116,4 +122,116 @@ test('statement filename is safe and ends with PDF extension', () => {
   const statement = statementModule.buildCustomerAccountStatement(snapshot([]), customer.id);
   const filename = pdfModule.safeCustomerStatementFilename(statement);
   assert.match(filename, /^DigitalKhata_Customer_Statement_Asha_Shopper_cust-1\.pdf$/);
+});
+
+test('monthly statement uses the existing monthly selector and exports only one customer and selected month', () => {
+  const opened = { ...customer, opening: 1000, openingAdvance: 100, openingDate: '2026-01-01' };
+  const entries = [
+    entry('sep-credit', 'credit', 500, 0, { date: '2026-09-15', note: 'September' }),
+    entry('oct-credit', 'credit', 3000, 1, { date: '2026-10-10', note: 'October credit' }),
+    entry('oct-payment', 'payment', 2000, 2, { date: '2026-10-15', note: 'October payment' }),
+    entry('nov-credit', 'credit', 900, 3, { date: '2026-11-02', note: 'November' }),
+    entry('other-customer', 'credit', 700, 4, { customerId: 'other-customer', date: '2026-10-12', note: 'Private other customer' }),
+  ];
+  const data = { ...snapshot(entries, { customers: [opened, { ...customer, id: 'other-customer', name: 'Other customer' }] }).data };
+  const monthly = monthlyStatementModule.buildMonthlyKhataStatement(
+    { accountId: '6203253537', data, queue: [] },
+    opened.id,
+    '2026-10',
+    new Date('2026-10-27T12:00:00Z'),
+  );
+  assert.deepEqual(monthly.transactions.map((item) => item.id), ['oct-credit', 'oct-payment']);
+  assert.equal(monthly.period.openingBalance, 1400);
+  assert.equal(monthly.period.udhariGiven, 3000);
+  assert.equal(monthly.period.paymentReceived, 2000);
+  assert.equal(monthly.period.closingBalance, 2400);
+  assert.deepEqual(monthly.opening, { date: '2026-01-01', udhari: 1000, advance: 100, adjustedAgainstUdhari: 100, remainingAdvance: 0 });
+  const html = pdfModule.customerAccountStatementHtml(monthly);
+  assert.match(html, /Monthly Statement/);
+  assert.match(html, /October 2026/);
+  assert.match(html, /2,400\.00/);
+  assert.match(html, /October credit/);
+  assert.match(html, /October payment/);
+  assert.doesNotMatch(html, /September|November|Private other customer/);
+  const filename = pdfModule.safeMonthlyKhataStatementFilename(monthly);
+  assert.match(filename, /^DigitalKhata_Asha_Shopper_2026-10_cust-1\.pdf$/);
+});
+
+test('monthly PDF data is complete beyond visible pagination and omits deleted transactions', () => {
+  const october = Array.from({ length: 250 }, (_, index) => entry(
+    `oct-${String(index).padStart(3, '0')}`, 'credit', 1, index,
+    { date: `2026-10-${String((index % 28) + 1).padStart(2, '0')}`, note: `Oct note ${index}` },
+  ));
+  const deleted = { ...entry('oct-deleted', 'payment', 99, 251, { date: '2026-10-25' }), deletedAt: '2026-10-26T10:00:00.000Z' };
+  const november = entry('nov-outside', 'credit', 1, 252, { date: '2026-11-01' });
+  const data = { ...snapshot([...october, deleted, november]).data, deletedEntries: [deleted] };
+  const statement = monthlyStatementModule.buildMonthlyKhataStatement(
+    { accountId: '6203253537', data, queue: [] }, customer.id, '2026-10', new Date('2026-10-27T12:00:00Z'),
+  );
+  assert.equal(statement.transactions.length, 250);
+  assert.ok(statement.transactions.some((item) => item.id === 'oct-249'));
+  assert.ok(!statement.transactions.some((item) => ['oct-deleted', 'nov-outside'].includes(item.id)));
+  const html = pdfModule.customerAccountStatementHtml(statement);
+  assert.match(html, /Transaction History \(250\)/);
+  assert.match(html, /Oct note 249/);
+  assert.doesNotMatch(html, /oct-deleted|nov-outside/);
+});
+
+test('monthly PDF export reuses All, Udhari, and Payment card filters without recalculating balances', () => {
+  const entries = [
+    entry('oct-credit', 'credit', 300, 0, { date: '2026-10-02' }),
+    entry('oct-payment', 'payment', 100, 1, { date: '2026-10-03' }),
+    entry('oct-refund', 'refund', 25, 2, { date: '2026-10-04' }),
+    entry('nov-credit', 'credit', 500, 3, { date: '2026-11-01' }),
+  ];
+  const receiptSnapshot = snapshot(entries);
+  const all = monthlyStatementModule.buildMonthlyKhataStatement(receiptSnapshot, customer.id, '2026-10', new Date('2026-10-27T12:00:00Z'), 'All');
+  const udhari = monthlyStatementModule.buildMonthlyKhataStatement(receiptSnapshot, customer.id, '2026-10', new Date('2026-10-27T12:00:00Z'), 'Udhari', 'Asha', '2026-01-01');
+  const payment = monthlyStatementModule.buildMonthlyKhataStatement(receiptSnapshot, customer.id, '2026-10', new Date('2026-10-27T12:00:00Z'), 'Payment');
+
+  assert.deepEqual(all.transactions.map(({ id }) => id), ['oct-credit', 'oct-payment', 'oct-refund']);
+  assert.deepEqual(udhari.transactions.map(({ id }) => id), ['oct-credit']);
+  assert.deepEqual(payment.transactions.map(({ id }) => id), ['oct-payment']);
+  for (const statement of [all, udhari, payment]) {
+    assert.equal(statement.period.openingBalance, all.period.openingBalance);
+    assert.equal(statement.period.closingBalance, all.period.closingBalance);
+    assert.equal(statement.period.udhariGiven, all.period.udhariGiven);
+    assert.equal(statement.period.paymentReceived, all.period.paymentReceived);
+  }
+  assert.equal(udhari.period.customerSearch, 'Asha');
+  assert.equal(udhari.period.customerCreatedDateFilter, '2026-01-01');
+  const html = pdfModule.customerAccountStatementHtml(udhari);
+  assert.match(html, /Transaction Filter: Udhari/);
+  assert.match(html, /Customer Search: Asha/);
+  assert.match(html, /Khata Created On: 2026-01-01/);
+  assert.match(html, /Financial balances reflect the full selected-month ledger; transaction history is filtered\./);
+  assert.doesNotMatch(html, /oct-payment|oct-refund|nov-credit/);
+});
+
+test('monthly export is identical before and after Load More because it reads the complete ledger snapshot', () => {
+  const entries = Array.from({ length: 25 }, (_, index) => entry(
+    `oct-${String(index).padStart(2, '0')}`,
+    index % 3 === 0 ? 'payment' : 'credit',
+    index + 1,
+    index,
+    { date: `2026-10-${String((index % 28) + 1).padStart(2, '0')}`, note: `Transaction ${index}` },
+  ));
+  const ledgerSnapshot = snapshot(entries);
+  const filters = ['2026-10', 'Payment', 'Asha', '2026-01-01'];
+  const exportCurrentStatement = () => monthlyStatementModule.buildMonthlyKhataStatement(
+    ledgerSnapshot, customer.id, filters[0], new Date('2026-10-27T12:00:00Z'), filters[1], filters[2], filters[3],
+  );
+
+  const firstPage = entries.slice(-10);
+  const beforeLoadMore = exportCurrentStatement();
+  assert.equal(firstPage.length, 10);
+  assert.equal(beforeLoadMore.transactions.length, 9);
+  assert.ok(beforeLoadMore.transactions.some((item) => item.id === 'oct-00'));
+
+  const expandedPage = entries.slice(-20); // The UI's Load More action reveals the next ten rows.
+  const afterLoadMore = exportCurrentStatement();
+  assert.equal(expandedPage.length, 20);
+  assert.deepEqual(afterLoadMore.transactions, beforeLoadMore.transactions);
+  assert.equal(pdfModule.customerAccountStatementHtml(afterLoadMore), pdfModule.customerAccountStatementHtml(beforeLoadMore));
+  assert.equal(afterLoadMore.transactions.length, 9);
 });
