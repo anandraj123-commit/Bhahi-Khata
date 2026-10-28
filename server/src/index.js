@@ -1,4 +1,4 @@
-import "dotenv/config";
+import "./config/startupGuard.js";
 import mongoose from "mongoose";
 import { env, subscriptionConfig } from "./config/env.js";
 import { log, safeErrorContext } from "./config/logger.js";

@@ -1,6 +1,6 @@
 // Run from server/: node src/admin/scripts/provision.mjs --indexes | --bootstrap
 // Uses the same configured connection lifecycle as the existing backend, never app.listen().
-import "dotenv/config";
+import "../../config/startupGuard.js";
 import mongoose from "mongoose";
 import { connectDatabase } from "../../config/database.js";
 import { Customer } from "../../models.js";

@@ -4,12 +4,18 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.6.0"
   },
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js",
-    "indexes": "node src/index.js --indexes",
+    "dev": "node --env-file=.env.development --import=./src/config/startupGuard.js --watch src/index.js",
+    "start": "npm run start:production",
+    "start:testing": "node --env-file=.env.testing --import=./src/config/startupGuard.js src/index.js",
+    "start:production": "node --env-file=.env.production --import=./src/config/startupGuard.js src/index.js",
+    "indexes": "npm run indexes:development",
+    "indexes:development": "node --env-file=.env.development --import=./src/config/startupGuard.js src/index.js --indexes",
+    "indexes:testing": "node --env-file=.env.testing --import=./src/config/startupGuard.js src/index.js --indexes",
+    "indexes:production": "node --env-file=.env.production --import=./src/config/startupGuard.js src/index.js --indexes",
+    "test:env": "node --test src/config/environment.test.js",
     "test:payments": "node --test src/providers/cashfree.test.js src/services/subscriptionPricing.test.js src/services/cashfreeLifecycle.test.js"
   },
   "dependencies": {

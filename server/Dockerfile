@@ -6,4 +6,4 @@ RUN npm ci --omit=dev
 COPY src ./src
 USER node
 EXPOSE 4000
-CMD ["node", "src/index.js"]
+CMD ["npm", "run", "start:production"]

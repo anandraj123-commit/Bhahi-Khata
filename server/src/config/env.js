@@ -1,22 +1,10 @@
-import "dotenv/config";
-
 export const env = process.env;
-const secret = env.JWT_SECRET;
-if (!secret || secret.length < 32)
-  throw new Error("JWT_SECRET must contain at least 32 characters");
-if (!env.MONGODB_URI) throw new Error("MONGODB_URI is required");
-if (!env.MONGODB_DB_NAME) throw new Error("MONGODB_DB_NAME is required");
-const inferredMode =
-  env.NODE_ENV === "production"
-    ? "production"
-    : env.NODE_ENV === "test"
-      ? "testing"
-      : "development";
-env.APP_MODE ||= inferredMode;
-if (!["development", "testing", "production"].includes(env.APP_MODE))
+const allowedModes = ["development", "testing", "production"];
+if (!allowedModes.includes(env.APP_MODE))
   throw new Error("APP_MODE must be development, testing, or production");
-if (env.APP_MODE === "production" && env.NODE_ENV !== "production")
-  throw new Error("NODE_ENV must be production when APP_MODE=production");
+const expectedNodeEnv = { development: "development", testing: "test", production: "production" }[env.APP_MODE];
+if (env.NODE_ENV !== expectedNodeEnv)
+  throw new Error(`APP_MODE=${env.APP_MODE} requires NODE_ENV=${expectedNodeEnv}`);
 const environmentDatabase = {
   development: "digital_khata_development",
   testing: "digital_khata_testing",
@@ -25,12 +13,39 @@ const environmentDatabase = {
 if (env.MONGODB_DB_NAME !== environmentDatabase)
   throw new Error(`MONGODB_DB_NAME must be ${environmentDatabase} for APP_MODE=${env.APP_MODE}`);
 
+if (!env.MONGODB_URI) throw new Error("MONGODB_URI is required");
+let mongoUri;
+try {
+  mongoUri = new URL(env.MONGODB_URI);
+} catch {
+  throw new Error("MONGODB_URI must be a valid MongoDB connection URI");
+}
+if (!["mongodb:", "mongodb+srv:"].includes(mongoUri.protocol))
+  throw new Error("MONGODB_URI must use mongodb:// or mongodb+srv://");
+let uriDatabase;
+try {
+  uriDatabase = decodeURIComponent(mongoUri.pathname.replace(/^\/+|\/+$/g, ""));
+} catch {
+  throw new Error("MONGODB_URI contains an invalid database path");
+}
+if (uriDatabase && uriDatabase !== environmentDatabase)
+  throw new Error(`MONGODB_URI database path must be ${environmentDatabase} for APP_MODE=${env.APP_MODE}`);
+
+const secret = env.JWT_SECRET;
+if (!secret || secret.length < 32)
+  throw new Error("JWT_SECRET must contain at least 32 characters");
+
 const cashfreeClientId = env.CASHFREE_CLIENT_ID || "";
 const cashfreeClientSecret = env.CASHFREE_CLIENT_SECRET || "";
 const cashfreeWebhookSecret = env.CASHFREE_WEBHOOK_SECRET || "";
 const cashfreeWebhookUrl = env.CASHFREE_WEBHOOK_URL || "";
 const cashfreeApiVersion = env.CASHFREE_API_VERSION || "2026-01-01";
-const cashfreeEnvironment = env.CASHFREE_ENVIRONMENT || "sandbox";
+const expectedCashfreeEnvironment = env.APP_MODE === "production" ? "production" : "sandbox";
+if (!env.CASHFREE_ENVIRONMENT)
+  throw new Error("CASHFREE_ENVIRONMENT is required");
+if (env.CASHFREE_ENVIRONMENT !== expectedCashfreeEnvironment)
+  throw new Error(`APP_MODE=${env.APP_MODE} requires CASHFREE_ENVIRONMENT=${expectedCashfreeEnvironment}`);
+const cashfreeEnvironment = env.CASHFREE_ENVIRONMENT;
 if (!["sandbox", "production"].includes(cashfreeEnvironment))
   throw new Error("CASHFREE_ENVIRONMENT must be sandbox or production");
 if (!/^\d{4}-\d{2}-\d{2}$/.test(cashfreeApiVersion))

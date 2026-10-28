@@ -99,9 +99,7 @@ const orderJoin = () => [
   },
   {
     $match: {
-      "order.appMode":
-        process.env.APP_MODE ||
-        (process.env.NODE_ENV === "production" ? "production" : "development"),
+      "order.appMode": process.env.APP_MODE,
     },
   },
   { $unset: "order" },
@@ -118,7 +116,7 @@ const paymentDetailsJoin = () => [
   },
   {
     $match: {
-      "purchaseOrder.appMode": process.env.APP_MODE || (process.env.NODE_ENV === "production" ? "production" : "development"),
+      "purchaseOrder.appMode": process.env.APP_MODE,
     },
   },
   {

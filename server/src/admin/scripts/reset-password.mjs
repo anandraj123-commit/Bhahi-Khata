@@ -1,7 +1,7 @@
 // Explicit administrator recovery command. Run from server/ after setting
 // ADMIN_RESET_EMAIL and ADMIN_RESET_PASSWORD in protected environment input.
 // Production requires the additional --confirm-production flag.
-import "dotenv/config";
+import "../../config/startupGuard.js";
 import mongoose from "mongoose";
 import { env } from "../../config/env.js";
 import { connectDatabase } from "../../config/database.js";

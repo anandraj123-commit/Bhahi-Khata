@@ -1,5 +1,5 @@
 // Read-only: no model initialization, index creation, or compatibility migration.
-import 'dotenv/config';
+import '../src/config/startupGuard.js';
 import loadTs from '../../tests/helpers/loadTs.cjs';
 import { getBootstrap } from '../src/services/bootstrapService.js';
 import { listActivity } from '../src/services/activityService.js';
