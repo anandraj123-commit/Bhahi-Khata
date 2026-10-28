@@ -15,6 +15,10 @@ import { CustomerAccountStatementActions } from "./src/CustomerAccountStatementA
 import { buildCustomerAccountStatement } from "./src/customerAccountStatement";
 import { MonthlyKhataStatementActions } from "./src/MonthlyKhataStatementActions";
 import { buildMonthlyKhataStatement } from "./src/monthlyKhataStatement";
+import { DownloadReportActions } from "./src/DownloadReportActions";
+import { ReportDatePicker } from "./src/ReportDatePicker";
+import { buildDownloadReport, customReportDateState, type DownloadReport, type DownloadReportKind } from "./src/downloadReports";
+import { DOWNLOAD_REPORT_PAGE_SIZE, nextDownloadReportCount, visibleDownloadReportTransactions } from "./src/downloadReportPagination";
 import ErrorBoundary from "./src/ErrorBoundary";
 import React, { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import * as Crypto from "expo-crypto";
@@ -164,6 +168,7 @@ type Screen =
   | "notifications"
   | "reports"
   | "more"
+  | "downloadReports"
   | "profile"
   | "settings"
   | "reminders"
@@ -285,6 +290,7 @@ const titles: Partial<Record<Screen, string>> = {
   notifications: "Notifications",
   reports: "Reports",
   more: "More",
+  downloadReports: "Download Reports",
   profile: "Shop Profile",
   settings: "Settings",
   reminders: "Reminder Settings",
@@ -334,6 +340,17 @@ const customerDetailsStyles = StyleSheet.create({
   summaryIcon: { width: 18, height: 18, flexShrink: 0 },
   balanceLabelRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   transactionTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+});
+
+const statementStyles = StyleSheet.create({
+  accountCard: { gap: 12, borderColor: colors.greenBorder, backgroundColor: "#FCFFFD" },
+  balanceRow: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
+  balanceCell: { flex: 1, minWidth: 135, borderWidth: 1, borderRadius: 10, padding: 12, gap: 5 },
+  balanceLabel: { color: colors.muted, fontSize: 12, fontWeight: "600" },
+  balanceAmount: { fontSize: 20, lineHeight: 26, fontWeight: "800", flexShrink: 1 },
+  balancePosition: { fontSize: 12, fontWeight: "600" },
+  sectionCard: { gap: 10 },
+  loadMore: { width: "100%", alignSelf: "stretch", minHeight: 48, backgroundColor: "#FACC15", borderColor: "#FACC15" },
 });
 
 const khataStyles = StyleSheet.create({
@@ -487,6 +504,8 @@ function AppContent() {
     buildCustomerAccountStatement(await loadAuthenticatedReceiptSnapshot(), customerId), [loadAuthenticatedReceiptSnapshot]);
   const loadMonthlyKhataStatement = useCallback(async (customerId: string, selectedMonth: string, transactionFilter: string, customerSearch: string, customerCreatedDateFilter: string) =>
     buildMonthlyKhataStatement(await loadAuthenticatedReceiptSnapshot(), customerId, selectedMonth, new Date(), transactionFilter, customerSearch, customerCreatedDateFilter), [loadAuthenticatedReceiptSnapshot]);
+  const loadDownloadReport = useCallback(async (request: { kind: DownloadReportKind; customerId: string | null; fromDate?: string; toDate?: string }) =>
+    buildDownloadReport(await loadAuthenticatedReceiptSnapshot(), request), [loadAuthenticatedReceiptSnapshot]);
   const [route, setRoute] = useState<Route>({ screen: "welcome" });
   const [history, setHistory] = useState<Route[]>([]);
   const [search, setSearch] = useState("");
@@ -512,6 +531,56 @@ function AppContent() {
   const [customerPagePending, startCustomerPageTransition] = useTransition();
   const customerPageRequest = useRef<{ key: string; count: number } | null>(null);
   const [month, setMonth] = useState(today().slice(0, 7));
+  const [reportCustomerId, setReportCustomerId] = useState<string | null>(null);
+  const [reportCustomerSearch, setReportCustomerSearch] = useState("");
+  const [reportKind, setReportKind] = useState<DownloadReportKind>("all");
+  const [reportKindPickerVisible, setReportKindPickerVisible] = useState(false);
+  const [reportPreview, setReportPreview] = useState<DownloadReport | null>(null);
+  const [reportPreviewLoading, setReportPreviewLoading] = useState(false);
+  const [reportPreviewError, setReportPreviewError] = useState(false);
+  const [reportVisibleCount, setReportVisibleCount] = useState(DOWNLOAD_REPORT_PAGE_SIZE);
+  const reportPreviewRequest = useRef(0);
+  const [reportFromDate, setReportFromDate] = useState("");
+  const [reportToDate, setReportToDate] = useState("");
+  const [reportDatePicker, setReportDatePicker] = useState<"from" | "to" | "">("");
+  useEffect(() => {
+    if (route.screen === "downloadReports") {
+      setReportCustomerId(null);
+      setReportCustomerSearch("");
+      setReportKind("all");
+      setReportKindPickerVisible(false);
+      setReportPreview(null);
+      setReportVisibleCount(DOWNLOAD_REPORT_PAGE_SIZE);
+      setReportFromDate("");
+      setReportToDate("");
+      setReportDatePicker("");
+    }
+  }, [route.screen]);
+  useEffect(() => {
+    if (route.screen !== "downloadReports") return;
+    const requestId = ++reportPreviewRequest.current;
+    setReportVisibleCount(DOWNLOAD_REPORT_PAGE_SIZE);
+    setReportPreview(null);
+    setReportPreviewError(false);
+    const customDateState = reportKind === "custom" ? customReportDateState(reportFromDate, reportToDate) : "valid";
+    if (customDateState !== "valid") {
+      setReportPreviewLoading(false);
+      return;
+    }
+    setReportPreviewLoading(true);
+    void loadDownloadReport({ kind: reportKind, customerId: reportCustomerId,
+      ...(reportKind === "custom" ? { fromDate: reportFromDate, toDate: reportToDate } : {}) })
+      .then((report) => {
+        if (reportPreviewRequest.current === requestId) setReportPreview(report);
+      })
+      .catch(() => {
+        if (reportPreviewRequest.current === requestId) setReportPreviewError(true);
+      })
+      .finally(() => {
+        if (reportPreviewRequest.current === requestId) setReportPreviewLoading(false);
+      });
+    return () => { if (reportPreviewRequest.current === requestId) reportPreviewRequest.current += 1; };
+  }, [route.screen, reportKind, reportCustomerId, reportFromDate, reportToDate, data, loadDownloadReport]);
   const customerFinancialById = useMemo(
     () => new Map(data.customers.map((item) => [item.id, financialSummary(data, item.id)] as const)),
     [data],
@@ -585,6 +654,7 @@ function AppContent() {
   }, [data, route.screen, filter, month, matchingKhataCustomers]);
   const [listPage, setListPage] = useState({ key: "", count: PAGE_SIZE, loading: false });
   const [customerHistoryPage, setCustomerHistoryPage] = useState({ customerId: "", visibleCount: 10 });
+  const [statementHistoryPage, setStatementHistoryPage] = useState({ key: "", visibleCount: 10 });
   const listPageRef = useRef({ key: "", count: PAGE_SIZE, total: 0, loading: false });
   const listPageCounts = useRef(new Map<string, number>());
   const listScrollOffsets = useRef(new Map<string, number>());
@@ -621,6 +691,10 @@ function AppContent() {
     if (route.screen === "customer" || route.screen === "viewCustomer")
       setCustomerHistoryPage({ customerId: route.id || "", visibleCount: 10 });
   }, [route.screen, route.id]);
+  useEffect(() => {
+    if (route.screen === "statement")
+      setStatementHistoryPage({ key: `${route.id || ""}:${month}`, visibleCount: 10 });
+  }, [route.screen, route.id, month]);
   useEffect(() => {
     if (!customerPagePending) customerPageRequest.current = null;
   }, [customerPagePending, listPage]);
@@ -661,12 +735,12 @@ function AppContent() {
       void loadMoreSubscriptionHistory();
     if (listHasScrolled.current && nearBottom && route.screen === "subscriptionPayments" && subscriptionSnapshot?.paymentsNextCursor)
       void loadMoreSubscriptionPayments();
-    if (route.screen === "customer" || route.screen === "customers" || route.screen === "manageCustomers" || route.screen === "khata" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "customer" || route.screen === "customers" || route.screen === "manageCustomers" || route.screen === "khata" || route.screen === "statement" || !listHasScrolled.current || !nearBottom || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     requestNextVisiblePage();
   };
   const requestNextVisiblePage = () => {
     const current = listPageRef.current;
-    if (route.screen === "customer" || route.screen === "khata" || !listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
+    if (route.screen === "customer" || route.screen === "khata" || route.screen === "statement" || !listHasScrolled.current || current.key !== listPageKeyRef.current || current.loading || current.count >= current.total) return;
     const nextCount = nextVisibleCount(current.count, current.total);
     if (route.screen === "manageCustomers") {
       if (customerPageRequest.current?.key === current.key) return;
@@ -2307,18 +2381,6 @@ function AppContent() {
   type FinancialTone = keyof typeof financialPalette;
   const toneForBalance = (amount: number): FinancialTone =>
     amount > 0 ? "red" : amount < 0 ? "green" : "neutral";
-  const khataBalanceCard = (label: string, signedBalance: number) => {
-    const balanceDisplay = khataBalanceDisplay(signedBalance);
-    const palette = financialPalette[balanceDisplay.tone];
-    return (
-      <Card style={{ backgroundColor: palette.background, borderColor: palette.border }}>
-        <Hint style={{ color: palette.text }}>{label}</Hint>
-        <Text style={[s.stat, { color: palette.text }]}>
-          {`${money(balanceDisplay.amount)} ${balanceDisplay.position}`}
-        </Text>
-      </Card>
-    );
-  };
   const stat = (label: string, value: string, tone: FinancialTone = "neutral", compact = false, icon?: React.ComponentProps<typeof Icon>["name"]) => {
     const palette = financialPalette[tone];
     return (
@@ -4647,39 +4709,56 @@ function AppContent() {
     case "statement":
       if (customer) {
         const m = monthly(data, customer.id, month);
-        const statementPage = pageRecords(m.entries);
-        virtualizedRows = {
-          data: statementPage.items,
-          keyExtractor: (entry) => entry.id,
-          renderItem: (e) => (
-            <Row
-              title={e.note || entryLabel(e.type)}
-              subtitle={entryDateTime(e, localeTag(data.language))}
-              value={transactionAmountText(e, money)}
-              color={financialPalette[e.type === "credit" ? "red" : e.type === "refund" ? "amber" : "green"].text}
-              onPress={() => go("transaction", e.id)}
-            />
-          ),
-          header: <>
+        const statementKey = `${customer.id}:${month}`;
+        const visibleCount = statementHistoryPage.key === statementKey ? statementHistoryPage.visibleCount : 10;
+        const deletedIds = new Set((data.deletedEntries || []).map((deleted) => deleted.id));
+        const eligibleEntries = m.entries.filter((entry) => {
+          const record = entry as Entry & { deletedAt?: string | null; voidedAt?: string | null; status?: string };
+          return !deletedIds.has(entry.id) && !record.deletedAt && !record.voidedAt &&
+            record.status !== "deleted" && record.status !== "voided";
+        });
+        const visibleEntries = visiblePage(eligibleEntries, visibleCount);
+        const openingDisplay = khataBalanceDisplay(m.opening);
+        const closingDisplay = khataBalanceDisplay(m.closing);
+        const balancePositionKey = (position: string) =>
+          position === "Advance" ? "Available Advance" : position;
+        content = (
+          <>
             {monthPicker(
               customer.createdAt ? monthForDate(customer.createdAt) : undefined,
               today().slice(0, 7),
             )}
-            <Card>
-              <Title>{data.shop.name}</Title>
-              <Hint>{data.shop.address}</Hint>
-              <Text style={s.rowTitle}>{customer.name}</Text>
+            <Card style={statementStyles.accountCard}>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="wallet-outline" size={18} color={colors.green} />
+                <Title>{t("Account Balance", data.language)}</Title>
+              </View>
+              <Text style={s.rowTitle}>{data.shop.name}</Text>
+              {data.shop.address ? <Hint>{data.shop.address}</Hint> : null}
+              <Text style={[s.rowTitle, { fontSize: 17 }]}>{customer.name}</Text>
               <CustomerContactInfo customer={customer} compact />
-              {khataBalanceCard("Opening Balance", m.opening)}
+              <View style={statementStyles.balanceRow}>
+                {([
+                  [t("Opening Balance", data.language), openingDisplay],
+                  [t("Closing Balance", data.language), closingDisplay],
+                ] as const).map(([label, display]) => {
+                  const palette = financialPalette[display.tone];
+                  return <View key={label} style={[statementStyles.balanceCell, { backgroundColor: palette.background, borderColor: palette.border }]}>
+                    <Text style={statementStyles.balanceLabel}>{label}</Text>
+                    <Text style={[statementStyles.balanceAmount, { color: palette.text }]}>{money(display.amount)}</Text>
+                    <Text style={[statementStyles.balancePosition, { color: palette.text }]}>{t(balancePositionKey(display.position), data.language)}</Text>
+                  </View>;
+                })}
+              </View>
             </Card>
-          </>,
-          footer: <>
-            {listFooter(statementPage.hasMore)}
-            <Card>
-              <Row title="Udhari Given" value={money(m.credit)} color={colors.blue} />
-              <Row title="Payment Received" value={money(m.payment)} color={colors.green} />
-              {m.refund > 0 && <Row title="Advance Refunded" value={money(m.refund)} color={colors.orange} />}
-              {khataBalanceCard("Closing Balance", m.closing)}
+            <Card style={statementStyles.sectionCard}>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="stats-chart-outline" size={18} color={colors.blue} />
+                <Title>{t("Financial Information", data.language)}</Title>
+              </View>
+              <Row icon="arrow-up-outline" title="Udhari Given" value={money(m.credit)} color={colors.blue} />
+              <Row icon="arrow-down-outline" title="Payment Received" value={money(m.payment)} color={colors.green} />
+              {m.refund > 0 ? <Row icon="return-down-back-outline" title="Advance Refunded" value={money(m.refund)} color={colors.orange} /> : null}
               <Hint>
                 Opening Balance = Previous Period’s Closing Balance. For the first recorded period, the original opening position is Opening Outstanding − Opening Advance; those amounts are included in that period’s activity.
               </Hint>
@@ -4689,25 +4768,45 @@ function AppContent() {
               <Hint>
                 Current Outstanding = MAX(0, Closing Balance). Available Advance = MAX(0, −Closing Balance).
               </Hint>
+              <MonthlyKhataStatementActions
+                customerId={customer.id}
+                month={month}
+                transactionFilter="All"
+                customerSearch=""
+                customerCreatedDateFilter=""
+                loadStatement={loadMonthlyKhataStatement}
+              />
             </Card>
-            <Button
-              icon="logo-whatsapp"
-              title="WhatsApp / SMS Share"
-              onPress={() => go("share", customer.id)}
-            />
-            <Button
-              icon="share-outline"
-              title="Share Statement"
-              secondary
-              onPress={() => {
-                Share.share({ message: statementText(customer.id) }).catch(() =>
-                  Alert.alert("Unable to share", "Please try again."),
-                );
-              }}
-            />
-          </>,
-          empty: !statementPage.items.length ? <Empty title="No transactions in this period" description="The opening and closing balances still reflect the full selected period." /> : null,
-        };
+            <Card style={statementStyles.sectionCard}>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="time-outline" size={18} color={colors.dark} />
+                <Title>{t("Transaction History", data.language)}</Title>
+              </View>
+              {!eligibleEntries.length ? <Hint>{t("No transactions in this period", data.language)}</Hint> : null}
+              {visibleEntries.items.map((entry) => (
+                <Row
+                  key={entry.id}
+                  title={entryLabel(entry.type)}
+                  subtitle={`${entryDateTime(entry, localeTag(data.language))}${entry.note?.trim() ? ` · ${entry.note.trim()}` : ""}`}
+                  value={transactionAmountText(entry, money)}
+                  color={financialPalette[entry.type === "credit" ? "red" : entry.type === "refund" ? "amber" : "green"].text}
+                  onPress={() => go("transaction", entry.id)}
+                />
+              ))}
+              {visibleEntries.hasMore ? <Button
+                icon="reload-outline"
+                title={t("Load More", data.language)}
+                style={statementStyles.loadMore}
+                iconColor="#B45309"
+                textColor="#92400E"
+                onPress={() => setStatementHistoryPage((previous) => ({
+                  key: statementKey,
+                  visibleCount: nextVisibleCount(previous.key === statementKey ? previous.visibleCount : 10, eligibleEntries.length, 10),
+                }))}
+              /> : null}
+            </Card>
+          </>
+        );
       }
       break;
     case "share":
@@ -4884,6 +4983,7 @@ function AppContent() {
           </Card>
           {(
             [
+              "downloadReports",
               "profile",
               "manageCustomers",
               "reports",
@@ -4898,8 +4998,8 @@ function AppContent() {
           ).map((screen) => (
             <Row
               key={screen}
-              title={titles[screen] || screen}
-              icon={screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "notifications" ? "notifications-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "referral" ? "gift-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
+              title={screen === "downloadReports" ? t("Download", data.language) : titles[screen] || screen}
+              icon={screen === "downloadReports" ? "download-outline" : screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "notifications" ? "notifications-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "referral" ? "gift-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
               onPress={() => go(screen)}
             />
           ))}
@@ -4907,6 +5007,91 @@ function AppContent() {
         </>
       );
       break;
+    case "downloadReports": {
+      const query = reportCustomerSearch.trim().toLocaleLowerCase();
+      const customerDisplayName = (item: Customer) => {
+        const sameName = data.customers.filter((candidate) => candidate.name.trim().toLocaleLowerCase() === item.name.trim().toLocaleLowerCase());
+        if (sameName.length < 2) return item.name;
+        return `${item.name} · ${item.phone || formatCustomerCreatedOn(item.createdAt) || item.id.slice(0, 8)}`;
+      };
+      const reportCustomerMatches = data.customers.filter((item) => !query ||
+        [item.name, item.phone, item.address, (item.createdAt || "").slice(0, 10)].some((value) => value.toLocaleLowerCase().includes(query)))
+        .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) || left.id.localeCompare(right.id));
+      const customDateState = reportKind === "custom" ? customReportDateState(reportFromDate, reportToDate) : "valid";
+      const customDatesIncomplete = reportKind === "custom" && customDateState === "incomplete";
+      const customRangeInvalid = reportKind === "custom" && (customDateState === "invalid" || customDateState === "invalidOrder");
+      const reportKinds: { kind: DownloadReportKind; icon: React.ComponentProps<typeof Icon>["name"]; title: string }[] = [
+        { kind: "all", icon: "list-outline", title: t("All Transactions", data.language) },
+        { kind: "today", icon: "today-outline", title: t("Today", data.language) },
+        { kind: "thisMonth", icon: "calendar-outline", title: t("This Month", data.language) },
+        { kind: "lastMonth", icon: "calendar-clear-outline", title: t("Last Month", data.language) },
+        { kind: "custom", icon: "calendar-outline", title: t("Custom Date Range", data.language) },
+      ];
+      const activeReportKind = reportKinds.find((item) => item.kind === reportKind)!;
+      const visibleReportTransactions = reportPreview ? visibleDownloadReportTransactions(reportPreview.transactions, reportVisibleCount) : [];
+      const reportCustomerSelection = reportCustomerId
+        ? data.customers.find((item) => item.id === reportCustomerId)
+        : undefined;
+      const reportActions = reportPreview && reportPreview.transactions.length > 0 && !reportPreviewLoading && !customRangeInvalid && !customDatesIncomplete
+        ? <DownloadReportActions kind={reportKind} customerId={reportCustomerId} fromDate={reportFromDate} toDate={reportToDate} loadReport={loadDownloadReport} onReportLoaded={(freshReport) => {
+          setReportPreview(freshReport);
+          setReportVisibleCount((count) => Math.min(count, freshReport.transactions.length));
+        }} />
+        : null;
+      content = <>
+        <Card style={{ gap: 10, borderColor: colors.blueBorder, backgroundColor: "#F8FBFF" }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}><Icon name="people-outline" color={colors.blue} /><Title>{t("Customer Filter", data.language)}</Title></View>
+          <Field label="Search Customer" placeholder="Search Customer" value={reportCustomerSearch} onChangeText={setReportCustomerSearch} autoCapitalize="none" />
+          <Row icon="people-outline" title={t("All Customers", data.language)} value={reportCustomerId === null ? t("Selected", data.language) : undefined} onPress={() => setReportCustomerId(null)} />
+          {reportCustomerSelection ? <Row icon="person-outline" title={customerDisplayName(reportCustomerSelection)} value={t("Selected", data.language)} onPress={() => setReportCustomerId(null)} /> : null}
+          {query ? (reportCustomerMatches.length ? <View style={{ maxHeight: 220 }}><ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled">{reportCustomerMatches.map((item) => <Row key={item.id} icon={item.id === reportCustomerId ? "checkmark-circle" : "person-outline"} title={customerDisplayName(item)} value={item.phone || formatCustomerCreatedOn(item.createdAt) || t("Not added", data.language)} onPress={() => { setReportCustomerId(item.id); setReportCustomerSearch(""); }} />)}</ScrollView></View> : <Hint>{t("No customers found", data.language)}</Hint>) : null}
+        </Card>
+        <Card style={{ gap: 10, borderColor: colors.greenBorder }}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}><Icon name="options-outline" color={colors.green} /><Title>{t("Select Report Type", data.language)}</Title></View>
+          <Button icon={activeReportKind.icon} title={activeReportKind.title} secondary onPress={() => setReportKindPickerVisible(true)} accessibilityLabel={t("Select Report Type", data.language)} />
+          {reportKind === "custom" ? <>
+            <View style={{ flexDirection: "row", gap: 10 }}>
+              <View style={{ flex: 1 }}><Text style={{ color: colors.muted, fontSize: 12, fontWeight: "600", marginBottom: 5 }}>{t("From Date", data.language)}</Text><Button icon="calendar-outline" title={reportFromDate ? new Date(`${reportFromDate}T12:00:00`).toLocaleDateString(localeTag(data.language)) : "DD/MM/YYYY"} secondary onPress={() => setReportDatePicker("from")} /></View>
+              <View style={{ flex: 1 }}><Text style={{ color: colors.muted, fontSize: 12, fontWeight: "600", marginBottom: 5 }}>{t("To Date", data.language)}</Text><Button icon="calendar-outline" title={reportToDate ? new Date(`${reportToDate}T12:00:00`).toLocaleDateString(localeTag(data.language)) : "DD/MM/YYYY"} secondary onPress={() => setReportDatePicker("to")} /></View>
+            </View>
+            {reportFromDate || reportToDate ? <Button icon="close-circle-outline" title={t("Clear Date Range", data.language)} secondary onPress={() => { setReportFromDate(""); setReportToDate(""); }} /> : null}
+            {customRangeInvalid ? <Hint style={{ color: colors.red }}>{customDateState === "invalidOrder" ? t("From Date cannot be later than To Date.", data.language) : t("Invalid date range.", data.language)}</Hint> : null}
+          </> : null}
+        </Card>
+        <Card style={{ gap: 10, borderColor: colors.blueBorder }}>
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 1 }}><Icon name="receipt-outline" color={colors.blue} /><Title>{t("Transaction History", data.language)}</Title></View>
+            {!customRangeInvalid && !customDatesIncomplete && reportPreview ? <Hint style={{ fontWeight: "700", color: colors.dark }}>{t("Total Transactions: {{count}}", data.language, { count: reportPreview.transactions.length })}</Hint> : null}
+          </View>
+          {!customDatesIncomplete && !customRangeInvalid && reportPreviewLoading ? <View style={{ alignItems: "center", paddingVertical: 24, gap: 8 }}><ActivityIndicator color={colors.blue} /><Hint>{t("Loading Transactions", data.language)}</Hint></View> : null}
+          {!customDatesIncomplete && !customRangeInvalid && !reportPreviewLoading && reportPreviewError ? <View style={{ alignItems: "center", paddingVertical: 20, gap: 6 }}><Icon name="alert-circle-outline" color={colors.orange} size={28} /><Hint>{t("Unable to load transactions.", data.language)}</Hint></View> : null}
+          {customDatesIncomplete ? <Hint style={{ textAlign: "center", paddingVertical: 18 }}>{t("Select From Date and To Date to view transactions.", data.language)}</Hint> : null}
+          {!customDatesIncomplete && !customRangeInvalid && !reportPreviewLoading && !reportPreviewError && reportPreview?.transactions.length === 0 ? <View style={{ alignItems: "center", paddingVertical: 24, gap: 8 }}><Icon name="file-tray-outline" color={colors.muted} size={34} /><Text style={{ color: colors.dark, fontSize: 16, fontWeight: "800" }}>{t("No Transactions Found", data.language)}</Text><Hint style={{ textAlign: "center" }}>{t("No transactions are available for the selected customer and period.", data.language)}</Hint></View> : null}
+          {!customDatesIncomplete && !customRangeInvalid && !reportPreviewLoading && !reportPreviewError ? visibleReportTransactions.map((entry) => <View key={entry.id} style={{ borderWidth: 1, borderColor: colors.border, borderRadius: 12, backgroundColor: "#FFFFFF", padding: 12, gap: 7 }}>
+            {reportCustomerId === null ? <Text style={{ color: colors.dark, fontSize: 14, fontWeight: "800" }}>{entry.customerName}</Text> : null}
+            <View style={{ flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+              <View style={{ flex: 1, gap: 6 }}><TransactionTypeBadge label={entry.label} compact /><Text style={{ color: colors.muted, fontSize: 12 }}>{entry.displayDate}</Text></View>
+              <Text style={{ color: entry.type === "credit" ? colors.red : colors.green, fontSize: 16, fontWeight: "800", flexShrink: 0 }}>{formatCurrency(entry.amount, data.language)}</Text>
+            </View>
+            {entry.note?.trim() ? <Text style={{ color: colors.muted, fontSize: 13, lineHeight: 18 }}>{entry.note.trim()}</Text> : null}
+            {entry.syncState === "pending" || entry.syncState === "failed" || entry.syncState === "conflict" ? <Hint style={{ color: entry.syncState === "conflict" ? colors.orange : colors.muted }}>{t(entry.syncState === "pending" ? "Pending Sync" : entry.syncState === "failed" ? "Sync Failed" : "Conflict", data.language)}</Hint> : null}
+          </View>) : null}
+          {!reportPreviewLoading && !customRangeInvalid && !customDatesIncomplete && (reportPreview?.transactions.length || 0) > reportVisibleCount ? <Button icon="chevron-down-outline" title={t("Load More", data.language)} onPress={() => setReportVisibleCount((count) => nextDownloadReportCount(count, reportPreview?.transactions.length || count))} style={{ width: "100%", minHeight: 48, marginTop: 4, backgroundColor: colors.amberBg, borderColor: colors.amberBorder }} textColor={colors.dark} iconColor={colors.orange} /> : null}
+          {reportActions}
+        </Card>
+        <Modal visible={reportKindPickerVisible} transparent animationType="fade" onRequestClose={() => setReportKindPickerVisible(false)}>
+          <Pressable onPress={() => setReportKindPickerVisible(false)} style={{ flex: 1, justifyContent: "center", backgroundColor: "rgba(15,23,42,0.4)", padding: 20 }}>
+            <Pressable onPress={(event) => event.stopPropagation()} style={{ backgroundColor: "white", borderRadius: 16, padding: 16, gap: 8 }}>
+              <Title>{t("Select Report Type", data.language)}</Title>
+              {reportKinds.map(({ kind, icon, title }) => <Row key={kind} icon={icon} title={title} value={kind === reportKind ? t("Selected", data.language) : undefined} onPress={() => { if (kind !== reportKind) { setReportFromDate(""); setReportToDate(""); } setReportKind(kind); setReportKindPickerVisible(false); }} />)}
+              <Button title={t("Cancel", data.language)} secondary onPress={() => setReportKindPickerVisible(false)} />
+            </Pressable>
+          </Pressable>
+        </Modal>
+        <ReportDatePicker visible={reportDatePicker !== ""} value={reportDatePicker === "from" ? reportFromDate : reportToDate} language={data.language} title={reportDatePicker === "from" ? "From Date" : "To Date"} onClose={() => setReportDatePicker("")} onSelect={(date) => { if (reportDatePicker === "from") setReportFromDate(date); else setReportToDate(date); setReportDatePicker(""); }} />
+      </>;
+      break;
+    }
     case "profile":
       content = (
         <>
@@ -5654,7 +5839,9 @@ function AppContent() {
               </Pressable>
             )}
             <Text style={s.heading}>
-              {route.screen === "customer"
+              {route.screen === "downloadReports"
+                ? t("Download Reports", data.language)
+                : route.screen === "customer"
                 ? customer?.name
                 : route.screen === "customerForm" && route.id
                   ? "Edit Customer"

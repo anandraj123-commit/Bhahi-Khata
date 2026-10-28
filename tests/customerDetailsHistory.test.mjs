@@ -5,6 +5,7 @@ import { nextVisibleCount, visiblePage } from "../src/pagination.ts";
 
 const app = readFileSync("App.tsx", "utf8");
 const customerScreen = app.slice(app.indexOf('case "customer":'), app.indexOf('case "viewCustomer":'));
+const statementScreen = app.slice(app.indexOf('case "statement":'), app.indexOf('case "share":', app.indexOf('case "statement":')));
 
 test("customer history displays ten transactions initially and loads the next ten from cached data", () => {
   for (const length of [0, 1, 9, 10, 11, 25]) {
@@ -68,4 +69,39 @@ test("Load More spans the row with a supported loader icon and yellow styling", 
   assert.match(customerScreen, /iconColor="#B45309"\s+textColor="#92400E"/);
   const ionicons = JSON.parse(readFileSync("node_modules/@expo/vector-icons/build/vendor/react-native-vector-icons/glyphmaps/Ionicons.json", "utf8"));
   assert.ok(Object.hasOwn(ionicons, "reload-outline"));
+});
+
+test("Customer Statement is grouped into balance, financial, and transaction-history cards", () => {
+  assert.equal((statementScreen.match(/<Card/g) || []).length, 3);
+  assert.match(statementScreen, /t\("Account Balance", data\.language\)[\s\S]*t\("Opening Balance", data\.language\)[\s\S]*t\("Closing Balance", data\.language\)/);
+  assert.match(statementScreen, /t\("Financial Information", data\.language\)[\s\S]*Udhari Given[\s\S]*Payment Received[\s\S]*Advance Refunded/);
+  assert.match(statementScreen, /t\("Transaction History", data\.language\)[\s\S]*visibleEntries\.items\.map/);
+  assert.match(statementScreen, /<MonthlyKhataStatementActions[\s\S]*transactionFilter="All"[\s\S]*loadStatement=\{loadMonthlyKhataStatement\}/);
+  assert.doesNotMatch(statementScreen, /WhatsApp \/ SMS Share|Share Statement/);
+  assert.match(readFileSync("src/MonthlyKhataStatementActions.tsx", "utf8"), /Download PDF[\s\S]*Share PDF/);
+  assert.match(statementScreen, /entry\.note\?\.trim\(\)/);
+});
+
+test("Customer Statement history uses independent ten-row paging and resets for customer or month changes", () => {
+  assert.match(app, /const \[statementHistoryPage, setStatementHistoryPage\] = useState\(\{ key: "", visibleCount: 10 \}\)/);
+  assert.match(app, /if \(route\.screen === "statement"\)\s*setStatementHistoryPage\(\{ key: `\$\{route\.id \|\| ""\}:\$\{month\}`, visibleCount: 10 \}\);\s*\}, \[route\.screen, route\.id, month\]\)/);
+  assert.match(statementScreen, /const visibleCount = statementHistoryPage\.key === statementKey \? statementHistoryPage\.visibleCount : 10/);
+  assert.match(statementScreen, /visiblePage\(eligibleEntries, visibleCount\)/);
+  assert.match(statementScreen, /visibleEntries\.hasMore \? <Button[\s\S]*title=\{t\("Load More", data\.language\)\}[\s\S]*eligibleEntries\.length, 10\)/);
+  assert.match(app, /loadMore: \{[^}]*backgroundColor: "#FACC15"/);
+  assert.match(app, /route\.screen === "statement" \|\| !listHasScrolled\.current/);
+  for (const length of [0, 9, 10, 11, 26, 500]) {
+    const records = Array.from({ length }, (_, index) => ({ id: `statement-${index}` }));
+    assert.equal(visiblePage(records, 10).items.length, Math.min(length, 10));
+    assert.equal(visiblePage(records, nextVisibleCount(10, length, 10)).items.length, Math.min(length, 20));
+    assert.equal(visiblePage(records, length).hasMore, false);
+  }
+});
+
+test("statement PDF actions use the complete selected-month builder, independent of displayed rows", () => {
+  assert.match(statementScreen, /month=\{month\}/);
+  assert.match(statementScreen, /customerId=\{customer\.id\}/);
+  assert.match(statementScreen, /loadStatement=\{loadMonthlyKhataStatement\}/);
+  assert.match(app, /buildMonthlyKhataStatement\(await loadAuthenticatedReceiptSnapshot\(\), customerId, selectedMonth/);
+  assert.match(app, /buildCustomerAccountStatement\(await loadAuthenticatedReceiptSnapshot\(\), customerId\)/);
 });

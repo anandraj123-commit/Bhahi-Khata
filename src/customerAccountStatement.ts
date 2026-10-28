@@ -57,7 +57,7 @@ const isInactiveEntry = (entry: Entry) => {
   return Boolean(record.deletedAt || record.voidedAt || record.status === "deleted" || record.status === "voided");
 };
 
-function entrySyncState(snapshot: ReceiptSnapshot, entry: Entry): StatementSyncState {
+export function entrySyncState(snapshot: ReceiptSnapshot, entry: Entry): StatementSyncState {
   if (snapshot.queueAvailable === false) return "unknown";
   const operations = snapshot.queue.flatMap(({ state, change }) => change.entries
     .filter((item) => (item.after || item.before)?.id === entry.id)
