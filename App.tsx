@@ -618,7 +618,8 @@ function AppContent() {
     setListPage({ key: listPageKey, count, loading: false });
   }, [listPageKey, route.screen]);
   useEffect(() => {
-    if (route.screen === "customer") setCustomerHistoryPage({ customerId: route.id || "", visibleCount: 10 });
+    if (route.screen === "customer" || route.screen === "viewCustomer")
+      setCustomerHistoryPage({ customerId: route.id || "", visibleCount: 10 });
   }, [route.screen, route.id]);
   useEffect(() => {
     if (!customerPagePending) customerPageRequest.current = null;
@@ -2437,7 +2438,7 @@ function AppContent() {
       </Card>
     );
   };
-  const entryRow = (e: Entry, compact = false, showHomeCustomerDetails = false) => {
+  const entryRow = (e: Entry, compact = false, showHomeCustomerDetails = false, showNote = false) => {
     const customer = data.customers.find((item) => item.id === e.customerId);
     return (
       <Pressable
@@ -2470,7 +2471,10 @@ function AppContent() {
                   <Text style={s.small}>Created on: {entryDateTime(e, localeTag(data.language))}</Text>
                 </View>
               ) : (
-                <Text style={s.small}>{entryDateTime(e, localeTag(data.language))}</Text>
+                <View style={{ gap: 2 }}>
+                  <Text style={s.small}>{entryDateTime(e, localeTag(data.language))}</Text>
+                  {showNote && e.note?.trim() ? <Text style={s.small}>{e.note.trim()}</Text> : null}
+                </View>
               )}
             </View>
             <Text
@@ -4031,8 +4035,23 @@ function AppContent() {
         const advanceTone = customerFinancial.availableAdvancePaise > 0 ? "green" : "neutral";
         const openingBalanceDisplay = khataBalanceDisplay(customer.opening - (customer.openingAdvance || 0));
         const closingBalanceDisplay = khataBalanceDisplay(balance(data, customer.id));
-        content = (
-          <>
+        const deletedIds = new Set((data.deletedEntries || []).map((deleted) => deleted.id));
+        const entries = data.entries
+          .filter((candidate) => {
+            const record = candidate as Entry & { deletedAt?: string | null; voidedAt?: string | null; status?: string };
+            return candidate.customerId === customer.id && !deletedIds.has(candidate.id) &&
+              !record.deletedAt && !record.voidedAt && record.status !== "deleted" && record.status !== "voided";
+          })
+          .map((entry, index) => ({ entry, index }))
+          .sort((a, b) => b.entry.date.localeCompare(a.entry.date) || a.index - b.index)
+          .map(({ entry }) => entry);
+        const visibleCount = customerHistoryPage.customerId === customer.id ? customerHistoryPage.visibleCount : 10;
+        const visibleEntries = visiblePage(entries, visibleCount);
+        virtualizedRows = {
+          data: visibleEntries.items,
+          keyExtractor: (item) => item.id,
+          renderItem: (item) => entryRow(item, true, false, true),
+          header: <View style={customerDetailsStyles.headerContent}>
             <Title>Personal Information</Title>
             <Card>
               <Row icon="person-outline" title="Customer Name" value={customer.name} />
@@ -4057,8 +4076,28 @@ function AppContent() {
               <Row icon="wallet-outline" title="Available Advance" value={money(customerFinancial.availableAdvancePaise / 100)} color={financialPalette[advanceTone].text} />
             </Card>
             <CustomerAccountStatementActions customerId={customer.id} loadStatement={loadCustomerAccountStatement} />
-          </>
-        );
+            <View style={customerDetailsStyles.transactionHeading}>
+              <View style={customerDetailsStyles.transactionTitleRow}>
+                <Icon name="time-outline" size={18} style={customerDetailsStyles.summaryIcon} color={colors.dark} />
+                <Title>{t("Transaction History", data.language)}</Title>
+              </View>
+            </View>
+          </View>,
+          footer: visibleEntries.hasMore ? <View style={customerDetailsStyles.loadMoreContainer}>
+            <Button
+              icon="reload-outline"
+              title={t("Load More", data.language)}
+              style={customerDetailsStyles.loadMoreButton}
+              iconColor="#B45309"
+              textColor="#92400E"
+              onPress={() => setCustomerHistoryPage((previous) => ({
+                customerId: customer.id,
+                visibleCount: nextVisibleCount(previous.customerId === customer.id ? previous.visibleCount : 10, entries.length, 10),
+              }))}
+            />
+          </View> : null,
+          empty: entries.length === 0 ? <Empty title={t("No transactions yet", data.language)} description={t("Opening outstanding is included in the outstanding amount.", data.language)} /> : null,
+        };
       } else {
         content = <Empty title="Customer unavailable" description="This customer is not available in the current shop data." />;
       }
@@ -5637,7 +5676,7 @@ function AppContent() {
               ListHeaderComponent={virtualizedRows.header ? <>{virtualizedRows.header}</> : null}
               ListFooterComponent={virtualizedRows.footer ? <>{virtualizedRows.footer}</> : null}
               ListEmptyComponent={virtualizedRows.empty ? <>{virtualizedRows.empty}</> : null}
-              contentContainerStyle={route.screen === "customer" ? [s.content, customerDetailsStyles.listContent] : s.content}
+              contentContainerStyle={route.screen === "customer" || route.screen === "viewCustomer" ? [s.content, customerDetailsStyles.listContent] : s.content}
               keyboardShouldPersistTaps="handled"
               nestedScrollEnabled
               initialNumToRender={PAGE_SIZE}

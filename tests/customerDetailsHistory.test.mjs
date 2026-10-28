@@ -44,11 +44,21 @@ test("customer history keeps existing newest-first ordering and locally reflects
 
 test("customer changes reset the visible history and explicit Load More is UI-only", () => {
   assert.match(app, /const \[customerHistoryPage, setCustomerHistoryPage\] = useState\(\{ customerId: "", visibleCount: 10 \}\)/);
-  assert.match(app, /if \(route\.screen === "customer"\) setCustomerHistoryPage\(\{ customerId: route\.id \|\| "", visibleCount: 10 \}\);\s*\}, \[route\.screen, route\.id\]\)/);
+  assert.match(app, /if \(route\.screen === "customer" \|\| route\.screen === "viewCustomer"\)\s*setCustomerHistoryPage\(\{ customerId: route\.id \|\| "", visibleCount: 10 \}\);\s*\}, \[route\.screen, route\.id\]\)/);
   assert.match(customerScreen, /const visibleCount = customerHistoryPage\.customerId === customer\.id \? customerHistoryPage\.visibleCount : 10;\s*const visibleEntries = visiblePage\(entries, visibleCount\)/);
   assert.match(customerScreen, /visibleEntries\.hasMore \? <View[\s\S]*?title=\{t\("Load More", data\.language\)\}[\s\S]*?nextVisibleCount\(previous\.customerId === customer\.id \? previous\.visibleCount : 10, entries\.length, 10\)/);
   assert.match(customerScreen, /<CustomerContactInfo customer=\{customer\} compact \/>/);
   assert.doesNotMatch(customerScreen, /pageRecords\(historyItems\)/);
+});
+
+test("View Customer renders its own newest-first history with ten-row Load More pagination", () => {
+  const viewCustomer = app.slice(app.indexOf('case "viewCustomer":'), app.indexOf('case "credit":', app.indexOf('case "viewCustomer":')));
+  assert.match(viewCustomer, /data\.entries[\s\S]*?candidate\.customerId === customer\.id[\s\S]*?\.sort\(\(a, b\) => b\.entry\.date\.localeCompare\(a\.entry\.date\) \|\| a\.index - b\.index\)/);
+  assert.match(viewCustomer, /const visibleCount = customerHistoryPage\.customerId === customer\.id \? customerHistoryPage\.visibleCount : 10/);
+  assert.match(viewCustomer, /data: visibleEntries\.items[\s\S]*?renderItem: \(item\) => entryRow\(item, true, false, true\)/);
+  assert.match(viewCustomer, /<Title>\{t\("Transaction History", data\.language\)\}<\/Title>/);
+  assert.match(viewCustomer, /visibleEntries\.hasMore \? <View[\s\S]*?title=\{t\("Load More", data\.language\)\}[\s\S]*?entries\.length, 10\)/);
+  assert.match(viewCustomer, /<CustomerAccountStatementActions customerId=\{customer\.id\} loadStatement=\{loadCustomerAccountStatement\} \/>/);
 });
 
 test("Load More spans the row with a supported loader icon and yellow styling", () => {

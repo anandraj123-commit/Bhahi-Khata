@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import loadTs from './helpers/loadTs.cjs';
+import { visiblePage } from '../src/pagination.ts';
 
 const model = loadTs('src/model.ts', { 'expo-crypto': { randomUUID: () => 'test-id' } });
 const receipt = loadTs('src/transactionReceipt.ts', { './model': model });
@@ -57,6 +58,27 @@ test('statement exports every active local transaction independently of Customer
     if (count) assert.equal(statement.transactions[0]?.id, 'txn-0000');
     assert.equal(statement.transactions.at(-1)?.id, count ? `txn-${String(count - 1).padStart(4, '0')}` : undefined);
   }
+});
+
+test('View Customer statement and PDF contents are identical before and after Load More', () => {
+  const entries = Array.from({ length: 500 }, (_, index) => entry(
+    `history-${String(index).padStart(3, '0')}`, index % 2 ? 'payment' : 'credit', index + 1, index,
+    { note: `History note ${index}` },
+  ));
+  const localSnapshot = snapshot(entries);
+  const generatedAt = new Date('2026-10-27T12:00:00.000Z');
+  const buildExport = () => statementModule.buildCustomerAccountStatement(
+    localSnapshot, customer.id, generatedAt, { includeRunningBalances: false },
+  );
+
+  assert.equal(visiblePage(entries, 10).items.length, 10);
+  const beforeLoadMore = buildExport();
+  assert.equal(beforeLoadMore.transactions.length, 500);
+  assert.equal(visiblePage(entries, 20).items.length, 20);
+  assert.equal(visiblePage(entries, 70).items.length, 70);
+  const afterLoadMore = buildExport();
+  assert.deepEqual(afterLoadMore, beforeLoadMore);
+  assert.equal(pdfModule.customerAccountStatementHtml(afterLoadMore), pdfModule.customerAccountStatementHtml(beforeLoadMore));
 });
 
 test('financial summary uses the existing selectors and matches the detail-card values including opening advances', () => {
