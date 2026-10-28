@@ -61,6 +61,9 @@ export async function createCashfreeOrder({
         customer_phone: customerPhone,
         ...(customerName ? { customer_name: customerName } : {}),
       },
+      ...(subscriptionConfig.cashfreeWebhookUrl
+        ? { order_meta: { notify_url: subscriptionConfig.cashfreeWebhookUrl } }
+        : {}),
       order_note: "Digital Khata subscription",
     },
   });

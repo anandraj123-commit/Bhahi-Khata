@@ -820,8 +820,23 @@ async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, 
   const existing = await PaymentTransaction.findOne({ gatewayPaymentId: gatewayPayment.id }).session(session);
   if (existing && (String(existing.shopId) !== String(order.shopId) || String(existing.orderId) !== String(order._id)))
     throw serviceError("Payment reference is already attached to another order", 409);
+  if (existing?.status === "captured" && existing.verificationStatus === "verified" && existing.reviewStatus === "duplicate_order_capture") {
+    const activated = await findSubscriptionForPaymentOrder(order, session);
+    const activationPayment = activated?.sourcePaymentId
+      ? await PaymentTransaction.findById(activated.sourcePaymentId).session(session)
+      : null;
+    return {
+      payment: activationPayment?.toObject?.() || activationPayment || existing.toObject(),
+      additionalPayment: true,
+      additionalPaymentId: String(existing._id),
+      repeated: true,
+    };
+  }
   if (existing?.status === "captured" && existing.verificationStatus === "verified")
     return { payment: existing.toObject(), repeated: true };
+  const activatedSubscription = await findSubscriptionForPaymentOrder(order, session);
+  if (activatedSubscription)
+    return recordAdditionalCapturedPayment({ gatewayPayment, order, activatedSubscription, existing, session });
   if (order.walletReservationStatus === "reserved" && order.walletAppliedMinor > 0) {
     const captured = await WalletAccount.updateOne(
       { shopId: order.shopId, reservedMinor: { $gte: order.walletAppliedMinor }, balanceMinor: { $gte: order.walletAppliedMinor } },
@@ -880,6 +895,7 @@ async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, 
         expiresAt,
         durationMonths: order.durationMonths,
         sourcePaymentId: paymentDoc._id,
+        sourcePaymentOrderId: order._id,
         renewalOf: schedule.renewalOf,
         activatedAt: status === "active" ? now : undefined,
         amountPaidMinor: order.totalAmountMinor ?? (order.amountMinor + (order.walletAppliedMinor || 0)),
@@ -908,6 +924,93 @@ async function reconcilePayment({ gatewayPayment, gatewayOrder, order, actorId, 
     { session },
   );
   return { payment: paymentDoc.toObject(), subscription: subscription.toObject(), repeated: false };
+}
+
+/** Resolve both new order-linked activations and legacy payment-linked records. */
+async function findSubscriptionForPaymentOrder(order, session) {
+  const directlyLinked = await ShopSubscription.findOne({ sourcePaymentOrderId: order._id }).session(session);
+  if (directlyLinked) return directlyLinked;
+  const paymentIds = await PaymentTransaction.distinct("_id", {
+    orderId: order._id,
+    status: "captured",
+    verificationStatus: "verified",
+  }).session(session);
+  if (!paymentIds.length) return null;
+  return ShopSubscription.findOne({ sourcePaymentId: { $in: paymentIds } }).session(session);
+}
+
+/** Record a verified extra capture without changing the order's activation. */
+async function recordAdditionalCapturedPayment({ gatewayPayment, order, activatedSubscription, existing, session }) {
+  const now = new Date();
+  const record = {
+    shopId: order.shopId,
+    orderId: order._id,
+    provider: "cashfree",
+    gatewayPaymentId: gatewayPayment.id,
+    gatewayOrderId: gatewayPayment.order_id,
+    amountMinor: gatewayPayment.amount,
+    currency: gatewayPayment.currency,
+    method: gatewayPayment.method,
+    status: "captured",
+    verificationStatus: "verified",
+    reviewStatus: "duplicate_order_capture",
+    reviewReason: "additional_successful_payment_for_paid_order",
+    gatewayCreatedAt: gatewayPayment.created_at
+      ? (typeof gatewayPayment.created_at === "number" ? new Date(gatewayPayment.created_at * 1000) : new Date(gatewayPayment.created_at))
+      : undefined,
+    verifiedAt: now,
+  };
+  let payment = existing;
+  if (payment) {
+    payment.set(record);
+    await payment.save({ session });
+  } else {
+    [payment] = await PaymentTransaction.create([record], { session });
+  }
+  await SubscriptionAuditLog.updateOne(
+    { referenceId: `payment-review:${gatewayPayment.id}` },
+    { $setOnInsert: {
+      shopId: order.shopId,
+      previousPlan: activatedSubscription.planSnapshot || null,
+      newPlan: activatedSubscription.planSnapshot || null,
+      eventType: "payment_review_required",
+      referenceId: `payment-review:${gatewayPayment.id}`,
+      actorType: "gateway",
+      occurredAt: now,
+      metadata: {
+        paymentOrderId: String(order._id),
+        reason: "additional_successful_payment_for_paid_order",
+      },
+    } },
+    { upsert: true, session },
+  );
+  const activationPayment = activatedSubscription.sourcePaymentId
+    ? await PaymentTransaction.findById(activatedSubscription.sourcePaymentId).session(session)
+    : null;
+  return {
+    payment: activationPayment?.toObject?.() || activationPayment || payment.toObject(),
+    additionalPayment: true,
+    additionalPaymentId: String(payment._id),
+    repeated: true,
+  };
+}
+
+async function recordAdditionalCaptureAfterDuplicateKey({ order, gatewayPayment }) {
+  const session = await mongoose.startSession();
+  try {
+    let result = null;
+    await session.withTransaction(async () => {
+      const currentOrder = await PaymentOrder.findById(order._id).session(session);
+      if (!currentOrder) return;
+      const activatedSubscription = await findSubscriptionForPaymentOrder(currentOrder, session);
+      if (!activatedSubscription) return;
+      const existing = await PaymentTransaction.findOne({ gatewayPaymentId: gatewayPayment.id }).session(session);
+      if (existing && (String(existing.shopId) !== String(currentOrder.shopId) || String(existing.orderId) !== String(currentOrder._id)))
+        throw serviceError("Payment reference is already attached to another order", 409);
+      result = await recordAdditionalCapturedPayment({ gatewayPayment, order: currentOrder, activatedSubscription, existing, session });
+    });
+    return result;
+  } finally { await session.endSession(); }
 }
 
 async function releaseWalletReservation(orderId, shopId) {
@@ -942,10 +1045,12 @@ async function activateVerifiedPayment({ shopId, userId, order, gatewayOrder, pa
     await session.withTransaction(async () => {
       const current = await PaymentOrder.findOne({ _id: order._id, shopId }).session(session);
       if (!current) throw serviceError("Payment order not found", 404);
-      if (current.status !== "paid")
+      const committed = current.status === "paid"
+        ? await PaymentTransaction.findOne({ orderId: current._id, gatewayPaymentId: gatewayPayment.id, status: "captured", verificationStatus: "verified" }).session(session)
+        : null;
+      if (current.status !== "paid" || committed?.gatewayPaymentId !== gatewayPayment.id)
         result = await reconcilePayment({ gatewayPayment, gatewayOrder, order: current, actorId: userId || null, session });
       else {
-        const committed = await PaymentTransaction.findOne({ orderId: current._id, status: "captured", verificationStatus: "verified" }).session(session);
         if (!committed) throw serviceError("Paid order has no verified transaction", 409);
         result = { payment: committed.toObject(), repeated: true };
       }
@@ -954,7 +1059,10 @@ async function activateVerifiedPayment({ shopId, userId, order, gatewayOrder, pa
     if (error.code === 11000) {
       const committed = await PaymentTransaction.findOne({ shopId, gatewayPaymentId: gatewayPayment.id, orderId: order._id, status: "captured", verificationStatus: "verified" }).lean();
       if (committed) result = { payment: committed, repeated: true };
-      else throw error;
+      else {
+        result = await recordAdditionalCaptureAfterDuplicateKey({ order, gatewayPayment });
+        if (!result) throw error;
+      }
     } else throw error;
   } finally { await session.endSession(); }
   await notifyPaymentSuccess(shopId, gatewayPayment.id);
@@ -1015,7 +1123,8 @@ export async function getPaymentAttemptStatus({ shopId, idempotencyKey }) {
 }
 
 const paymentReconciliationBackoffMinutes = [1, 5, 15, 60, 240, 720, 1440, 2880];
-const PAYMENT_RECONCILIATION_MAX_ATTEMPTS = paymentReconciliationBackoffMinutes.length;
+const PAYMENT_RECONCILIATION_MAX_ATTEMPTS = subscriptionConfig.paymentReconciliationMaxAttempts;
+const PAYMENT_RECONCILIATION_MAX_AGE_MS = 7 * 86400000;
 
 /** Bounded recovery for paid orders whose app callback and webhook were missed. */
 export async function reconcilePendingCashfreePayments({ limit = 20, now = new Date() } = {}) {
@@ -1024,23 +1133,21 @@ export async function reconcilePendingCashfreePayments({ limit = 20, now = new D
     status: { $in: ["created", "pending"] },
     gatewayOrderId: { $type: "string" },
     $and: [
-      { $or: [
-        { createdAt: { $gte: new Date(now.getTime() - 7 * 86400000) } },
-        { walletReservationStatus: "reserved" },
-      ] },
-      { $or: [
-        { walletReservationStatus: "reserved" },
-        { paymentReconciliationAttempts: { $lt: PAYMENT_RECONCILIATION_MAX_ATTEMPTS } },
-        { paymentReconciliationAttempts: { $exists: false } },
-      ] },
+      { createdAt: { $gte: new Date(now.getTime() - PAYMENT_RECONCILIATION_MAX_AGE_MS) } },
+      {
+        $or: [
+          { paymentReconciliationAttempts: { $lt: PAYMENT_RECONCILIATION_MAX_ATTEMPTS } },
+          { paymentReconciliationAttempts: { $exists: false } },
+        ],
+      },
+      {
+        $or: [
+          { paymentReconciliationNextAt: { $exists: false } },
+          { paymentReconciliationNextAt: null },
+          { paymentReconciliationNextAt: { $lte: now } },
+        ],
+      },
     ],
-    $and: [{
-      $or: [
-        { paymentReconciliationNextAt: { $exists: false } },
-        { paymentReconciliationNextAt: null },
-        { paymentReconciliationNextAt: { $lte: now } },
-      ],
-    }],
   })
     .sort({ paymentReconciliationNextAt: 1, createdAt: 1, _id: 1 })
     .limit(boundedLimit)
@@ -1056,6 +1163,13 @@ export async function reconcilePendingCashfreePayments({ limit = 20, now = new D
         _id: candidate._id,
         status: { $in: ["created", "pending"] },
         $and: [
+          { createdAt: { $gte: new Date(now.getTime() - PAYMENT_RECONCILIATION_MAX_AGE_MS) } },
+          {
+            $or: [
+              { paymentReconciliationAttempts: { $lt: PAYMENT_RECONCILIATION_MAX_ATTEMPTS } },
+              { paymentReconciliationAttempts: { $exists: false } },
+            ],
+          },
           {
             $or: [
               { paymentReconciliationAttempts: attempts },
@@ -1178,10 +1292,12 @@ export async function processPaymentWebhook({ eventId, eventType, orderId, payme
       const duplicateEvent = await mongoose.model("PaymentWebhookEvent").findOne({ eventId }).lean();
       const committed = await PaymentTransaction.findOne({ shopId: order.shopId, gatewayPaymentId: normalized.id, orderId: order._id }).lean();
       if (duplicateEvent?.status === "processed" || committed) return { duplicate: true };
+      const extraCapture = await recordAdditionalCaptureAfterDuplicateKey({ order, gatewayPayment: normalized });
+      if (extraCapture) return { processed: true, additionalPaymentReview: true };
     }
     throw error;
   } finally { await session.endSession(); }
-  if (successEvent && result?.payment) await notifyPaymentSuccess(order.shopId, normalized.id);
+  if (successEvent && result?.payment && !result.additionalPayment) await notifyPaymentSuccess(order.shopId, normalized.id);
   if (failureEvent && result?.failed) await notifyPaymentFailure(order.shopId, normalized.id);
   return result;
 }

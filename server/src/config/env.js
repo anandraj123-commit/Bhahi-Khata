@@ -68,6 +68,9 @@ const checkoutEnabled = checkoutRequested && (cashfreeEnvironment !== "productio
 const taxBps = Number(env.SUBSCRIPTION_TAX_BPS || 0);
 if (!Number.isInteger(taxBps) || taxBps < 0 || taxBps > 10000)
   throw new Error("SUBSCRIPTION_TAX_BPS must be an integer from 0 to 10000");
+const paymentReconciliationMaxAttempts = Number(env.PAYMENT_RECONCILIATION_MAX_ATTEMPTS || 8);
+if (!Number.isSafeInteger(paymentReconciliationMaxAttempts) || paymentReconciliationMaxAttempts < 1 || paymentReconciliationMaxAttempts > 32)
+  throw new Error("PAYMENT_RECONCILIATION_MAX_ATTEMPTS must be an integer from 1 to 32");
 if (env.SUBSCRIPTION_TAX_INCLUSIVE !== undefined && !["true", "false"].includes(env.SUBSCRIPTION_TAX_INCLUSIVE))
   throw new Error("SUBSCRIPTION_TAX_INCLUSIVE must be true or false");
 if (env.SUBSCRIPTION_REMINDER_TIME && !/^([01]\d|2[0-3]):[0-5]\d$/.test(env.SUBSCRIPTION_REMINDER_TIME))
@@ -88,6 +91,7 @@ export const subscriptionConfig = Object.freeze({
   cashfreeLivePaymentsApproved,
   taxBps,
   taxInclusive: env.SUBSCRIPTION_TAX_INCLUSIVE === "true",
+  paymentReconciliationMaxAttempts,
   pushEnabled: env.SUBSCRIPTION_PUSH_ENABLED === "true",
   reminderTime: env.SUBSCRIPTION_REMINDER_TIME || "10:00",
   reminderTimezone,

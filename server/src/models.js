@@ -314,6 +314,9 @@ export const ShopSubscription = mongoose.model(
       durationMonths: { type: Number, default: 0 },
       amountPaidMinor: { type: Number, min: 0 },
       sourcePaymentId: { type: Schema.Types.ObjectId },
+      // Durable order-level idempotency. Older subscription records omit this
+      // field and remain valid; new paid activations always set it.
+      sourcePaymentOrderId: { type: Schema.Types.ObjectId, immutable: true },
       scheduledStartAt: Date,
       renewalOf: { type: Schema.Types.ObjectId },
       activatedAt: Date,
@@ -324,6 +327,7 @@ export const ShopSubscription = mongoose.model(
 ShopSubscription.schema.index({ shopId: 1, startsAt: -1, _id: -1 });
 ShopSubscription.schema.index({ shopId: 1, status: 1, startsAt: 1, expiresAt: 1 });
 ShopSubscription.schema.index({ sourcePaymentId: 1 }, { unique: true, sparse: true });
+ShopSubscription.schema.index({ sourcePaymentOrderId: 1 }, { unique: true, sparse: true });
 
 export const PaymentOrder = mongoose.model(
   "PaymentOrder",
@@ -385,6 +389,8 @@ export const PaymentTransaction = mongoose.model(
       method: String,
       status: { type: String, enum: ["captured", "failed", "refunded", "partially_refunded", "pending"], required: true },
       verificationStatus: { type: String, enum: ["verified", "unverified"], required: true },
+      reviewStatus: { type: String, enum: ["none", "duplicate_order_capture"], default: "none" },
+      reviewReason: { type: String, enum: ["additional_successful_payment_for_paid_order"] },
       refundedAmountMinor: { type: Number, min: 0, default: 0 },
       refundReferences: { type: [String], default: [] },
       gatewayCreatedAt: Date,

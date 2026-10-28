@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { after, before, test } from "node:test";
 import { createServer } from "node:http";
 
@@ -12,6 +13,7 @@ Object.assign(process.env, {
   CASHFREE_API_VERSION: "2026-01-01",
   CASHFREE_CHECKOUT_ENABLED: "false",
   CASHFREE_WEBHOOK_SECRET: "webhook-unit-test-secret",
+  CASHFREE_WEBHOOK_URL: "https://cashfree-webhook.test/api/v1/payments/webhook",
 });
 
 let cashfree;
@@ -57,6 +59,9 @@ test("Cashfree order creation sends only the server-quoted amount and validates 
   assert.equal(sent.url, "https://sandbox.cashfree.com/pg/orders");
   assert.equal(sent.body.order_amount, 199);
   assert.equal(sent.body.order_currency, "INR");
+  assert.deepEqual(sent.body.order_meta, {
+    notify_url: "https://cashfree-webhook.test/api/v1/payments/webhook",
+  });
   assert.equal(sent.options.headers["x-idempotency-key"], "stable-test-key");
   assert.equal(order.paymentSessionId, "session-value");
 
@@ -84,6 +89,48 @@ test("Cashfree webhook route rejects invalid signatures before payment processin
       body: JSON.stringify({ type: "PAYMENT_SUCCESS_WEBHOOK" }),
     });
     assert.equal(response.status, 400);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("Cashfree webhook verifies the signature against the exact raw request body", async () => {
+  globalThis.fetch = originalFetch;
+  const server = createServer(createApp());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    const timestamp = String(Date.now());
+    // Deliberate whitespace ensures the signature is checked against the
+    // original bytes instead of parsed and reserialized JSON.
+    const rawBody = Buffer.from('{\n  "type": "PAYMENT_SUCCESS_WEBHOOK",\n  "data": {"order": {}, "payment": {}}\n}');
+    const signature = createHmac("sha256", process.env.CASHFREE_WEBHOOK_SECRET)
+      .update(timestamp)
+      .update(rawBody)
+      .digest("base64");
+    const endpoint = `http://127.0.0.1:${address.port}/api/v1/payments/webhook`;
+    const valid = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-webhook-timestamp": timestamp,
+        "x-webhook-signature": signature,
+      },
+      body: rawBody,
+    });
+    assert.equal(valid.status, 200);
+    assert.deepEqual(await valid.json(), { received: true, ignored: true });
+
+    const altered = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-webhook-timestamp": timestamp,
+        "x-webhook-signature": signature,
+      },
+      body: Buffer.from(rawBody.toString().replace("  ", " ")),
+    });
+    assert.equal(altered.status, 400);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }

@@ -19,6 +19,7 @@ Object.assign(process.env, {
   SUBSCRIPTION_NATIVE_CHECKOUT_READY: "true",
   SUBSCRIPTION_TAX_BPS: "0",
   SUBSCRIPTION_TAX_INCLUSIVE: "false",
+  PAYMENT_RECONCILIATION_MAX_ATTEMPTS: "8",
 });
 
 let service;
@@ -249,6 +250,41 @@ test("pending and failed Cashfree results do not activate a subscription", async
   assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, status: "captured" }), 0);
 });
 
+test("pending success webhooks and failed payment webhooks never activate subscriptions", async () => {
+  const key = `webhook-non-success-${randomBytes(8).toString("hex")}`;
+  const { order, shop: testShop } = await createOrder(key);
+  const pending = {
+    ...successfulPayment(order.gatewayOrderId, `pending-webhook-${key}`),
+    payment_status: "PENDING",
+  };
+  payments.set(order.gatewayOrderId, { orderStatus: "ACTIVE", items: [pending] });
+  await assert.rejects(
+    service.processPaymentWebhook({
+      eventId: `pending-success-event-${key}`,
+      eventType: "PAYMENT_SUCCESS_WEBHOOK",
+      orderId: order.gatewayOrderId,
+      paymentId: pending.cf_payment_id,
+    }),
+    { status: 503 },
+  );
+
+  const failed = {
+    ...successfulPayment(order.gatewayOrderId, `failed-webhook-${key}`),
+    payment_status: "FAILED",
+  };
+  payments.set(order.gatewayOrderId, { orderStatus: "ACTIVE", items: [failed] });
+  await service.processPaymentWebhook({
+    eventId: `failed-event-${key}`,
+    eventType: "PAYMENT_FAILED_WEBHOOK",
+    orderId: order.gatewayOrderId,
+    paymentId: failed.cf_payment_id,
+  });
+
+  assert.equal(await models.ShopSubscription.countDocuments({ shopId: testShop._id }), 0);
+  assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, status: "captured" }), 0);
+  assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, status: "failed", verificationStatus: "verified" }), 1);
+});
+
 test("signed-event service processing is idempotent across duplicate delivery and failure-before-success", async () => {
   const key = `webhook-${randomBytes(8).toString("hex")}`;
   const { order, shop: testShop } = await createOrder(key);
@@ -268,6 +304,67 @@ test("signed-event service processing is idempotent across duplicate delivery an
   assert.ok(duplicateResults.every((result) => result.payment || result.duplicate));
   assert.equal(await models.ShopSubscription.countDocuments({ sourcePaymentId: { $exists: true }, shopId: testShop._id }), 1);
   assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, gatewayPaymentId: success.cf_payment_id, status: "captured" }), 1);
+});
+
+test("a second distinct successful payment for one order is captured for review without another activation", async () => {
+  const key = `extra-capture-${randomBytes(8).toString("hex")}`;
+  const { order, shop: testShop } = await createOrder(key);
+  const first = successfulPayment(order.gatewayOrderId, `first-${key}`);
+  const second = successfulPayment(order.gatewayOrderId, `second-${key}`);
+  payments.set(order.gatewayOrderId, { orderStatus: "PAID", items: [first, second] });
+
+  await service.processPaymentWebhook({ eventId: `success-event-${key}-1`, eventType: "PAYMENT_SUCCESS_WEBHOOK", orderId: order.gatewayOrderId, paymentId: first.cf_payment_id });
+  const original = await models.PaymentTransaction.findOne({ orderId: order._id, gatewayPaymentId: first.cf_payment_id }).lean();
+  const originalSubscription = await models.ShopSubscription.findOne({ sourcePaymentId: original._id }).lean();
+  await service.processPaymentWebhook({ eventId: `success-event-${key}-2`, eventType: "PAYMENT_SUCCESS_WEBHOOK", orderId: order.gatewayOrderId, paymentId: second.cf_payment_id });
+  await service.processPaymentWebhook({ eventId: `success-event-${key}-2-retry`, eventType: "PAYMENT_SUCCESS_WEBHOOK", orderId: order.gatewayOrderId, paymentId: second.cf_payment_id });
+
+  const extra = await models.PaymentTransaction.findOne({ orderId: order._id, gatewayPaymentId: second.cf_payment_id }).lean();
+  const subscriptions = await models.ShopSubscription.find({ sourcePaymentOrderId: order._id }).lean();
+  assert.equal(subscriptions.length, 1);
+  assert.equal(String(subscriptions[0]._id), String(originalSubscription._id));
+  assert.equal(String(subscriptions[0].sourcePaymentId), String(original._id));
+  assert.equal(extra.status, "captured");
+  assert.equal(extra.verificationStatus, "verified");
+  assert.equal(extra.reviewStatus, "duplicate_order_capture");
+  assert.equal(extra.reviewReason, "additional_successful_payment_for_paid_order");
+  assert.equal(await models.SubscriptionAuditLog.countDocuments({ referenceId: `payment-review:${second.cf_payment_id}` }), 1);
+  assert.equal(await models.ShopSubscription.countDocuments({ shopId: testShop._id }), 1);
+});
+
+test("concurrent distinct success webhooks for one order create one subscription and retain the extra capture for review", async () => {
+  const key = `concurrent-extra-${randomBytes(8).toString("hex")}`;
+  const { order, shop: testShop } = await createOrder(key);
+  const first = successfulPayment(order.gatewayOrderId, `concurrent-first-${key}`);
+  const second = successfulPayment(order.gatewayOrderId, `concurrent-second-${key}`);
+  payments.set(order.gatewayOrderId, { orderStatus: "PAID", items: [first, second] });
+  const results = await Promise.all([
+    service.processPaymentWebhook({ eventId: `success-event-${key}-1`, eventType: "PAYMENT_SUCCESS_WEBHOOK", orderId: order.gatewayOrderId, paymentId: first.cf_payment_id }),
+    service.processPaymentWebhook({ eventId: `success-event-${key}-2`, eventType: "PAYMENT_SUCCESS_WEBHOOK", orderId: order.gatewayOrderId, paymentId: second.cf_payment_id }),
+  ]);
+  assert.equal(results.length, 2);
+  assert.equal(await models.ShopSubscription.countDocuments({ sourcePaymentOrderId: order._id }), 1);
+  assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, status: "captured", verificationStatus: "verified" }), 2);
+  assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, reviewStatus: "duplicate_order_capture" }), 1);
+  assert.equal(await models.ShopSubscription.countDocuments({ shopId: testShop._id }), 1);
+});
+
+test("separate successful payment orders remain valid purchases and renewals", async () => {
+  const key = `separate-orders-${randomBytes(8).toString("hex")}`;
+  const context = await createOrderContext();
+  const first = await createOrder(`${key}-1`, context);
+  payments.set(first.order.gatewayOrderId, { orderStatus: "PAID", items: [successfulPayment(first.order.gatewayOrderId, `separate-first-${key}`)] });
+  await service.verifyPayment({ shopId: context.shop._id, userId: context.user._id, orderId: first.order._id });
+  const firstSubscription = await models.ShopSubscription.findOne({ sourcePaymentOrderId: first.order._id }).lean();
+
+  const second = await createOrder(`${key}-2`, context);
+  payments.set(second.order.gatewayOrderId, { orderStatus: "PAID", items: [successfulPayment(second.order.gatewayOrderId, `separate-second-${key}`)] });
+  await service.verifyPayment({ shopId: context.shop._id, userId: context.user._id, orderId: second.order._id });
+  const secondSubscription = await models.ShopSubscription.findOne({ sourcePaymentOrderId: second.order._id }).lean();
+  assert.ok(secondSubscription);
+  assert.equal(await models.ShopSubscription.countDocuments({ shopId: context.shop._id }), 2);
+  assert.equal(secondSubscription.startsAt.getTime(), firstSubscription.expiresAt.getTime());
+  assert.ok(secondSubscription.expiresAt > firstSubscription.expiresAt);
 });
 
 test("bounded reconciliation recovers a paid order after a transient verification failure", async () => {
@@ -300,6 +397,34 @@ test("bounded reconciliation recovers a paid order after a transient verificatio
   assert.ok(recovered.paid >= 1);
   assert.equal(await models.ShopSubscription.countDocuments({ shopId: testShop._id }), 1);
   assert.equal(await models.PaymentTransaction.countDocuments({ orderId: order._id, status: "captured", verificationStatus: "verified" }), 1);
+});
+
+test("reconciliation enforces maximum attempts and payment age while manual verification remains available", async () => {
+  const key = `bounded-limits-${randomBytes(8).toString("hex")}`;
+  const now = new Date();
+  const exhausted = await createOrder(`${key}-attempts`);
+  const overExhausted = await createOrder(`${key}-over-attempts`);
+  const tooOld = await createOrder(`${key}-age`);
+  const eligible = await createOrder(`${key}-eligible`);
+  await models.PaymentOrder.updateOne({ _id: exhausted.order._id }, { $set: { paymentReconciliationAttempts: 8, paymentReconciliationNextAt: new Date(now.getTime() - 1000) } });
+  await models.PaymentOrder.updateOne({ _id: overExhausted.order._id }, { $set: { paymentReconciliationAttempts: 9, paymentReconciliationNextAt: new Date(now.getTime() - 1000) } });
+  await models.PaymentOrder.collection.updateOne(
+    { _id: tooOld.order._id },
+    { $set: { createdAt: new Date(now.getTime() - 10 * 86400000), paymentReconciliationAttempts: 3, paymentReconciliationNextAt: new Date(now.getTime() - 1000) } },
+  );
+  await models.PaymentOrder.updateOne({ _id: eligible.order._id }, { $set: { paymentReconciliationAttempts: 3, paymentReconciliationNextAt: new Date(now.getTime() - 1000) } });
+  payments.set(eligible.order.gatewayOrderId, { orderStatus: "ACTIVE", items: [] });
+
+  await service.reconcilePendingCashfreePayments({ limit: 50, now });
+  assert.equal((await models.PaymentOrder.findById(exhausted.order._id).lean()).paymentReconciliationAttempts, 8);
+  assert.equal((await models.PaymentOrder.findById(overExhausted.order._id).lean()).paymentReconciliationAttempts, 9);
+  assert.equal((await models.PaymentOrder.findById(tooOld.order._id).lean()).paymentReconciliationAttempts, 3);
+  assert.equal((await models.PaymentOrder.findById(eligible.order._id).lean()).paymentReconciliationAttempts, 4);
+
+  payments.set(exhausted.order.gatewayOrderId, { orderStatus: "PAID", items: [successfulPayment(exhausted.order.gatewayOrderId, `manual-recovery-${key}`)] });
+  const recovered = await service.verifyPayment({ shopId: exhausted.shop._id, userId: exhausted.user._id, orderId: exhausted.order._id });
+  assert.equal(recovered.status, "paid");
+  assert.equal(await models.ShopSubscription.countDocuments({ sourcePaymentOrderId: exhausted.order._id }), 1);
 });
 
 test("mobile verification, webhook, and reconciliation races activate one subscription", async () => {
