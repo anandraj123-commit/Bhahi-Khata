@@ -112,7 +112,7 @@ test("customer lifecycle list, search, detail and shop-scoped customer list rend
   await page.getByLabel("Lifecycle").selectOption("");
   await page.getByRole("textbox", { name: "Search customers" }).fill("Customer Active");
   await expect(page.locator("tbody tr")).toHaveCount(1);
-  await page.getByRole("link", { name: "View", exact: true }).click();
+  await page.getByRole("link", { name: "View Customer", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Customer Active", exact: false })).toBeVisible();
   await page.goto(`/admin/shops/${fixture.shopId}`);
   await expect(page.getByRole("heading", { name: "Customers", exact: true })).toBeVisible();

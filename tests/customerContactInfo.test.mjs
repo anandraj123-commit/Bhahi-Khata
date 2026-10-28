@@ -114,6 +114,37 @@ test('full details preserve complete values and long addresses can wrap', () => 
   assert.equal(details[2].props.children[1].props.numberOfLines, undefined);
   assert.equal(CustomerContactInfo({ customer, compact: true }).props.children[1], false);
 });
+test('profile detail rows pair each existing icon action with its label and saved value', () => {
+  const tree = CustomerContactInfo({ customer, detailRows: true });
+  const rows = tree.props.children[0].props.children;
+  assert.equal(rows.length, 3);
+  for (const [index, iconName, label, value] of [
+    [0, 'call-outline', 'Mobile Number', customer.phone],
+    [1, 'logo-whatsapp', 'WhatsApp Number', customer.whatsappNumber],
+    [2, 'location-outline', 'Address', customer.address],
+  ]) {
+    const row = rows[index];
+    const [iconWrap, copy] = row.props.children;
+    assert.equal(iconWrap.props.children.props.name, iconName);
+    assert.equal(copy.props.children[0].props.children, label);
+    assert.equal(copy.props.children[1].props.children, value);
+    assert.equal(row.props.accessibilityRole, 'link');
+    assert.equal(row.props.accessibilityState.disabled, false);
+    const style = Object.assign({}, ...row.props.style({ pressed: false }).filter(Boolean));
+    assert.equal(style.minHeight, 68);
+  }
+  assert.equal(tree.props.children[1], false);
+});
+test('profile detail rows keep missing contacts visible, labeled, and disabled', () => {
+  const tree = CustomerContactInfo({ customer: { phone: '', whatsappNumber: undefined, address: '' }, detailRows: true });
+  const rows = tree.props.children[0].props.children;
+  assert.equal(rows.length, 3);
+  for (const row of rows) {
+    assert.equal(row.props.accessibilityState.disabled, true);
+    const value = row.props.children[1].props.children[1].props.children;
+    assert.equal(value, 'Not added');
+  }
+});
 test('all identified customer contact display sites use the shared renderer', () => {
   const source = readFileSync('App.tsx', 'utf8');
   assert.equal((source.match(/<CustomerContactInfo /g) || []).length, 8);

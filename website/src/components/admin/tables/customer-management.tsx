@@ -75,7 +75,7 @@ function CustomerTable({
               <td>{date(customer.createdAt)}</td>
               {!compact && <td>{date(customer.updatedAt)}</td>}
               <td>
-                <Link href={`/admin/customers/${customer._id}`}>View</Link>
+                <Link href={`/admin/customers/${customer._id}`}>View Customer</Link>
               </td>
             </tr>
           ))}

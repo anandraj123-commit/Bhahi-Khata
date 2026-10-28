@@ -160,6 +160,10 @@ test('sync API sends WhatsApp values, base records and versions, including expli
 test('customer details use compact contact actions while the profile retains full contact details', () => {
   const source = readFileSync('App.tsx', 'utf8');
   assert.match(source, /case "customer":[\s\S]*?<CustomerContactInfo customer=\{customer\} compact \/>/);
-  assert.match(source, /case "viewCustomer":[\s\S]*?<CustomerContactInfo customer=\{customer\} \/>/);
+  assert.match(source, /case "viewCustomer":[\s\S]*?<CustomerContactInfo customer=\{customer\} detailRows \/>/);
+  const viewCustomer = source.slice(source.indexOf('case "viewCustomer":'), source.indexOf('case "credit":', source.indexOf('case "viewCustomer":')));
+  assert.match(viewCustomer, /stat\(t\("Opening Balance"/);
+  assert.match(viewCustomer, /stat\(t\("Closing Balance"/);
+  assert.match(viewCustomer, /<CustomerAccountStatementActions customerId=\{customer\.id\} loadStatement=\{loadCustomerAccountStatement\} \/>/);
   assert.match(source, /field\("WhatsApp Number \(Optional\)", "whatsappNumber", \{\s*icon: "logo-whatsapp",\s*keyboardType: "phone-pad"/);
 });

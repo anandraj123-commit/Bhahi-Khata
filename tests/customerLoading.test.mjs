@@ -140,6 +140,11 @@ test('shared Button uses the existing native spinner and marks loading actions d
   assert.equal(Button({ title: 'View Customer', onPress() {} }).props.disabled, false);
 });
 
+test('mobile customer details action uses the existing localized label and preserves its route and icon', () => {
+  const managedCustomerRow = appSource.slice(appSource.indexOf('const managedCustomerRow ='), appSource.indexOf('const transactionRow ='));
+  assert.match(managedCustomerRow, /icon="person-outline" title=\{t\("View Customer", data\.language\)\} secondary onPress=\{\(\) => go\("customer", c\.id\)\}/);
+});
+
 test('loading UI remains tied to startup, real rendering work, and the current list key', () => {
   const manage = appSource.slice(appSource.indexOf('case "manageCustomers": {'), appSource.indexOf('case "customerForm":'));
   assert.match(manage, /empty: !loaded \?/);

@@ -1,4 +1,4 @@
-import { financialSummary, totalUdhari, type Customer, type Data, type Entry } from "./model";
+import { balance, financialSummary, totalUdhari, type Customer, type Data, type Entry } from "./model";
 import { customerLifecycleState } from "./customerLifecycle";
 import { entryDateTime, transactionLabel } from "./entryPresentation";
 import { localeTag } from "./locales";
@@ -26,8 +26,10 @@ export type CustomerAccountStatement = {
     advanceRefunded: number;
     outstanding: number;
     availableAdvance: number;
+    closingBalance: number;
   };
   opening: {
+    balance: number;
     date?: string;
     udhari?: number;
     advance?: number;
@@ -89,7 +91,9 @@ export function buildCustomerAccountStatement(
   const data: Data = { ...snapshot.data, entries: allActiveEntries };
   const totals = financialSummary(data, customer.id);
   const openingAdvance = customer.openingAdvance || 0;
-  const opening: CustomerAccountStatement["opening"] = {};
+  const opening: CustomerAccountStatement["opening"] = {
+    balance: customer.opening - openingAdvance,
+  };
   if (customer.opening > 0) opening.udhari = customer.opening;
   if (openingAdvance > 0) opening.advance = openingAdvance;
   if (customer.opening > 0 || openingAdvance > 0)
@@ -135,6 +139,7 @@ export function buildCustomerAccountStatement(
       advanceRefunded: totals.totalAdvanceRefundedPaise / 100,
       outstanding: totals.outstandingPaise / 100,
       availableAdvance: totals.availableAdvancePaise / 100,
+      closingBalance: balance(data, customer.id),
     },
     opening,
     transactions,

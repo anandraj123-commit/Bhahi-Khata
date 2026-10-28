@@ -10,6 +10,10 @@ const text = (value: unknown) => escapeReceiptHtml(value == null || value === ""
 const optionalField = (label: string, value: unknown) => typeof value === "string" && value.trim()
   ? `<div class="field"><span>${text(label)}</span><strong>${text(value.trim())}</strong></div>` : "";
 const amountField = (label: string, amount: number) => `<div class="field"><span>${text(label)}</span><strong>${text(receiptCurrency(amount))}</strong></div>`;
+const positionField = (label: string, amount: number, language: string) => {
+  const position = amount > 0 ? t("Outstanding", language) : amount < 0 ? t("Available Advance", language) : t("Settled", language);
+  return `<div class="field"><span>${text(t(label, language))}</span><strong>${text(receiptCurrency(Math.abs(amount)))} · ${text(position)}</strong></div>`;
+};
 const labels: Record<string, string> = {
   pending: "Pending Sync", failed: "Sync Failed", conflict: "Conflict", server: "Server Confirmed",
   local: "Local Record", unknown: "Sync Status Unavailable",
@@ -35,6 +39,7 @@ export function customerAccountStatementHtml(statement: CustomerAccountStatement
     : t("Not available", language);
   const state = statement.customerState === "active" ? "" : `<div class="status">${text(t(statement.customerState === "removed" ? "Removed" : "Disabled", language))}</div>`;
   const openingFields = [
+    !statement.period ? positionField("Opening Balance", statement.opening.balance, language) : "",
     statement.opening.date ? `<div class="field"><span>${text(t("Date", language))}</span><strong>${text(statement.opening.date)}</strong></div>` : "",
     statement.opening.udhari !== undefined ? amountField(t("Opening Udhari", language), statement.opening.udhari) : "",
     statement.opening.advance !== undefined ? amountField(t("Opening Advance", language), statement.opening.advance) : "",
@@ -54,6 +59,7 @@ export function customerAccountStatementHtml(statement: CustomerAccountStatement
     amountField(t("Payment Received", language), statement.period.paymentReceived),
     ...(statement.period.advanceRefunded > 0 ? [amountField(t("Advance Refunded", language), statement.period.advanceRefunded)] : []),
   ].join("") : [
+    positionField("Closing Balance", financial.closingBalance, language),
     amountField(t("Total Udhari", language), financial.totalUdhari),
     amountField(t("Total Money Received", language), financial.totalReceived),
     amountField(t("Udhari Recovered", language), financial.udhariRecovered),
@@ -78,6 +84,11 @@ export function customerAccountStatementHtml(statement: CustomerAccountStatement
       ? `<p class="muted">${text(t("Financial balances reflect the full selected-month ledger; transaction history is filtered.", language))}</p>`
       : "",
   ].join("") : "";
+  const createdAt = statement.customer.createdAt ? new Date(statement.customer.createdAt) : null;
+  const customerCreatedOn = createdAt && Number.isFinite(createdAt.getTime())
+    ? createdAt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })
+    : t("Not available", language);
+  const customerProfileFields = statement.period ? "" : `${optionalField(t("Khata Created On", language), customerCreatedOn)}${amountField(t("Credit Limit", language), Math.abs(statement.customer.limit || 0))}${optionalField(t("Reminders", language), t(statement.customer.reminder ? "Allowed" : "Off", language))}`;
   const runningHeader = statement.runningBalancesAvailable ? `<th>${text(t("Balance After", language))}</th>` : "";
   const rows = statement.transactions.map((entry) => {
     const running = entry.runningAfter
@@ -104,7 +115,7 @@ export function customerAccountStatementHtml(statement: CustomerAccountStatement
     <header><img src="${receiptLogoDataUri}" alt="Digital-Khata logo"><div><h1>DIGITAL-KHATA</h1><p>Digital Ledger &amp; Customer Management</p></div><div class="statement-title">${text(t(statement.period ? "Monthly Statement" : "Customer Account Statement", language))}</div></header>
     <section><h2>${text(t("Shop Information", language))}</h2><div class="fields"><div>${optionalField(t("Shop Name *", language), statement.shop.name)}${optionalField(t("Owner Name *", language), statement.shop.owner)}${optionalField(t("Mobile Number", language), statement.shop.phone)}</div><div>${optionalField(t("WhatsApp Number", language), statement.shop.whatsapp)}${optionalField(t("Address", language), statement.shop.address)}</div></div></section>
     ${periodScope}
-    <section><h2>${text(t("Customer Name", language))}</h2><div class="customer-name">${text(statement.customer.name)}</div>${state}<div class="fields"><div>${optionalField(t("Mobile Number", language), statement.customer.phone)}${optionalField(t("WhatsApp Number", language), statement.customer.whatsappNumber)}</div><div>${optionalField(t("Address", language), statement.customer.address)}</div></div></section>
+    <section><h2>${text(t("Customer Name", language))}</h2><div class="customer-name">${text(statement.customer.name)}</div>${state}<div class="fields"><div>${optionalField(t("Mobile Number", language), statement.customer.phone)}${optionalField(t("WhatsApp Number", language), statement.customer.whatsappNumber)}${customerProfileFields}</div><div>${optionalField(t("Address", language), statement.customer.address)}</div></div></section>
     <section><h2>${text(t("Financial Summary", language))}</h2>${openingSection}${summaryRows}</section>
     <section><h2>${text(t("Transaction History", language))} (${statement.transactions.length})</h2>${historyCaveat}${emptyHistory}<div class="table-wrap"><table class="${tableClass}"><thead><tr><th>${text(t("Date", language))}</th><th>${text(t("Transaction", language))}</th><th>${text(t("Transaction ID", language))}</th><th>${text(t("Amount", language))}</th>${runningHeader}<th>${text(t("Description / Note", language))}</th><th>${text(t("Sync", language))}</th></tr></thead><tbody>${rows}</tbody></table></div></section>
     <footer class="footer">${text(t("Developed by", language))}<strong>${text(receiptBrand.company)}</strong>${text(receiptBrand.registration)}<br>${text(t("Website", language))}: ${text(receiptBrand.website)} · ${text(t("Email", language))}: ${text(receiptBrand.email)}<br>${text(t("Phone", language))}: ${text(receiptBrand.mobile)} · WhatsApp: ${text(receiptBrand.whatsapp)}</footer>

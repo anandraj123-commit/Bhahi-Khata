@@ -2415,7 +2415,7 @@ function AppContent() {
         </View>
         <Text style={{ color: financialPalette[tone].text, fontWeight: "700", marginTop: 8 }}>{label}</Text>
         <View style={[s.split, { marginTop: 8 }]}>
-          <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="person-outline" title="View Customer" secondary onPress={() => go("customer", c.id)} /></View>
+          <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="person-outline" title={t("View Customer", data.language)} secondary onPress={() => go("customer", c.id)} /></View>
           <View style={{ flex: 1 }}><Button style={customerDetailsStyles.equalRowButton} icon="document-text-outline" title="Statement" secondary onPress={() => go("statement", c.id)} /></View>
         </View>
         {state === "active" ? (
@@ -4029,23 +4029,34 @@ function AppContent() {
         const customerFinancial = financialSummary(data, customer.id);
         const outstandingTone = customerFinancial.outstandingPaise > 0 ? "red" : "neutral";
         const advanceTone = customerFinancial.availableAdvancePaise > 0 ? "green" : "neutral";
+        const openingBalanceDisplay = khataBalanceDisplay(customer.opening - (customer.openingAdvance || 0));
+        const closingBalanceDisplay = khataBalanceDisplay(balance(data, customer.id));
         content = (
           <>
             <Title>Personal Information</Title>
             <Card>
               <Row icon="person-outline" title="Customer Name" value={customer.name} />
-              <CustomerContactInfo customer={customer} />
+              <CustomerContactInfo customer={customer} detailRows />
               <Row icon="calendar-outline" title={t("Khata Created On", data.language)} value={formatCustomerCreatedOn(customer.createdAt)} />
               <Row title="Credit Limit" value={money(Math.abs(customer.limit || 0))} />
               <Row title="Reminders" value={customer.reminder ? "Allowed" : "Off"} />
             </Card>
             <Title>Financial Information</Title>
+            <View style={customerDetailsStyles.financialRow}>
+              {stat(t("Opening Balance", data.language), `${money(openingBalanceDisplay.amount)} · ${t(openingBalanceDisplay.position, data.language)}`, openingBalanceDisplay.tone, true, "wallet-outline")}
+              {stat(t("Closing Balance", data.language), `${money(closingBalanceDisplay.amount)} · ${t(closingBalanceDisplay.position, data.language)}`, closingBalanceDisplay.tone, true, "wallet-outline")}
+            </View>
             <Card>
               <Row icon="arrow-up-outline" title="Opening Udhari" value={money(Math.abs(customer.opening))} color={colors.red} />
               <Row icon="wallet-outline" title="Opening Advance" value={money(Math.abs(customer.openingAdvance || 0))} color={colors.green} />
+              {customer.opening > 0 && (customer.openingAdvance || 0) > 0 ? <>
+                <Row icon="swap-horizontal-outline" title="Opening Advance Adjusted Against Udhari" value={money(Math.min(customer.opening, customer.openingAdvance || 0))} color={colors.green} />
+                <Row icon="wallet-outline" title="Remaining Opening Advance" value={money(Math.max(0, (customer.openingAdvance || 0) - customer.opening))} color={colors.green} />
+              </> : null}
               <Row icon="wallet-outline" title="Current Outstanding" value={money(customerFinancial.outstandingPaise / 100)} color={financialPalette[outstandingTone].text} />
               <Row icon="wallet-outline" title="Available Advance" value={money(customerFinancial.availableAdvancePaise / 100)} color={financialPalette[advanceTone].text} />
             </Card>
+            <CustomerAccountStatementActions customerId={customer.id} loadStatement={loadCustomerAccountStatement} />
           </>
         );
       } else {

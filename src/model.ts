@@ -125,8 +125,6 @@ export const initialData: Data = {
 };
 // Sum integer paise to avoid binary floating-point drift in ledger totals.
 const paise = (value: number) => Math.round(value * 100);
-const signedPaise = (entry: Entry) =>
-  paise(entry.amount) * (entry.type === "credit" || entry.type === "refund" ? 1 : -1);
 const openingDate = (customer: Customer) =>
   customer.openingDate || customer.createdAt?.slice(0, 10);
 
@@ -194,9 +192,9 @@ export function periodReceived(data: Data, month: string, id?: string) {
     .reduce((sum, entry) => sum + paise(entry.amount), 0)) / 100;
 }
 
-function customerFinancialSummary(data: Data, customer: Customer) {
+function customerFinancialSummary(data: Data, customer: Customer, beforeDate?: string) {
   const entries = data.entries
-    .filter((entry) => entry.customerId === customer.id)
+    .filter((entry) => entry.customerId === customer.id && (!beforeDate || entry.date < beforeDate))
     .slice()
     .sort((a, b) =>
       a.date.localeCompare(b.date) ||
@@ -207,7 +205,7 @@ function customerFinancialSummary(data: Data, customer: Customer) {
     );
   const openingRecordedOn = openingDate(customer);
   const events = [
-    ...(openingRecordedOn
+    ...(openingRecordedOn && (!beforeDate || openingRecordedOn < beforeDate)
       ? [{ kind: "opening" as const, date: openingRecordedOn, recordedAt: `${openingRecordedOn}T00:00:00.000Z` }]
       : []),
     ...entries.map((entry) => ({ kind: "entry" as const, date: entry.date, recordedAt: entry.recordedAt || `${entry.date}T00:00:00.000Z`, entry })),
@@ -292,26 +290,29 @@ export function financialSummary(data: Data, id?: string) {
     );
 }
 
-export const balance = (data: Data, id: string) =>
-  ((paise(data.customers.find((c) => c.id === id)?.opening || 0) -
-    paise(data.customers.find((c) => c.id === id)?.openingAdvance || 0)) +
-    data.entries
-      .filter((e) => e.customerId === id)
-      .reduce((sum, entry) => sum + signedPaise(entry), 0)) /
-  100;
+export const balance = (data: Data, id: string) => {
+  const customer = data.customers.find((item) => item.id === id);
+  return customer ? customerFinancialSummary(data, customer).netPaise / 100 : 0;
+};
 export function monthly(data: Data, id: string, month: string) {
   const customer = data.customers.find((c) => c.id === id);
   const entries = data.entries
     .filter((e) => e.customerId === id && e.date.startsWith(month))
     .sort((a, b) => a.date.localeCompare(b.date));
   const recordedOpeningMonth = customer ? openingDate(customer)?.slice(0, 7) : undefined;
-  const openingPaise =
-    (recordedOpeningMonth === undefined || recordedOpeningMonth < month
-      ? paise(customer?.opening || 0) - paise(customer?.openingAdvance || 0)
-      : 0) +
-    data.entries
-      .filter((e) => e.customerId === id && e.date.slice(0, 7) < month)
-      .reduce((sum, entry) => sum + signedPaise(entry), 0);
+  const [year, monthNumber] = month.split("-").map(Number);
+  const nextMonthStart = Number.isInteger(year) && Number.isInteger(monthNumber)
+    ? new Date(Date.UTC(year, monthNumber, 1)).toISOString().slice(0, 10)
+    : `${month}\uffff`;
+  // Use the same dated opening event and ledger order as the lifetime balance.
+  // Exclusive month boundaries include an opening position only once its
+  // recorded date has passed, even when it was recorded during that month.
+  const openingPaise = customer
+    ? customerFinancialSummary(data, customer, `${month}-01`).netPaise
+    : 0;
+  const closingPaise = customer
+    ? customerFinancialSummary(data, customer, nextMonthStart).netPaise
+    : 0;
   const creditPaise = entries
     .filter((e) => e.type === "credit")
     .reduce((sum, entry) => sum + paise(entry.amount), 0) +
@@ -329,7 +330,7 @@ export function monthly(data: Data, id: string, month: string) {
     credit: creditPaise / 100,
     payment: paymentPaise / 100,
     refund: refundPaise / 100,
-    closing: (openingPaise + creditPaise - paymentPaise + refundPaise) / 100,
+    closing: closingPaise / 100,
   };
 }
 function isDate(value: unknown): value is string {

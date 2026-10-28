@@ -72,13 +72,41 @@ test('financial summary uses the existing selectors and matches the detail-card 
   assert.equal(statement.financial.advanceRefunded, summary.totalAdvanceRefundedPaise / 100);
   assert.equal(statement.financial.outstanding, summary.outstandingPaise / 100);
   assert.equal(statement.financial.availableAdvance, summary.availableAdvancePaise / 100);
-  assert.deepEqual(statement.opening, { date: '2026-01-01', udhari: 300, advance: 500, adjustedAgainstUdhari: 300, remainingAdvance: 200 });
+  assert.deepEqual(statement.opening, { balance: -200, date: '2026-01-01', udhari: 300, advance: 500, adjustedAgainstUdhari: 300, remainingAdvance: 200 });
+  assert.equal(statement.financial.closingBalance, model.balance(data, opened.id));
+  const html = pdfModule.customerAccountStatementHtml(statement);
+  assert.match(html, /Opening Advance Adjusted Against Udhari/);
+  assert.match(html, /Remaining Advance/);
+});
+
+test('opening and closing positions distinguish outstanding, advance and settled balances', () => {
+  const openingUdhari = { ...customer, opening: 500, openingAdvance: 100 };
+  const settledEntries = [entry('settle-payment', 'payment', 400, 0, { date: '2026-01-02' })];
+  const settledData = { ...snapshot(settledEntries, { customers: [openingUdhari] }).data };
+  const settled = statementModule.buildCustomerAccountStatement({ ...snapshot(settledEntries, { customers: [openingUdhari] }), data: settledData }, customer.id);
+  assert.equal(settled.opening.balance, 400);
+  assert.equal(settled.financial.closingBalance, 0);
+
+  const advanceCustomer = { ...customer, opening: 0, openingAdvance: 250 };
+  const advance = statementModule.buildCustomerAccountStatement(snapshot([], { customers: [advanceCustomer] }), customer.id);
+  assert.equal(advance.opening.balance, -250);
+  assert.equal(advance.financial.closingBalance, -250);
+
+  const udhariCustomer = { ...customer, opening: 500, openingAdvance: 0 };
+  const outstanding = statementModule.buildCustomerAccountStatement(snapshot([entry('more-credit', 'credit', 100, 0)], { customers: [udhariCustomer] }), customer.id);
+  assert.equal(outstanding.opening.balance, 500);
+  assert.equal(outstanding.financial.closingBalance, 600);
+  assert.equal(outstanding.financial.closingBalance, model.balance({ ...snapshot([entry('more-credit', 'credit', 100, 0)], { customers: [udhariCustomer] }).data }, customer.id));
+
+  const html = pdfModule.customerAccountStatementHtml(settled);
+  assert.match(html, /Opening Balance<\/span><strong>₹400\.00 · Outstanding/);
+  assert.match(html, /Closing Balance<\/span><strong>₹0\.00 · Settled/);
 });
 
 test('opening advance is independently included when there is no opening Udhari and optional contact values stay optional', () => {
   const opened = { ...customer, opening: 0, openingAdvance: 500, phone: '', whatsappNumber: '', address: '' };
   const statement = statementModule.buildCustomerAccountStatement(snapshot([], { customers: [opened] }), opened.id);
-  assert.deepEqual(statement.opening, { date: '2026-01-01', advance: 500 });
+  assert.deepEqual(statement.opening, { balance: -500, date: '2026-01-01', advance: 500 });
   const html = pdfModule.customerAccountStatementHtml(statement);
   assert.match(html, /Opening Advance/);
   assert.doesNotMatch(html, /Opening Advance Adjusted Against Udhari/);
@@ -106,7 +134,7 @@ test('statement HTML contains the complete customer, shop, financial, history, l
   const e = entry('txn-html', 'payment', 2500, 0, { note: '<script>alert(1)</script>', reference: 'REF-1', appliedToUdhari: 2000, addedToAdvance: 500 });
   const statement = statementModule.buildCustomerAccountStatement(snapshot([e]), customer.id);
   const html = pdfModule.customerAccountStatementHtml(statement);
-  for (const value of ['data:image/png;base64,bG9nbw==', 'DIGITAL-KHATA', 'Asha Stores', 'Asha &lt;Shopper&gt;', '9876543210', '9123456789', 'Main &amp; Market', 'Total Money Received', 'Available Advance', 'txn-html', 'Payment Received', '₹2,500.00', 'REF-1', 'Apurva Software Solutions', 'supports@apurvasoftwaresolutions.com', 'www.apurvasoftwaresolutions.com']) assert.ok(html.includes(value), value);
+  for (const value of ['data:image/png;base64,bG9nbw==', 'DIGITAL-KHATA', 'Asha Stores', 'Asha &lt;Shopper&gt;', '9876543210', '9123456789', 'Main &amp; Market', 'Khata Created On', 'Credit Limit', 'Reminders', 'Opening Balance', 'Closing Balance', 'Total Money Received', 'Available Advance', 'txn-html', 'Payment Received', '₹2,500.00', 'REF-1', 'Apurva Software Solutions', 'supports@apurvasoftwaresolutions.com', 'www.apurvasoftwaresolutions.com']) assert.ok(html.includes(value), value);
   assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
   assert.ok(!html.includes('<script>alert(1)</script>'));
   assert.match(html, /<thead>/);
@@ -145,7 +173,7 @@ test('monthly statement uses the existing monthly selector and exports only one 
   assert.equal(monthly.period.udhariGiven, 3000);
   assert.equal(monthly.period.paymentReceived, 2000);
   assert.equal(monthly.period.closingBalance, 2400);
-  assert.deepEqual(monthly.opening, { date: '2026-01-01', udhari: 1000, advance: 100, adjustedAgainstUdhari: 100, remainingAdvance: 0 });
+  assert.deepEqual(monthly.opening, { balance: 900, date: '2026-01-01', udhari: 1000, advance: 100, adjustedAgainstUdhari: 100, remainingAdvance: 0 });
   const html = pdfModule.customerAccountStatementHtml(monthly);
   assert.match(html, /Monthly Statement/);
   assert.match(html, /October 2026/);
@@ -153,6 +181,10 @@ test('monthly statement uses the existing monthly selector and exports only one 
   assert.match(html, /October credit/);
   assert.match(html, /October payment/);
   assert.doesNotMatch(html, /September|November|Private other customer/);
+  assert.doesNotMatch(html, /Credit Limit|Customer Search|Reminders/);
+  assert.equal((html.match(/<span>Opening Balance<\/span>/g) || []).length, 1);
+  assert.equal((html.match(/<span>Closing Balance<\/span>/g) || []).length, 1);
+  assert.doesNotMatch(html, /Monthly Opening Balance|Monthly Closing Balance/);
   const filename = pdfModule.safeMonthlyKhataStatementFilename(monthly);
   assert.match(filename, /^DigitalKhata_Asha_Shopper_2026-10_cust-1\.pdf$/);
 });
