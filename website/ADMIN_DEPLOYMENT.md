@@ -62,4 +62,4 @@ Run `npm ci`, `npm run typecheck`, `npm run lint`, and `npm run build` from `web
 
 Subscription and payment pages are read-only. Account suspension, refunds, entitlement changes, and manual plan activation are not exposed. Verified payment revenue is shown by currency, for the configured backend app mode, net of recorded refunds. “Active shops” means the linked owner account exists and is not disabled; it is not a measure of recent shop activity. Historical active-shop trends are unavailable because that activity history is not stored.
 
-Browser and database integration tests use only the temporary local MongoDB fixture harness under `website/tests/admin` and `server/src/admin/tests`; those commands are for development only and are not part of the production build.
+Automated testing is postponed until explicitly requested by the project owner. Use the available typecheck, syntax-check and application-build commands during development. Deployment environment and index-management commands remain unchanged.

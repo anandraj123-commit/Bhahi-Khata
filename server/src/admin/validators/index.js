@@ -144,6 +144,7 @@ export const planConfigurationUpdate = z.object({
     z.string().max(300), z.number().finite(), z.boolean(), z.null(),
   ])).refine((value) => Object.keys(value).length <= 50, "Too many entitlements"),
   enabled: z.boolean(),
+  tier: z.number().int().min(0).max(100).optional(),
   displayOrder: z.number().int().min(0).max(1000),
   durations: z.array(planDuration).max(4),
 }).strict().refine(

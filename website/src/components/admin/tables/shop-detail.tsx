@@ -7,6 +7,7 @@ import { date } from "../../../lib/admin/api";
 import { useAdmin } from "../layout/shell";
 import { Badge, Button, Empty, ErrorState, Skeleton } from "../shared/ui";
 import { ResourceTable } from "./resource-table";
+import { PaymentOrders } from "./payment-orders";
 import { ShopCustomers } from "./customer-management";
 export function ShopDetail({ id }: { id: string }) {
   const query = useAdminQuery<Detail>(`shops/${id}`);
@@ -50,6 +51,9 @@ export function ShopDetail({ id }: { id: string }) {
               <dl className="a-card-body a-detail-grid">
                 {Object.entries({
                   "Shop ID": d.shop._id,
+                  "Total customers": d.counts?.total,
+                  "Active customers": d.counts?.active,
+                  "Archived customers": d.counts?.archived,
                   Owner: d.shop.owner,
                   Registered: date(d.shop.createdAt),
                   ...(d.shop.phone
@@ -130,6 +134,7 @@ export function ShopDetail({ id }: { id: string }) {
               <h2 className="a-title" style={{ margin: "24px 0 14px" }}>
                 Payment history
               </h2>
+              <PaymentOrders shopId={id} />
               <ResourceTable resource="payments" shopId={id} />
             </>
           )}

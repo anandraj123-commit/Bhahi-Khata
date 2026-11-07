@@ -17,5 +17,6 @@ export function paymentProvider({ forVerification = false } = {}) {
     fetchOrder: cashfree.fetchCashfreeOrder,
     fetchPayment: cashfree.fetchCashfreePayment,
     fetchOrderPayments: cashfree.fetchCashfreeOrderPayments,
+    fetchRefunds: cashfree.fetchCashfreeRefunds,
   };
 }

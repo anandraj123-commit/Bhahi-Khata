@@ -3,6 +3,7 @@ import * as Crypto from "expo-crypto";
 export type Customer = {
   id: string;
   /** Mutually exclusive lifecycle flags; old cached records normalize to Active. */
+  subscriptionArchived?: boolean;
   status: boolean;
   disabled: boolean;
   removed: boolean;

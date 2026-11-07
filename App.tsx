@@ -8,6 +8,7 @@ import { isTemporaryBackendFailure } from "./src/startupRecovery";
 import { readLanguagePreference, saveLanguagePreference } from "./src/languagePreference";
 import { localeTag } from "./src/locales";
 import { deviceClockNeedsWarning } from "./src/serverClock";
+import { migratePaymentStorageKey, paymentStatusMessage, canReplaySubscriptionAttempt, finishVerifiedPayment, paymentProblem, paymentStorage, parsePaymentAttempt, resolvePendingSubscriptionPayment, type StoredSubscriptionPaymentAttempt } from "./src/subscriptionPaymentAttempt";
 import { entryDateTime, formatClockTime, localDateTimeIso, parseClockTime, transactionLabel as entryLabel } from "./src/entryPresentation";
 import { buildTransactionReceipt, authorizeReceiptAccess, receiptAccountIdentity, resolveReceiptAccountId } from "./src/transactionReceipt";
 import { TransactionDetails } from "./src/TransactionDetails";
@@ -80,6 +81,9 @@ import * as api from "./src/api";
 import {
   cacheAuthenticatedAccount,
   cacheSubscriptionSnapshot,
+  retainOfflinePaymentReference,
+  readOfflinePaymentReferences,
+  markOfflinePaymentReferenceChecked,
   clearOfflineSubscriptionState,
   clearOfflineAccount,
   clearOfflineSession,
@@ -122,6 +126,7 @@ import {
   observeConnectivity,
   type ConnectivityStatus,
 } from "./src/connectivity";
+import { offlineEntitlement, canCreateOperationalCustomer, subscriptionCustomerArchived } from "./src/offlineEntitlement";
 import type { SubscriptionSnapshot } from "./src/subscription";
 import {
   evaluateOfflineSubscriptionClock,
@@ -175,6 +180,7 @@ type Screen =
   | "help"
   | "subscription"
   | "subscriptionPayments"
+  | "customerSelection"
   | "referral"
   | "account"
   | "audit"
@@ -182,6 +188,8 @@ type Screen =
 type Route = { screen: Screen; id?: string };
 type HomeCustomerListKey = "outstanding" | "udhari" | "received" | "recovered" | "availableAdvance" | "deposited" | "refunded" | "customers";
 type HomeCustomerSort = "date-desc" | "date-asc" | "name-asc" | "name-desc";
+const subscriptionIntegrityKey = (accountId: string) => `dk.subscription.integrity.${accountId}`;
+const subscriptionDigest = (snapshot: SubscriptionSnapshot) => Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, JSON.stringify({ current: snapshot.current, plans: snapshot.plans }));
 const subscriptionShopBindingKey = (accountId: string) => `dk.subscription.shop.${accountId}`;
 const subscriptionClockAnchorKey = (accountId: string) => `dk.subscription.clock.${accountId}`;
 async function markSubscriptionClock(accountId: string, shopId: string) {
@@ -193,7 +201,7 @@ async function markSubscriptionClock(accountId: string, shopId: string) {
     const previous = raw ? JSON.parse(raw) as SubscriptionClockAnchor : null;
     observedAt = mergeVerifiedSubscriptionClockAnchor(previous, shopId, now).observedAt;
     await SecureStore.setItemAsync(key, JSON.stringify({ shopId, observedAt }));
-  } catch { /* A missing secure clock anchor makes offline limits fail closed. */ }
+  } catch { throw new Error("Secure subscription clock could not be saved"); }
 }
 async function isOfflineSubscriptionClockSafe(accountId: string, shopId: string, cachedAt?: number) {
   const now = Date.now();
@@ -201,7 +209,7 @@ async function isOfflineSubscriptionClockSafe(accountId: string, shopId: string,
   try {
     const raw = await SecureStore.getItemAsync(key);
     const anchor = raw ? JSON.parse(raw) as SubscriptionClockAnchor : null;
-    const result = evaluateOfflineSubscriptionClock({ now, shopId, anchor, cachedAt });
+    const result = evaluateOfflineSubscriptionClock({ now, shopId, anchor });
     if (!result.safe || !result.nextAnchor) return false;
     await SecureStore.setItemAsync(key, JSON.stringify(result.nextAnchor));
     return true;
@@ -295,6 +303,7 @@ const titles: Partial<Record<Screen, string>> = {
   settings: "Settings",
   reminders: "Reminder Settings",
   help: "Help & Support",
+  customerSelection: "Select Active Customers",
   subscription: "My Subscription",
   subscriptionPayments: "Payment History",
   referral: "Refer & Earn",
@@ -470,6 +479,10 @@ function AppContent() {
     ? { ...value, language: activeLanguageRef.current }
     : value;
   const dataRef = useRef(data);
+  const entryFormGate = useRef(false);
+  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<SubscriptionSnapshot | null>(null);
+  const isSubscriptionArchived = (customer: Customer) => subscriptionCustomerArchived(customer, subscriptionSnapshot?.current);
+
   const persistedRef = useRef<Data | null>(null);
   const offlineAccountRef = useRef<string | null>(null);
   const localRevision = useRef(0);
@@ -622,9 +635,9 @@ function AppContent() {
     return [];
   }, [data, route.screen, search, filter, customerListSort, customerCreationDateFilter, customerFinancialById]);
   const managedCustomers = useMemo(() => data.customers.filter((c) => {
-    const tabMatches = matchesCustomerLifecycleFilter(c, manageCustomerFilter as "All" | "Disabled" | "Removed");
+    const tabMatches = manageCustomerFilter === "Archived" ? isActiveCustomer(c) && isSubscriptionArchived(c) : matchesCustomerLifecycleFilter(c, manageCustomerFilter as "All" | "Disabled" | "Removed");
     return tabMatches && (c.name.toLowerCase().includes(search.toLowerCase()) || c.phone.includes(search));
-  }), [data.customers, search, manageCustomerFilter]);
+  }), [data.customers, search, manageCustomerFilter, subscriptionSnapshot?.current.archivedCustomerIds]);
   const matchingKhataCustomers = useMemo(() => {
     if (route.screen !== "khata") return [];
     const query = search.trim().toLocaleLowerCase();
@@ -869,8 +882,12 @@ function AppContent() {
   const [faq, setFaq] = useState("");
   const [channel, setChannel] = useState("WhatsApp");
   const [plan, setPlan] = useState("Pro");
-  const [subscriptionSnapshot, setSubscriptionSnapshot] = useState<SubscriptionSnapshot | null>(null);
   const subscriptionSnapshotRef = useRef<SubscriptionSnapshot | null>(null);
+  const [customerSelection, setCustomerSelection] = useState<api.CustomerSelection | null>(null);
+  const [selectedCustomerIds, setSelectedCustomerIds] = useState<string[]>([]);
+  const [selectionSaving, setSelectionSaving] = useState(false);
+  const [, tickEntitlementClock] = useState(0);
+  useEffect(() => { const timer = setInterval(() => tickEntitlementClock(value => value + 1), 30000); return () => clearInterval(timer); }, []);
   const [subscriptionLoading, setSubscriptionLoading] = useState(false);
   const [subscriptionPageLoading, setSubscriptionPageLoading] = useState(false);
   const subscriptionPageLock = useRef(false);
@@ -881,6 +898,32 @@ function AppContent() {
   const [subscriptionPaymentLoading, setSubscriptionPaymentLoading] = useState(false);
   const subscriptionPaymentLock = useRef(false);
   const pendingPaymentCheck = useRef<string | null>(null);
+  const [latestPaymentState, setLatestPaymentState] = useState<string | null>(null);
+  const referenceWrites = useRef<Promise<unknown>>(Promise.resolve());
+  const paymentKeyMigrations = useRef(new Map<string, Promise<string>>());
+  function paymentScope(accountId: string) { return `${api.API_BASE_URL}:${accountId}`; }
+  function pendingPaymentKey(accountId: string) {
+    const scope = paymentScope(accountId);
+    const existing = paymentKeyMigrations.current.get(scope);
+    if (existing) return existing;
+    const migration = (async () => {
+      const hash = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, api.API_BASE_URL);
+      const key = `dk.subscription.pending.v2.${hash}.${accountId}`;
+      return migratePaymentStorageKey(key, `dk.subscription.pending.${accountId}`,
+        name => SecureStore.getItemAsync(name), (name, value) => SecureStore.setItemAsync(name, value));
+    })();
+    paymentKeyMigrations.current.set(scope, migration);
+    migration.catch(() => paymentKeyMigrations.current.delete(scope));
+    return migration;
+  }
+  async function retainSubscriptionReference(accountId: string, pending: StoredSubscriptionPaymentAttempt | null) {
+    if (!pending) return;
+    const write = referenceWrites.current.catch(() => undefined).then(() =>
+      paymentStorage(() => retainOfflinePaymentReference(paymentScope(accountId), pending)));
+    referenceWrites.current = write;
+    await write;
+  }
+
   const reconnectSyncLock = useRef(false);
   async function refreshSyncStatus(accountId = offlineAccountRef.current) {
     const current = dataRef.current;
@@ -926,12 +969,37 @@ function AppContent() {
       if ((await checkConnectivity()) !== "online")
         throw new api.ApiTransportError("network");
       const snapshot = await api.getSubscriptionSnapshot();
-      const pendingKey = `dk.subscription.pending.${accountId}`;
-      const pendingRaw = await SecureStore.getItemAsync(pendingKey).catch(() => null);
+      const pendingKey = await paymentStorage(() => pendingPaymentKey(accountId));
+      const pendingRaw = await paymentStorage(() => SecureStore.getItemAsync(pendingKey));
+      // Copy legacy references without deleting them. Idempotent SQLite upserts
+      // make interruption safe; new purchases no longer grow SecureStore values.
+      const retainedRaw = await SecureStore.getItemAsync(`dk.subscription.references.${accountId}`);
+      if (retainedRaw) {
+        const legacy = JSON.parse(retainedRaw);
+        if (!Array.isArray(legacy)) throw new Error("Invalid payment references");
+        for (const reference of legacy) await retainSubscriptionReference(accountId, parsePaymentAttempt(JSON.stringify(reference)));
+      }
+      const references = await readOfflinePaymentReferences(paymentScope(accountId));
+      for (const row of references) {
+        const reference = parsePaymentAttempt(row.record_json);
+        try {
+          if (!reference || reference.shopId !== snapshot.current.shopId) continue;
+          const status = reference.orderId ? await api.getSubscriptionPaymentStatus(reference.orderId)
+            : reference.idempotencyKey ? await api.getSubscriptionPaymentAttemptStatus(reference.idempotencyKey) : null;
+          if (offlineAccountRef.current !== accountId) return false;
+          if (status) setLatestPaymentState(paymentStatusMessage(status));
+        } catch {
+          setLatestPaymentState("Payment pending verification");
+        } finally {
+          await markOfflinePaymentReferenceChecked(paymentScope(accountId), row.reference_key);
+        }
+      }
+      if (references.length) Object.assign(snapshot, await api.getSubscriptionSnapshot());
       let verifiedPendingOrderId: string | null = null;
       if (pendingRaw) {
         try {
           const pending = JSON.parse(pendingRaw) as { orderId?: string; idempotencyKey?: string; planCode?: string; months?: number; shopId?: string };
+          await retainSubscriptionReference(accountId, pending);
           if (pending.shopId && pending.shopId !== snapshot.current.shopId) {
             pendingPaymentCheck.current = null;
           } else if (pending.orderId || pending.idempotencyKey) {
@@ -950,8 +1018,9 @@ function AppContent() {
                 status = await api.getSubscriptionPaymentAttemptStatus(pending.idempotencyKey);
                 pending.orderId = status.id;
                 pending.shopId = snapshot.current.shopId;
-                await SecureStore.setItemAsync(pendingKey, JSON.stringify(pending));
+                await SecureStore.setItemAsync(pendingKey, JSON.stringify(pending)).catch(() => undefined);
               }
+              if (status) setLatestPaymentState(paymentStatusMessage(status));
               if (!status) {
                 pendingPaymentCheck.current = null;
               } else if (status.status === "paid") {
@@ -963,7 +1032,7 @@ function AppContent() {
                 snapshot.paymentsNextCursor = fresh.paymentsNextCursor;
                 snapshot.plans = fresh.plans;
                 verifiedPendingOrderId = pending.orderId ?? null;
-              } else if (status.status === "failed") {
+              } else if (status.status === "failed" && !status.hasPendingAttempts) {
                 await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
               } else pendingPaymentCheck.current = null;
             }
@@ -1003,15 +1072,15 @@ function AppContent() {
           try {
             await SecureStore.setItemAsync(subscriptionShopBindingKey(accountId), snapshot.current.shopId);
             await markSubscriptionClock(accountId, snapshot.current.shopId);
+            await SecureStore.setItemAsync(subscriptionIntegrityKey(accountId), await subscriptionDigest(snapshot));
           } catch {
             cacheSaved = false;
           }
         }
       }
-      if (verifiedPendingOrderId && cacheSaved)
-        await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-      else if (verifiedPendingOrderId)
-        pendingPaymentCheck.current = null;
+      // Refresh must never delete a reference written by a newer checkout.
+      // The serialized purchase resolver clears a verified attempt when needed.
+      if (verifiedPendingOrderId) pendingPaymentCheck.current = null;
       try {
         const reminders = await scheduleSubscriptionNotifications(
           snapshot,
@@ -1033,27 +1102,9 @@ function AppContent() {
       if (cached && typeof cached === "object" && "current" in cached && "plans" in cached) {
         const snapshot = cached as SubscriptionSnapshot;
         const boundShopId = await SecureStore.getItemAsync(subscriptionShopBindingKey(accountId)).catch(() => null);
-        if (boundShopId && boundShopId === snapshot.current?.shopId) {
-          const expiresAt = snapshot.current.expiresAt ? Date.parse(snapshot.current.expiresAt) : null;
-          const clockSafe = await isOfflineSubscriptionClockSafe(
-            accountId,
-            snapshot.current.shopId,
-            Number((snapshot as SubscriptionSnapshot).cachedAt),
-          );
-          if (expiresAt !== null && Number.isFinite(expiresAt)) {
-            const remaining = Math.max(0, expiresAt - Date.now());
-            snapshot.current.remainingMilliseconds = remaining;
-            snapshot.current.remainingDays = Math.ceil(remaining / 86400000);
-            snapshot.current.remainingHours = Math.ceil(remaining / 3600000);
-            snapshot.current.offlineExpired = !isOfflineEntitlementUsable({ now: Date.now(), expiresAt, clockSafe });
-          } else if (snapshot.current.expiresAt) {
-            snapshot.current.remainingMilliseconds = 0;
-            snapshot.current.remainingDays = 0;
-            snapshot.current.remainingHours = 0;
-            snapshot.current.offlineExpired = true;
-          } else {
-            snapshot.current.offlineExpired = !isOfflineEntitlementUsable({ now: Date.now(), expiresAt: null, clockSafe });
-          }
+        if (boundShopId && boundShopId === snapshot.current?.shopId && await SecureStore.getItemAsync(subscriptionIntegrityKey(accountId)).catch(() => null) === await subscriptionDigest(snapshot)) {
+          const clockSafe = await isOfflineSubscriptionClockSafe(accountId, snapshot.current.shopId, snapshot.cachedAt);
+          snapshot.current.offlineExpired = !clockSafe;
           setSubscriptionSnapshot(snapshot);
           setSubscriptionLoadError("");
           try {
@@ -1073,7 +1124,34 @@ function AppContent() {
         setSubscriptionLoading(false);
     }
   }
-  async function purchaseSubscription(acceptedPricingVersionOverride?: number) {
+  async function openCustomerSelection() {
+    try {
+      const selection = await api.getCustomerSelection();
+      setCustomerSelection(selection);
+      setSelectedCustomerIds(selection.customers.filter(item => !item.archived).map(item => item.id));
+      go("customerSelection");
+    } catch { Alert.alert("Internet required", "Connect to review and apply the authoritative customer selection. Existing records remain available offline."); }
+  }
+  async function confirmCustomerSelection() {
+    if (!customerSelection || selectionSaving) return;
+    setSelectionSaving(true);
+    try {
+      await api.applyCustomerSelection({ activeIds: selectedCustomerIds, expectedVersion: customerSelection.version, operationId: Crypto.randomUUID() });
+      const accountId = offlineAccountRef.current;
+      await refreshSubscriptionInfo();
+      if (accountId) {
+        const revision = localRevision.current;
+        const remote = await synchronizeAccount(accountId);
+        if (remote && offlineAccountRef.current === accountId && localRevision.current === revision) {
+          dataRef.current = remote; persistedRef.current = remote; setData(remote);
+        }
+      }
+      Alert.alert("Customer selection saved", "The server applied your selection. Archived customers retain all history and outstanding-payment collection.");
+      go("subscription");
+    } catch (problem) { Alert.alert("Selection needs review", problem instanceof api.ApiError ? problem.message : "The request could not be confirmed. Refresh the selection before trying again."); }
+    finally { setSelectionSaving(false); }
+  }
+  async function purchaseSubscription(acceptedPricingVersionOverride?: number, confirmedPreview?: api.SubscriptionPreview, riskAccepted = false) {
     const accountId = offlineAccountRef.current;
     const selected = subscriptionSnapshot?.plans.find((item) => item.name === plan || item.code === plan.toLowerCase());
     const selectedMonths = Number(subscriptionDuration);
@@ -1106,68 +1184,114 @@ function AppContent() {
       Alert.alert("Internet required", "Internet connection required to purchase or renew your subscription. Your existing offline records remain available.");
       return;
     }
+    if (!confirmedPreview) {
+      try {
+        const preview = await api.previewSubscriptionPurchase({ planCode: selected.code, durationMonths: months, useWallet: useWalletForPurchase });
+        const previewLine = (label: string, value: string | number) => `${t(label, data.language)}: ${value}`;
+        Alert.alert("Review subscription purchase", [
+          t(preview.message, data.language),
+          "",
+          previewLine("Duration", t("{{count}} months", data.language, { count: months })),
+          previewLine("Expected start / resume", new Date(preview.startsAt).toLocaleString(localeTag(data.language))),
+          previewLine("Expected expiry", new Date(preview.expiresAt).toLocaleString(localeTag(data.language))),
+          previewLine("Customer limit", preview.unlimitedCustomers ? t("Unlimited", data.language) : preview.customerLimit ?? "—"),
+          previewLine("Base price", money(preview.pricing.basePriceMinor / 100)),
+          previewLine("Discount", money(preview.pricing.discountAmountMinor / 100)),
+          previewLine("Tax", money(preview.pricing.taxAmountMinor / 100)),
+          previewLine("Total", money(preview.pricing.finalAmountMinor / 100)),
+          t("Dates for immediate activation begin at server verification.", data.language),
+        ].join("\n"), [
+          { text: "Cancel", style: "cancel" },
+          { text: "Confirm purchase", onPress: () => void purchaseSubscription(preview.pricing.pricingVersion, preview) },
+        ]);
+      } catch (problem) { const [title, message] = paymentProblem(problem, "checkout"); Alert.alert(title, message); }
+      return;
+    }
+    // Connectivity and preview confirmation are asynchronous; another press
+    // may already have entered checkout while this invocation was waiting.
+    if (subscriptionPaymentLock.current || offlineAccountRef.current !== accountId) return;
     subscriptionPaymentLock.current = true;
     setSubscriptionPaymentLoading(true);
-    const pendingKey = `dk.subscription.pending.${accountId}`;
+    let pendingKey = "";
     const acceptedPricingVersion = acceptedPricingVersionOverride ?? selected.pricingVersion;
-    let pending: { idempotencyKey?: string; orderId?: string; planCode?: string; months?: number; shopId?: string; pricingVersion?: number; useWallet?: boolean } | null = null;
+    let pending: StoredSubscriptionPaymentAttempt | null = null;
     let orderId: string | undefined;
+    let stage: "saved-attempt" | "checkout" | "verification" = "saved-attempt";
     try {
-      const raw = await SecureStore.getItemAsync(pendingKey);
-      if (raw) {
-        try { pending = JSON.parse(raw); } catch { pending = null; }
+      pendingKey = await paymentStorage(() => pendingPaymentKey(accountId));
+      const raw = await paymentStorage(() => SecureStore.getItemAsync(pendingKey));
+      pending = parsePaymentAttempt(raw);
+      await retainSubscriptionReference(accountId, pending);
+      const pendingResolution = await resolvePendingSubscriptionPayment({
+        pending,
+        currentShopId,
+        getOrderStatus: api.getSubscriptionPaymentStatus,
+        getAttemptStatus: api.getSubscriptionPaymentAttemptStatus,
+        clear: () => paymentStorage(() => SecureStore.deleteItemAsync(pendingKey)),
+      }).catch(() => ({ kind: "unverified" as const }));
+      let acknowledgeDuplicateRisk = riskAccepted;
+      if (pendingResolution.kind === "pending" || pendingResolution.kind === "unverified" || pendingResolution.kind === "different-shop") {
+        acknowledgeDuplicateRisk = riskAccepted || await new Promise<boolean>(resolve => Alert.alert(
+          "Payment pending verification",
+          "An earlier payment is unresolved. A new purchase can charge you again. If both payments succeed, both subscriptions will be fulfilled. The earlier reference will be retained.",
+          [{ text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+           { text: "Start independent purchase", onPress: () => resolve(true) }],
+          { cancelable: false },
+        ));
+        if (!acknowledgeDuplicateRisk || offlineAccountRef.current !== accountId) return;
+        pending = null;
       }
-      if (pending?.shopId && pending.shopId !== currentShopId) {
-        Alert.alert("Payment pending verification", "This payment belongs to another shop. Sign in to that shop to verify it before starting another payment.");
-        return;
-      }
-      if (pending?.orderId && pending.planCode === selected.code && pending.months === months && (pending.useWallet === true) === useWalletForPurchase) {
-        orderId = pending.orderId;
-        const status = await api.getSubscriptionPaymentStatus(orderId);
-        if (status.status === "paid") {
-          const refreshed = await refreshSubscriptionInfo(accountId);
-          if (refreshed) {
-            await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-            Alert.alert("Subscription active", status.walletAppliedMinor ? "The wallet payment was verified and the subscription is active." : "Cashfree confirmed your payment and the subscription is active.");
-          } else {
-            Alert.alert("Payment pending verification", "Cashfree confirmed payment. The app will refresh the subscription entitlement when the connection is available.");
-          }
+      if (pendingResolution.kind === "paid") {
+        // The saved attempt is already verified and no longer locks checkout.
+        // Refresh entitlements, then let the backend apply its normal renewal or
+        // plan-change policy to this newly requested purchase.
+        pendingPaymentCheck.current = null;
+        const synchronized = await finishVerifiedPayment(
+          () => refreshSubscriptionInfo(accountId),
+          () => SecureStore.deleteItemAsync(pendingKey),
+        );
+        if (!synchronized) {
+          Alert.alert("Payment successful", "Your previous payment is verified, but local synchronization is incomplete. Refresh subscription details before starting another purchase.");
           return;
         }
-        if (status.status === "failed") {
-          await SecureStore.deleteItemAsync(pendingKey);
-          pending = null;
-          orderId = undefined;
-        }
-      } else if (pending && (pending.planCode !== selected.code || pending.months !== months || (pending.useWallet === true) !== useWalletForPurchase)) {
-        Alert.alert("Payment still processing", "Finish or verify the existing subscription payment before starting another one.");
-        return;
+        pending = null;
+      } else if (pendingResolution.kind === "failed") {
+        pending = null;
+        pendingPaymentCheck.current = null;
       }
       const idempotencyKey = pending?.idempotencyKey || Crypto.randomUUID();
       if (!pending?.idempotencyKey) {
         pending = { idempotencyKey, planCode: selected.code, months, shopId: currentShopId, pricingVersion: acceptedPricingVersion, useWallet: useWalletForPurchase };
       }
       pending = { ...pending, idempotencyKey, planCode: selected.code, months, shopId: currentShopId, pricingVersion: acceptedPricingVersion, useWallet: useWalletForPurchase };
-      await SecureStore.setItemAsync(pendingKey, JSON.stringify(pending));
+      await paymentStorage(() => SecureStore.setItemAsync(pendingKey, JSON.stringify(pending)));
+      await retainSubscriptionReference(accountId, pending);
+      stage = "checkout";
       const checkout = await api.createSubscriptionCheckout({
         planCode: selected.code as "pro" | "business",
         durationMonths: months,
         acceptedPricingVersion,
+        previewToken: confirmedPreview.token,
+        acknowledgeDuplicateRisk,
         idempotencyKey,
         useWallet: useWalletForPurchase,
       });
+      stage = "verification";
       orderId = checkout.orderId;
-      pending = { idempotencyKey, planCode: selected.code, months, orderId, shopId: currentShopId, useWallet: useWalletForPurchase };
-      await SecureStore.setItemAsync(pendingKey, JSON.stringify(pending));
+      pending = { idempotencyKey, planCode: selected.code, months, orderId, gatewayOrderId: checkout.gatewayOrderId, shopId: currentShopId, useWallet: useWalletForPurchase };
+      await retainSubscriptionReference(accountId, pending);
       if (checkout.status === "paid" && checkout.amountMinor === 0) {
-        const refreshed = await refreshSubscriptionInfo(accountId);
+        const refreshed = await finishVerifiedPayment(
+          () => refreshSubscriptionInfo(accountId),
+          () => SecureStore.deleteItemAsync(pendingKey),
+        );
         if (refreshed) {
-          await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
           await api.getReferralWalletSnapshot().then(setReferralSnapshot).catch(() => undefined);
-          Alert.alert("Subscription active", "Your wallet payment was applied and the subscription is active.");
+          Alert.alert("Payment successful", "Your wallet payment is verified. See My Subscription for its activation schedule.");
         } else Alert.alert("Payment applied", "Wallet payment was accepted. Refresh subscription details when connected to update this device.");
         return;
       }
+      await paymentStorage(() => SecureStore.setItemAsync(pendingKey, JSON.stringify(pending)));
       try {
         await launchCashfreeCheckout({
           paymentSessionId: checkout.paymentSessionId,
@@ -1178,20 +1302,29 @@ function AppContent() {
       if (!orderId) throw new Error("Payment order is unavailable for verification.");
       const status = await api.verifySubscriptionPayment({ orderId });
       if (status.status === "paid") {
-        const refreshed = await refreshSubscriptionInfo(accountId);
+        const refreshed = await finishVerifiedPayment(
+          () => refreshSubscriptionInfo(accountId),
+          () => SecureStore.deleteItemAsync(pendingKey),
+        );
         if (refreshed) {
-          await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-          Alert.alert("Subscription active", checkout.walletAppliedMinor ? "Your wallet contribution and verified Cashfree payment activated the subscription." : "Cashfree confirmed your payment and the subscription is active.");
+          Alert.alert("Payment successful", checkout.walletAppliedMinor ? "Your wallet contribution and Cashfree payment are verified. See My Subscription for its activation schedule." : "Your payment is verified. The subscription is active or scheduled as shown in My Subscription.");
         } else {
-          Alert.alert("Payment pending verification", "Cashfree confirmed payment. The app will refresh the subscription entitlement when the connection is available.");
+          Alert.alert("Payment successful", "The server verified your payment, but this device could not refresh or save subscription details. Local synchronization is incomplete. Refresh when connected; do not pay again for this purchase.");
         }
       } else if (status.status === "failed") {
-        await SecureStore.deleteItemAsync(pendingKey);
-        Alert.alert("Payment not completed", "Cashfree did not confirm a successful payment. You can try again.");
+        if (!status.hasPendingAttempts) await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
+        setLatestPaymentState(paymentStatusMessage(status));
+        Alert.alert(paymentStatusMessage(status), "Cashfree did not confirm a successful payment. You can try again.");
       } else {
         Alert.alert("Payment processing", "The payment is not confirmed yet. Your subscription will update after Cashfree verification. Use Refresh in Subscription & Billing to check again.");
       }
     } catch (problem) {
+      if (problem instanceof api.ApiError && problem.payload?.code === "PAYMENT_PENDING") {
+        Alert.alert("Payment pending verification",
+          "An earlier payment is unresolved. A new purchase can charge you again. If both payments succeed, both subscriptions will be fulfilled. The earlier reference will be retained.",
+          [{ text: "Cancel", style: "cancel" }, { text: "Start independent purchase", onPress: () => void purchaseSubscription(acceptedPricingVersion, confirmedPreview, true) }]);
+        return;
+      }
       const changedPricing = problem instanceof api.ApiError &&
         problem.payload?.code === "SUBSCRIPTION_PRICE_CHANGED" &&
         problem.payload?.currentPricing;
@@ -1214,9 +1347,7 @@ function AppContent() {
           "Plan price changed",
           `${details}\n\nReview and accept this amount before continuing to Cashfree.`,
           [
-            { text: "Cancel", style: "cancel", onPress: () => {
-              if (!pending?.orderId) void SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-            } },
+            { text: "Cancel", style: "cancel" },
             { text: "Accept and continue", onPress: () => void purchaseSubscription(updated.pricingVersion) },
           ],
         );
@@ -1226,22 +1357,27 @@ function AppContent() {
         try {
           const status = await api.getSubscriptionPaymentStatus(orderId);
           if (status.status === "paid") {
-            const refreshed = await refreshSubscriptionInfo(accountId);
+            const refreshed = await finishVerifiedPayment(
+              () => refreshSubscriptionInfo(accountId),
+              () => SecureStore.deleteItemAsync(pendingKey),
+            );
             if (refreshed) {
-              await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
-              Alert.alert("Subscription active", status.walletAppliedMinor ? "Your wallet contribution and verified Cashfree payment activated the subscription." : "Cashfree confirmed your payment and the subscription is active.");
+              Alert.alert("Payment successful", status.walletAppliedMinor ? "Your wallet contribution and Cashfree payment are verified. See My Subscription for its activation schedule." : "Your payment is verified. The subscription is active or scheduled as shown in My Subscription.");
             } else {
-              Alert.alert("Payment pending verification", "Cashfree confirmed payment. The app will refresh the subscription entitlement when the connection is available.");
+              Alert.alert("Payment successful", "The server verified your payment, but this device could not refresh or save subscription details. Local synchronization is incomplete. Refresh when connected; do not pay again for this purchase.");
             }
+            return;
+          }
+          if (status.status === "failed") {
+            if (!status.hasPendingAttempts) await SecureStore.deleteItemAsync(pendingKey).catch(() => undefined);
+            setLatestPaymentState(paymentStatusMessage(status));
+            Alert.alert(paymentStatusMessage(status), "The server confirmed this payment failed. You can try again.");
             return;
           }
         } catch { /* Preserve the idempotent attempt for an online retry. */ }
       }
-      if ((orderId || pending?.idempotencyKey) && (await checkConnectivity().catch(() => "offline")) !== "online") {
-        Alert.alert("Payment pending verification", "Your payment reference is saved securely. We’ll check its status when the connection returns. No new order was created.");
-      } else {
-        Alert.alert("Unable to complete payment", errorMessage(problem, "A payment is activated only after server verification."));
-      }
+      const [title, message] = paymentProblem(problem, stage);
+      Alert.alert(title, message);
     } finally {
       subscriptionPaymentLock.current = false;
       setSubscriptionPaymentLoading(false);
@@ -1663,6 +1799,8 @@ function AppContent() {
   useEffect(() => {
     const id = offlineAccountRef.current;
     if (!data.signedIn || !id || !["subscription", "subscriptionPayments"].includes(route.screen)) return;
+    pendingPaymentCheck.current = null;
+    setLatestPaymentState(null);
     void refreshSubscriptionInfo(id, route.screen === "subscription");
     if (connectivityStatus !== "offline")
       void api.getReferralWalletSnapshot().then(setReferralSnapshot).catch(() => undefined);
@@ -1766,6 +1904,7 @@ function AppContent() {
             await cancelSubscriptionNotifications(accountId);
             await clearOfflineSubscriptionState(accountId).catch(() => undefined);
             await Promise.all([
+              SecureStore.deleteItemAsync(subscriptionIntegrityKey(accountId)),
               SecureStore.deleteItemAsync(subscriptionShopBindingKey(accountId)),
               SecureStore.deleteItemAsync(subscriptionClockAnchorKey(accountId)),
             ]).catch(() => undefined);
@@ -2444,6 +2583,7 @@ function AppContent() {
             </View>
             <View style={{ flex: 1 }}>
               <Text style={s.rowTitle}>{c.name}</Text>
+              {isSubscriptionArchived(c) && <Text style={{ color: colors.orange }}>Archived · outstanding payments only</Text>}
               {includeCreatedTime
                 ? c.createdAt && formatCustomerCreatedAt(c.createdAt) !== "Not available"
                   ? <View style={{ alignSelf: "flex-start", marginTop: 4, marginBottom: 2, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 10, backgroundColor: colors.greenBg }}><Text style={{ fontSize: 10, color: colors.green, fontWeight: "600" }}>{t("Khata Created On", data.language)}: {formatCustomerCreatedAt(c.createdAt)}</Text></View>
@@ -2468,6 +2608,7 @@ function AppContent() {
         <View style={[s.split, { alignItems: "center" }]}>
           <View style={{ flex: 1 }}>
             <Text style={s.rowTitle}>{c.name}</Text>
+              {isSubscriptionArchived(c) && <Text style={{ color: colors.orange }}>Archived · outstanding payments only</Text>}
             <CustomerContactInfo customer={c} compact />
           </View>
           <View style={[s.badge, { backgroundColor: state === "removed" ? colors.redBg : state === "disabled" ? colors.neutralBg : colors.greenBg }]}>
@@ -2621,6 +2762,7 @@ function AppContent() {
       openingAdvance: Math.round(openingAdvance * 100) / 100,
       limit: Math.round(limit * 100) / 100,
       reminder: form.reminder === "true",
+      subscriptionArchived: existingCustomer?.subscriptionArchived,
       status: existingCustomer?.status ?? true,
       disabled: existingCustomer?.disabled ?? false,
       removed: existingCustomer?.removed ?? false,
@@ -2635,27 +2777,13 @@ function AppContent() {
         subscriptionSnapshot?.cachedAt,
       ),
     );
-    const expiration = cachedCurrent?.expiresAt ? Date.parse(cachedCurrent.expiresAt) : null;
-    const isExpiredOfflineEntitlement = Boolean(
-      cachedCurrent?.offlineExpired || !isOfflineEntitlementUsable({
-        now: Date.now(),
-        expiresAt: expiration,
-        clockSafe,
-      }),
-    );
-    const entitlement = isExpiredOfflineEntitlement
-      ? subscriptionSnapshot?.plans.find((item) => item.code === "free") || {
-          name: "Free",
-          customerLimit: 50,
-          unlimitedCustomers: false,
-        }
-      : cachedCurrent?.plan;
-    const localCustomerLimit = entitlement?.customerLimit ?? 50;
+    if (dataRef.current !== data) return Alert.alert("Review customer", "Customer records changed. Review this form before saving.");
+    const entitlement = offlineEntitlement(cachedCurrent, Date.now(), clockSafe);
+    const localCustomerLimit = entitlement?.customerLimit ?? 0;
     const hasUnlimitedCustomers = entitlement?.unlimitedCustomers ?? false;
     if (
       !route.id &&
-      !hasUnlimitedCustomers &&
-      data.customers.filter(isActiveCustomer).length >= localCustomerLimit
+      !canCreateOperationalCustomer(entitlement, data.customers.filter(item => isActiveCustomer(item) && !subscriptionCustomerArchived(item, cachedCurrent)).length)
     )
       return Alert.alert(
         "Customer limit reached",
@@ -2719,6 +2847,14 @@ function AppContent() {
           Alert.alert("Customer status change not allowed", "This customer cannot be moved to that status.");
           return;
         }
+        if (target === "active" && current !== "active" && !isSubscriptionArchived(latestCustomer)) {
+          const safe = Boolean(confirmedAccount && subscriptionSnapshot?.current.shopId && await isOfflineSubscriptionClockSafe(confirmedAccount, subscriptionSnapshot.current.shopId));
+          const plan = offlineEntitlement(subscriptionSnapshot?.current, Date.now(), safe);
+          if (!canCreateOperationalCustomer(plan, latest.customers.filter(item => isActiveCustomer(item) && !isSubscriptionArchived(item)).length)) {
+            Alert.alert("Customer limit reached", "Connect and review active customers before restoring another operational customer.");
+            return;
+          }
+        }
         const saved = await commit({
           ...latest,
           customers: latest.customers.map((item) => item.id === customer.id ? transitionCustomerLifecycle(item, target) : item),
@@ -2748,7 +2884,14 @@ function AppContent() {
       { text: t(target === "disabled" ? "Disable Customer" : target === "removed" ? "Remove Customer" : target === "active" && current === "removed" ? "Restore Customer" : "Enable Customer", data.language), style: target === "removed" ? "destructive" : "default", onPress: () => void perform() },
     ], { cancelable: true, onDismiss: () => customerActionGate.current.cancel(reservation) });
   }
-  function saveEntry() {
+  async function saveEntry() {
+    if (entryFormGate.current) return;
+    entryFormGate.current = true;
+    let awaitingConfirmation = false;
+    let submitted = false;
+    const accountAtStart = offlineAccountRef.current;
+    const release = () => { if (!submitted) entryFormGate.current = false; };
+    try {
     const old = route.screen === "editTransaction" ? entry : undefined;
     if (route.screen === "editTransaction" && !old)
       return Alert.alert("Transaction unavailable", "This transaction is no longer available in the active ledger. Refresh the account before editing it.");
@@ -2763,6 +2906,15 @@ function AppContent() {
       );
     if (!isActiveCustomer(c))
       return Alert.alert("Customer is unavailable for transactions", "Enable or restore this customer before recording financial transactions.");
+    const entitlementClockSafe = Boolean(offlineAccountRef.current && subscriptionSnapshot?.current.shopId && await isOfflineSubscriptionClockSafe(offlineAccountRef.current, subscriptionSnapshot.current.shopId));
+    if (dataRef.current !== data || offlineAccountRef.current !== accountAtStart) return;
+    const operationPlan = offlineEntitlement(subscriptionSnapshot?.current, Date.now(), entitlementClockSafe);
+    const operationalCount = data.customers.filter(item => isActiveCustomer(item) && !isSubscriptionArchived(item)).length;
+    const restricted = isSubscriptionArchived(c) || !operationPlan || (!operationPlan.unlimitedCustomers && operationalCount > (operationPlan.customerLimit ?? 0));
+    if ((restricted || operationPlan?.entitlements?.credit === false) && (type !== "payment" || !!old))
+      return Alert.alert("Customer restricted", "Select active customers within your plan limit. Existing records and outstanding payment collection remain available.");
+    if (restricted && amount > Math.max(0, balance(data, c.id)))
+      return Alert.alert("Outstanding payments only", "This customer can pay up to the existing outstanding balance.");
     if (
       !Number.isFinite(amount) ||
       amount < 0.01 ||
@@ -2837,42 +2989,73 @@ function AppContent() {
       ],
     };
     const useServerTimestamp = !old && !transactionDateTimeEdited && currentConnectivity() === "online";
-    const apply = () => save(next, () => go("customer", c.id, true), useServerTimestamp ? "server" : undefined);
+    const apply = async () => {
+      if (submitted) return;
+      submitted = true;
+      try {
+        if (offlineAccountRef.current !== accountAtStart || dataRef.current !== data) {
+          Alert.alert("Review transaction", "Records changed while confirmation was open. Review the amount and try again.");
+          return;
+        }
+        const safe = Boolean(accountAtStart && subscriptionSnapshot?.current.shopId && await isOfflineSubscriptionClockSafe(accountAtStart, subscriptionSnapshot.current.shopId));
+        const effectivePlan = offlineEntitlement(subscriptionSnapshot?.current, Date.now(), safe);
+        const overLimit = !effectivePlan || (!effectivePlan.unlimitedCustomers && operationalCount > (effectivePlan.customerLimit ?? 0));
+        if ((overLimit || restricted) && type === "payment" && amount > Math.max(0, balance(data, c.id))) {
+          Alert.alert("Outstanding payments only", "This customer can pay up to the existing outstanding balance.");
+          return;
+        }
+        if ((overLimit || restricted || effectivePlan?.entitlements?.credit === false) && (type !== "payment" || !!old)) {
+          Alert.alert("Customer restricted", "Subscription access changed. Refresh and review active customers before adding credit.");
+          return;
+        }
+        if (dataRef.current !== data || offlineAccountRef.current !== accountAtStart) return;
+        if (await commit(next, undefined, useServerTimestamp ? "server" : undefined)) go("customer", c.id, true);
+      } finally { entryFormGate.current = false; }
+    };
     if (type === "payment") {
+      awaitingConfirmation = true;
       Alert.alert(
         "Confirm money received",
         `Amount Received: ${money(amountPaise / 100)}\nAdjusted Against Udhari: ${money(appliedToUdhariPaise / 100)}\nAdded to Advance: ${money(addedToAdvancePaise / 100)}`,
-        [{ text: "Cancel", style: "cancel" }, { text: "Confirm", onPress: apply }],
+        [{ text: "Cancel", style: "cancel", onPress: release }, { text: "Confirm", onPress: apply }],
+        { cancelable: true, onDismiss: release },
       );
       return;
     }
     if (type === "credit" && advanceAppliedPaise > 0) {
       const newOutstandingPaise = Math.max(0, currentPaise + amountPaise);
+      awaitingConfirmation = true;
       Alert.alert(
         "Confirm Udhari",
         `Purchase Amount: ${money(amountPaise / 100)}\nAdjusted From Advance: ${money(advanceAppliedPaise / 100)}\nNew Outstanding: ${money(newOutstandingPaise / 100)}`,
-        [{ text: "Cancel", style: "cancel" }, { text: "Confirm", onPress: apply }],
+        [{ text: "Cancel", style: "cancel", onPress: release }, { text: "Confirm", onPress: apply }],
+        { cancelable: true, onDismiss: release },
       );
       return;
     }
     if (type === "refund") {
+      awaitingConfirmation = true;
       Alert.alert(
         "Confirm advance refund",
         `Refund: ${money(amountPaise / 100)}\nRemaining Advance: ${money((-currentPaise - amountPaise) / 100)}`,
-        [{ text: "Cancel", style: "cancel" }, { text: "Confirm", onPress: apply }],
+        [{ text: "Cancel", style: "cancel", onPress: release }, { text: "Confirm", onPress: apply }],
+        { cancelable: true, onDismiss: release },
       );
       return;
     }
-    if (type === "credit" && c.limit > 0 && balance(next, c.id) > c.limit)
+    if (type === "credit" && c.limit > 0 && balance(next, c.id) > c.limit) {
+      awaitingConfirmation = true;
       Alert.alert(
         "Credit limit exceeded",
         `This takes ${c.name} above their ${money(c.limit)} credit limit.`,
         [
-          { text: "Cancel", style: "cancel" },
+          { text: "Cancel", style: "cancel", onPress: release },
           { text: "Save anyway", onPress: apply },
         ],
+        { cancelable: true, onDismiss: release },
       );
-    else apply();
+    } else await apply();
+    } finally { if (!awaitingConfirmation && !submitted) entryFormGate.current = false; }
   }
   function deleteEntry(e: Entry) {
     const customerName = dataRef.current.customers.find((item) => item.id === e.customerId)?.name || "Customer";
@@ -3909,7 +4092,7 @@ function AppContent() {
         renderItem: (item) => managedCustomerRow(item),
         header: <>
           <Field label="Search customers" placeholder="Search name or phone" value={search} onChangeText={setSearch} />
-          <Chips items={["All", "Disabled", "Removed"]} value={manageCustomerFilter} onChange={setManageCustomerFilter} />
+          <Chips items={["All", "Archived", "Disabled", "Removed"]} value={manageCustomerFilter} onChange={setManageCustomerFilter} />
         </>,
         footer: listFooter(page.hasMore, ""),
         empty: !loaded ? <View style={{ paddingVertical: 12, alignItems: "center" }}><ActivityIndicator size="small" color={colors.green} /></View> : <Empty title={manageCustomerFilter === "All" ? "No customers found" : manageCustomerFilter === "Disabled" ? "No disabled customers" : "No removed customers"} description="Try another search or customer status." />,
@@ -5360,8 +5543,27 @@ function AppContent() {
       );
       break;
     }
+    case "customerSelection": {
+      content = <>
+        <Title>Select active customers</Title>
+        <Hint>Review your choices before applying. Archiving preserves customers, balances and history. Selection changes require connectivity.</Hint>
+        <Row title="Current plan limit" value={customerSelection?.limit === null ? "Unlimited" : String(customerSelection?.limit ?? 0)} />
+        <Row title="Selected" value={String(selectedCustomerIds.length)} />
+        <Row title="Will be archived" value={String((customerSelection?.customers.length || 0) - selectedCustomerIds.length)} />
+        <Button title="Suggest recently active customers" secondary onPress={() => setSelectedCustomerIds(customerSelection?.suggestedIds || [])} />
+        <Button title="Apply selection" disabled={selectionSaving || (customerSelection?.limit !== null && selectedCustomerIds.length > (customerSelection?.limit ?? 0))} onPress={() => Alert.alert("Confirm customer selection", "Only the selected customers can create new credit. Other customers remain available for viewing and outstanding-payment collection.", [{ text: "Cancel", style: "cancel" }, { text: "Apply", onPress: () => void confirmCustomerSelection() }])} />
+      </>;
+      virtualizedRows = {
+        data: customerSelection?.customers || [], keyExtractor: item => item.id,
+        renderItem: item => <Button secondary title={`${selectedCustomerIds.includes(item.id) ? "✓ " : ""}${item.name}${item.archived ? ` · ${t("Archived", data.language)}` : ""}`} onPress={() => setSelectedCustomerIds(ids => ids.includes(item.id) ? ids.filter(id => id !== item.id) : [...ids, item.id])} />,
+      };
+      break;
+    }
     case "subscription": {
-      const current = subscriptionSnapshot?.current;
+      const verifiedCurrent = subscriptionSnapshot?.current;
+      const currentPeriod = verifiedCurrent?.timeline?.find(item => Date.parse(item.startsAt) <= Date.now() && (!item.expiresAt || Date.now() < Date.parse(item.expiresAt)));
+      const visiblePlan = offlineEntitlement(verifiedCurrent, Date.now(), !verifiedCurrent?.offlineExpired);
+      const current = verifiedCurrent && { ...verifiedCurrent, ...(currentPeriod && visiblePlan?.code === currentPeriod.plan.code ? { plan: currentPeriod.plan, startsAt: currentPeriod.startsAt, expiresAt: currentPeriod.expiresAt, remainingMilliseconds: currentPeriod.expiresAt ? Math.max(0, Date.parse(currentPeriod.expiresAt) - Date.now()) : null, remainingDays: currentPeriod.expiresAt ? Math.ceil(Math.max(0, Date.parse(currentPeriod.expiresAt) - Date.now()) / 86400000) : null } : visiblePlan ? { plan: visiblePlan, startsAt: null, expiresAt: null, remainingMilliseconds: null, remainingDays: null, isFallback: true } : { offlineExpired: true }) };
       const plans = subscriptionSnapshot?.plans || [];
       const historyPage = pageRecords(subscriptionSnapshot?.history || []);
       const selected = plans.find((item) => item.name === plan || item.code === plan.toLowerCase());
@@ -5389,12 +5591,18 @@ function AppContent() {
             <Card>
               <Title>Current Subscription</Title>
               <Row icon="ribbon-outline" title="Plan" value={current.plan.name} />
-              <Row icon="checkmark-circle-outline" title="Status" value={t("Active", data.language)} />
+              <Row icon="checkmark-circle-outline" title="Status" value={current.offlineExpired ? "Verification required" : t("Active", data.language)} />
               <Row icon="calendar-outline" title="Start date" value={current.startsAt ? new Date(current.startsAt).toLocaleDateString("en-IN") : "—"} />
               <Row icon="calendar-outline" title="Expiry" value={current.expiresAt ? new Date(current.expiresAt).toLocaleDateString("en-IN") : t("Never", data.language)} />
               <Row icon="time-outline" title="Time remaining" value={remainingText} />
-              <Row icon="people-outline" title="Customer limit" value={current.customerUsage.unlimited ? t("Unlimited", data.language) : String(current.customerUsage.limit ?? 0)} />
+              <Row icon="people-outline" title="Customer limit" value={current.plan.unlimitedCustomers ? t("Unlimited", data.language) : String(current.plan.customerLimit ?? 0)} />
               <Row icon="people-outline" title="Customers used" value={String(current.customerUsage.used)} />
+              <Row title="Archived customers" value={String(current.customerUsage.archived || 0)} />
+              {current.customerUsage.selectionRequired && <Hint>Your current plan has fewer customer slots. Review your active customer selection. Viewing and outstanding collections remain available.</Hint>}
+              <Button title="Select active / restore archived customers" secondary onPress={() => void openCustomerSelection()} />
+              <Row title="Connection" value={connectivityStatus === "online" ? "Online" : "Offline · cached entitlement"} />
+              <Row title="Last verified" value={new Date(current.verifiedAt).toLocaleString()} />
+              {Object.entries(current.plan.entitlements || {}).map(([name, value]) => <Row key={name} title={name} value={String(value)} />)}
               {!current.customerUsage.unlimited && <Row icon="people-outline" title="Customer capacity left" value={String(current.customerUsage.remaining ?? 0)} />}
               {current.durationMonths > 0 && <Row icon="calendar-outline" title="Duration" value={t("{{count}} months", data.language, { count: current.durationMonths })} />}
               {current.amountPaidMinor !== null && <Row icon="card-outline" title="Amount paid" value={asRupees(current.amountPaidMinor)} />}
@@ -5407,9 +5615,18 @@ function AppContent() {
                   <Row title="Duration" value={t("{{count}} months", data.language, { count: current.scheduled.durationMonths })} />
                 </>
               )}
-              {current.isFallback && <Hint>{t("Free plan • ₹0 • 50 customers • Expiry: Never", data.language)}</Hint>}
+              {current.isFallback && <Hint>{`Free plan · ${current.plan.unlimitedCustomers ? "Unlimited" : current.plan.customerLimit} customers`}</Hint>}
             </Card>
           )}
+          {(verifiedCurrent?.timeline || []).filter(item => Date.parse(item.startsAt) > Date.now()).map((item, index) => <Card key={item.id}>
+            <Title>{item.status === "paused" ? "Paused subscription" : "Upcoming subscription"}</Title>
+            <Row title="Plan" value={item.plan.name} />
+            <Row title="Queue position" value={String(index + 1)} />
+            <Row title="Payment" value={item.paymentStatus} />
+            <Row title="Expected start / resume" value={new Date(item.startsAt).toLocaleString()} />
+            <Row title="Expected expiry" value={item.expiresAt ? new Date(item.expiresAt).toLocaleString() : "—"} />
+            {item.status === "paused" && <Hint>{`Higher-tier subscription active. ${Math.ceil((item.remainingMilliseconds || 0) / 60000)} minutes of paid time preserved.`}</Hint>}
+          </Card>)}
           {(subscriptionSnapshot?.history || []).length > 0 && (
             <>
               <Title>Subscription History</Title>
@@ -5507,6 +5724,9 @@ function AppContent() {
             disabled={!subscriptionSnapshot?.checkoutEnabled || !selected || selected.code === "free" || !price}
             onPress={() => void purchaseSubscription()}
           />
+          {latestPaymentState && <Hint>{latestPaymentState}</Hint>}
+          <Button title="Retry Payment" secondary disabled={subscriptionPaymentLoading || connectivityStatus !== "online"} onPress={() => void purchaseSubscription()} />
+          <Button icon="refresh-outline" title="Check Payment Status" secondary onPress={() => { pendingPaymentCheck.current = null; void refreshSubscriptionInfo(); }} />
           <Button icon="receipt-outline" title="Payment History" secondary onPress={() => go("subscriptionPayments")} />
           <Hint>
             {subscriptionSnapshot?.cachedAt
@@ -5540,6 +5760,10 @@ function AppContent() {
             <Row icon={payment.status === "paid" ? "checkmark-circle-outline" : payment.status === "failed" ? "close-circle-outline" : payment.status === "refunded" || payment.status === "partially_refunded" ? "refresh-outline" : "time-outline"} title="Status" value={payment.status} />
             {payment.gatewayPaymentId && <Row icon="receipt-outline" title="Payment reference" value={payment.gatewayPaymentId} />}
             {payment.gatewayOrderId && <Row icon="receipt-outline" title="Order reference" value={payment.gatewayOrderId} />}
+            {payment.attempts?.map((attempt: { id: string; gatewayPaymentId: string; status: string; gatewayStatus?: string }) => <View key={attempt.id}>
+              <Row title="Payment reference" value={attempt.gatewayPaymentId} />
+              <Row title="Status" value={paymentStatusMessage({ status: ["captured", "refunded", "partially_refunded"].includes(attempt.status) ? "paid" : attempt.status === "failed" ? "failed" : "pending", latestPaymentStatus: attempt.gatewayStatus })} />
+            </View>)}
             {payment.method && <Row icon="card-outline" title="Payment method" value={payment.method} />}
             {payment.currency && <Row title="Currency" value={payment.currency} />}
             {payment.refunded && <Row icon="refresh-outline" title="Refund status" value={`${payment.status} • ${money((payment.refundedAmountMinor || 0) / 100)} refunded`} />}

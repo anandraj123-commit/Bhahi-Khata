@@ -42,6 +42,7 @@ export const customerSchema = z
     openingDate: daySchema.optional(),
     limit: moneySchema(),
     reminder: z.boolean(),
+    subscriptionArchived: z.boolean().optional(),
     status: z.boolean().optional(),
     disabled: z.boolean().optional(),
     removed: z.boolean().optional(),

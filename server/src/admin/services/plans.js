@@ -1,11 +1,12 @@
 import mongoose from "mongoose";
+import { AdminControl } from "../models/index.js";
 import { SubscriptionPlan } from "../../models.js";
 import { calculateDurationPricing, SUPPORTED_SUBSCRIPTION_DURATIONS } from "../../services/subscriptionPricing.js";
 import { fail } from "../utils/security.js";
 import { audit } from "./audit.js";
 
 const planProjection =
-  "_id code name description features monthlyPriceMinor currency customerLimit unlimitedCustomers entitlements enabled displayOrder configurationVersion pricingVersion durations createdByAdminId updatedByAdminId createdAt updatedAt";
+  "_id code tier name description features monthlyPriceMinor currency customerLimit unlimitedCustomers entitlements enabled displayOrder configurationVersion pricingVersion durations createdByAdminId updatedByAdminId createdAt updatedAt";
 
 function outputPlan(plan) {
   return {
@@ -47,6 +48,7 @@ function pricingState(plan) {
 function planAuditView(plan) {
   return {
     name: plan.name,
+    tier: plan.tier,
     description: plan.description,
     customerLimit: plan.unlimitedCustomers ? "unlimited" : plan.customerLimit,
     unlimitedCustomers: Boolean(plan.unlimitedCustomers),
@@ -60,6 +62,7 @@ function planAuditView(plan) {
 export async function updatePlanConfiguration(req, planId, input) {
   let result;
   await mongoose.connection.transaction(async (session) => {
+    await AdminControl.updateOne({ _id: "subscription-tiers" }, { $inc: { revision: 1 } }, { upsert: true, session });
     const previous = await SubscriptionPlan.findById(planId)
       .select(planProjection)
       .session(session)
@@ -93,7 +96,14 @@ export async function updatePlanConfiguration(req, planId, input) {
     } catch (error) {
       throw fail(400, error.code || "ADMIN_PLAN_PRICING_INVALID", error.message);
     }
+    const tier = input.tier ?? previous.tier ?? ({ free: 0, pro: 1, business: 2 }[previous.code]);
+    const other = await SubscriptionPlan.findOne({ code: previous.code === "pro" ? "business" : "pro" }).session(session).lean();
+    const otherTier = other?.tier ?? (other?.code === "business" ? 2 : 1);
+    if ((previous.code === "free" && tier !== 0) || (previous.code !== "free" && tier < 1) ||
+        (previous.code === "pro" && tier >= otherTier) || (previous.code === "business" && tier <= otherTier))
+      throw fail(400, "ADMIN_PLAN_TIER_INVALID", "Tier ordering must remain Free < Pro < Business. Existing purchases retain their tier snapshot.");
     const nextValues = {
+      tier,
       name: input.name,
       description: input.description,
       customerLimit: input.unlimitedCustomers ? null : input.customerLimit,

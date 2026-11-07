@@ -10,6 +10,7 @@ import {
 import { date, money } from "../../../lib/admin/api";
 import { Badge, Button, Empty, ErrorState, Skeleton } from "../shared/ui";
 import { DateFilter } from "../shared/date-filter";
+import { PaymentOrders } from "./payment-orders";
 import { PlanLimitManagement } from "./plan-limit-management";
 export type Resource =
   "shops" | "subscriptions" | "payments" | "audit-logs" | "administrators";
@@ -68,8 +69,12 @@ const columns: Record<Resource, Column[]> = {
     { key: "startsAt", label: "Starts", render: (r) => date(r.startsAt) },
     { key: "expiresAt", label: "Expires", render: (r) => date(r.expiresAt) },
     { key: "durationMonths", label: "Months" },
+    { key: "remainingMilliseconds", label: "Preserved time", render: r => r.remainingMilliseconds ? `${Math.ceil(Number(r.remainingMilliseconds) / 60000)} min` : "—" },
+    { key: "pauseReason", label: "Pause reason" },
   ],
   payments: [
+    { key: "gatewayStatus", label: "Cashfree attempt status" },
+    { key: "reviewStatus", label: "Payment review", render: (r) => `${String(r.reviewStatus || "none")} · ${String(r.reviewReason || "—")}` },
     { key: "planCode", label: "Purchased plan", render: (r) => String(r.planName || r.planCode || "—") },
     { key: "durationMonths", label: "Duration", render: (r) => Number(r.durationMonths) > 0 ? `${r.durationMonths} months` : "—" },
     {
@@ -178,7 +183,7 @@ const columns: Record<Resource, Column[]> = {
 };
 const statuses: Partial<Record<Resource, string[]>> = {
   shops: ["enabled", "disabled", "unavailable"],
-  subscriptions: ["active", "expiring", "expired", "scheduled", "cancelled"],
+  subscriptions: ["active", "expiring", "expired", "paused", "scheduled", "cancelled"],
   payments: ["captured", "pending", "failed", "refunded", "partially_refunded"],
 };
 export function ResourceTable({
@@ -403,6 +408,7 @@ export function ResourcePage({
   }[resource];
   return (
     <>
+      {resource === "payments" && <PaymentOrders />}
       <div className="a-page-heading">
         <div>
           <div className="a-eyebrow">

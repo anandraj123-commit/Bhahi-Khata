@@ -21,3 +21,6 @@ export const otpLimit = rateLimit({
 export const authLimit = limiter(15 * 60_000, 20);
 export const writeLimit = limiter(60_000, 120);
 export const apiLimit = limiter(60_000, 300);
+
+// Separate webhook ingress from interactive API traffic; rejected deliveries retry.
+export const webhookLimit = limiter(60_000, 1200);

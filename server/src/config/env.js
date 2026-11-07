@@ -93,7 +93,11 @@ if (env.SUBSCRIPTION_REMINDER_TIME && !/^([01]\d|2[0-3]):[0-5]\d$/.test(env.SUBS
 const reminderTimezone = env.SUBSCRIPTION_REMINDER_TIMEZONE || "Asia/Kolkata";
 try { new Intl.DateTimeFormat("en", { timeZone: reminderTimezone }).format(new Date()); }
 catch { throw new Error("SUBSCRIPTION_REMINDER_TIMEZONE is invalid"); }
+const offlineGraceHours = Number(env.SUBSCRIPTION_OFFLINE_GRACE_HOURS || 72);
+if (!Number.isSafeInteger(offlineGraceHours) || offlineGraceHours < 1 || offlineGraceHours > 720)
+  throw new Error("SUBSCRIPTION_OFFLINE_GRACE_HOURS must be an integer from 1 to 720");
 export const subscriptionConfig = Object.freeze({
+  offlineGraceMilliseconds: offlineGraceHours * 3600000,
   appMode: env.APP_MODE,
   checkoutEnabled,
   nativeCheckoutReady: env.SUBSCRIPTION_NATIVE_CHECKOUT_READY === "true",

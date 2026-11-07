@@ -53,7 +53,7 @@ Backend mode selection does not change the React Native app's API endpoint. The 
 
 ## Tests and utilities
 
-`npm run test:env` tests environment selection and validation without connecting to services. `npm run test:payments` runs the existing payment provider, pricing, and lifecycle tests; inspect their isolated test-database prerequisites before running. The `indexes:<mode>` scripts use the corresponding environment file and startup checks.
+Automated testing is postponed until explicitly requested by the project owner. Use the available typecheck, syntax-check and application-build commands during development. Deployment environment and index-management commands remain unchanged.
 
 For local administrator scripts, first provide the matching explicit environment file and startup guard, for example:
 

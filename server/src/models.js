@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import { randomBytes } from "node:crypto";
 import { normalizeCustomerMobile } from "./utils/phone.js";
+import { verifyPaymentIndexes } from "./services/paymentIndexVerification.js";
 
 const { Schema } = mongoose;
 const base = { timestamps: true, versionKey: false, autoIndex: false };
@@ -23,6 +24,7 @@ export const Shop = mongoose.model(
   new Schema(
     {
       ownerId: { type: Schema.Types.ObjectId, required: true, unique: true },
+      entitlementRevision: { type: Number, default: 0 },
       name: { type: String, default: "", maxlength: 120 },
       owner: { type: String, default: "", maxlength: 120 },
       address: { type: String, default: "", maxlength: 500 },
@@ -63,6 +65,7 @@ const customerSchema = new Schema(
       financialVersion: { type: Number, default: 1, min: 1 },
       limitPaise: { type: Number, min: 0, max: 100000000000 },
       reminder: { type: Boolean, default: true },
+      subscriptionArchived: { type: Boolean, default: false },
       // Lifecycle flags are distinct from deletedAt, the legacy sync tombstone.
       status: { type: Boolean, default: true },
       disabled: { type: Boolean, default: false },
@@ -82,6 +85,7 @@ export const Customer = mongoose.model("Customer", customerSchema);
 Customer.schema.index({ shopId: 1, clientId: 1 }, { unique: true });
 Customer.schema.index({ shopId: 1, nameFolded: 1, _id: 1 });
 Customer.schema.index({ shopId: 1, phone: 1 });
+Customer.schema.index({ shopId: 1, subscriptionArchived: 1, status: 1 });
 Customer.schema.index(
   { shopId: 1, phoneNormalized: 1 },
   {
@@ -260,6 +264,7 @@ export const SubscriptionPlan = mongoose.model(
       code: { type: String, required: true, unique: true },
       name: { type: String, required: true },
       description: { type: String, default: "" },
+      tier: { type: Number, min: 0, max: 100, validate: Number.isSafeInteger },
       monthlyPriceMinor: { type: Number, required: true, min: 0, validate: Number.isSafeInteger },
       currency: { type: String, required: true, default: "INR" },
       customerLimit: { type: Number, min: 0, default: null, validate: { validator: (value) => value == null || Number.isSafeInteger(value) } },
@@ -308,7 +313,7 @@ export const ShopSubscription = mongoose.model(
       planCode: { type: String, required: true },
       planSnapshot: { type: Schema.Types.Mixed, required: true, immutable: true },
       pricingSnapshot: { type: Schema.Types.Mixed, immutable: true },
-      status: { type: String, enum: ["active", "scheduled", "expired", "cancelled"], required: true },
+      status: { type: String, enum: ["active", "paused", "scheduled", "expired", "cancelled"], required: true },
       startsAt: { type: Date, required: true },
       expiresAt: Date,
       durationMonths: { type: Number, default: 0 },
@@ -317,6 +322,9 @@ export const ShopSubscription = mongoose.model(
       // Durable order-level idempotency. Older subscription records omit this
       // field and remain valid; new paid activations always set it.
       sourcePaymentOrderId: { type: Schema.Types.ObjectId, immutable: true },
+      remainingMilliseconds: { type: Number, min: 0 },
+      pauseReason: String,
+      segments: { type: [{ startsAt: Date, expiresAt: Date, _id: false }], default: [] },
       scheduledStartAt: Date,
       renewalOf: { type: Schema.Types.ObjectId },
       activatedAt: Date,
@@ -326,6 +334,7 @@ export const ShopSubscription = mongoose.model(
 );
 ShopSubscription.schema.index({ shopId: 1, startsAt: -1, _id: -1 });
 ShopSubscription.schema.index({ shopId: 1, status: 1, startsAt: 1, expiresAt: 1 });
+ShopSubscription.schema.index({ status: 1, expiresAt: 1, startsAt: 1 });
 ShopSubscription.schema.index({ sourcePaymentId: 1 }, { unique: true, sparse: true });
 ShopSubscription.schema.index({ sourcePaymentOrderId: 1 }, { unique: true, sparse: true });
 
@@ -348,6 +357,7 @@ export const PaymentOrder = mongoose.model(
       gatewayOrderId: String,
       gatewayReferenceId: String,
       paymentSessionId: String,
+      confirmedPreview: { type: Schema.Types.Mixed, immutable: true },
       providerRequestId: String,
       idempotencyKey: { type: String, required: true },
       requestHash: { type: String, required: true },
@@ -359,6 +369,15 @@ export const PaymentOrder = mongoose.model(
       paymentReconciliationAttempts: { type: Number, default: 0, min: 0 },
       paymentReconciliationNextAt: Date,
       paymentReconciliationLastCode: String,
+      paymentReconciliationCheckedAt: Date,
+      paymentReconciliationAttemptedAt: Date,
+      paymentReconciliationLeaseToken: String,
+      refundReconciliationCheckedAt: Date,
+      refundReconciliationLastCode: String,
+      gatewayOrderStatus: String,
+      latestPaymentId: String,
+      latestPaymentStatus: String,
+      latestPaymentTime: Date,
     },
     base,
   ),
@@ -375,10 +394,22 @@ PaymentOrder.schema.index(
   { partialFilterExpression: { gatewayOrderId: { $exists: true } } },
 );
 
+// Independent, server-authored recovery evidence; never reconstructed from client plan/amount data.
+export const PaymentOrderRecovery = mongoose.model("PaymentOrderRecovery", new Schema({
+  shopId: { type: Schema.Types.ObjectId, required: true },
+  appMode: { type: String, required: true },
+  idempotencyKey: { type: String, required: true },
+  snapshot: { type: Schema.Types.Mixed, required: true, immutable: true },
+  reconciliationNextAt: Date,
+  reconciliationLastCode: String,
+}, base));
+PaymentOrderRecovery.schema.index({ shopId: 1, appMode: 1, idempotencyKey: 1 }, { unique: true });
+
 export const PaymentTransaction = mongoose.model(
   "PaymentTransaction",
   new Schema(
     {
+      appMode: { type: String, default: () => process.env.APP_MODE },
       shopId: { type: Schema.Types.ObjectId, required: true },
       orderId: { type: Schema.Types.ObjectId, required: true },
       provider: { type: String, enum: ["razorpay", "cashfree"], required: true },
@@ -394,12 +425,14 @@ export const PaymentTransaction = mongoose.model(
       refundedAmountMinor: { type: Number, min: 0, default: 0 },
       refundReferences: { type: [String], default: [] },
       gatewayCreatedAt: Date,
+      gatewayStatus: String,
       verifiedAt: Date,
     },
     base,
   ),
 );
 PaymentTransaction.schema.index({ gatewayPaymentId: 1 }, { unique: true });
+PaymentTransaction.schema.index({ orderId: 1, status: 1 });
 PaymentTransaction.schema.index({ shopId: 1, createdAt: -1, _id: -1 });
 
 export const SubscriptionAuditLog = mongoose.model(
@@ -464,12 +497,38 @@ export const PaymentWebhookEvent = mongoose.model(
     {
       eventId: { type: String, required: true, unique: true },
       eventType: { type: String, required: true },
+      appMode: String,
+      orderId: String,
+      paymentId: String,
+      refundId: String,
+      attempts: { type: Number, default: 0 },
+      nextAttemptAt: Date,
+      lastErrorCode: String,
       processedAt: Date,
       status: { type: String, enum: ["received", "processed", "failed"], default: "received" },
     },
     base,
   ),
 );
+
+export const PaymentRefund = mongoose.model("PaymentRefund", new Schema({
+  appMode: { type: String, required: true },
+  shopId: { type: Schema.Types.ObjectId, required: true },
+  orderId: { type: Schema.Types.ObjectId, required: true },
+  gatewayOrderId: { type: String, required: true },
+  gatewayPaymentId: { type: String, required: true },
+  gatewayRefundId: { type: String, required: true },
+  refundId: { type: String, required: true },
+  amountMinor: { type: Number, required: true, min: 1, validate: Number.isSafeInteger },
+  currency: { type: String, required: true },
+  gatewayStatus: { type: String, required: true },
+  verifiedAt: Date,
+  entitlementReviewRequired: { type: Boolean, default: true },
+}, base));
+PaymentRefund.schema.index({ appMode: 1, gatewayRefundId: 1 }, { unique: true });
+PaymentRefund.schema.index({ orderId: 1, gatewayPaymentId: 1 });
+
+PaymentWebhookEvent.schema.index({ appMode: 1, status: 1, nextAttemptAt: 1 });
 
 export const SubscriptionUsage = mongoose.model(
   "SubscriptionUsage",
@@ -573,11 +632,13 @@ export async function ensureIndexes() {
     SubscriptionPlan,
     ShopSubscription,
     PaymentOrder,
+    PaymentOrderRecovery,
     PaymentTransaction,
     SubscriptionAuditLog,
     SubscriptionNotificationLog,
     SubscriptionNotificationPreference,
     PaymentWebhookEvent,
+    PaymentRefund,
     SubscriptionUsage,
     ReferralProgramSettings,
     Referral,
@@ -585,6 +646,8 @@ export async function ensureIndexes() {
     WalletLedgerEntry,
   ])
     await model.createIndexes();
+  await verifyPaymentIndexes([PaymentOrder, PaymentOrderRecovery, PaymentTransaction,
+    ShopSubscription, PaymentWebhookEvent, PaymentRefund, SubscriptionAuditLog, WalletLedgerEntry]);
 }
 
 /** Non-destructive compatibility migration for customers created before the

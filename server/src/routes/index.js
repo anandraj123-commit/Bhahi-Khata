@@ -1,5 +1,6 @@
+import { handle_post_payment_webhook } from "../controllers/subscriptionController.js";
 import express from "express";
-import { apiLimit } from "../middleware/rateLimits.js";
+import { apiLimit, webhookLimit } from "../middleware/rateLimits.js";
 import healthRoutes from "./healthRoutes.js";
 import authRoutes from "./authRoutes.js";
 import bootstrapRoutes from "./bootstrapRoutes.js";
@@ -18,6 +19,7 @@ import referralRoutes from "./referralRoutes.js";
 import { error } from "../utils/http.js";
 
 const router = express.Router();
+router.post("/payments/webhook", webhookLimit, handle_post_payment_webhook);
 router.use(apiLimit);
 router.use(healthRoutes);
 router.use(authRoutes);

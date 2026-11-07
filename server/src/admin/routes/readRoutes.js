@@ -1,8 +1,10 @@
 import { Router } from "express";
-import { permit } from "../middleware/security.js";
+import { permit, recentAuthentication, loginLimit } from "../middleware/security.js";
 import { filters, id, parse } from "../validators/index.js";
 import * as read from "../services/readModels.js";
 import { audit } from "../services/audit.js";
+import { PaymentOrder, PaymentOrderRecovery } from "../../models.js";
+import { verifyPayment } from "../../services/subscriptionService.js";
 import { fail } from "../utils/security.js";
 const router = Router();
 function reportFilters(query) {
@@ -57,3 +59,26 @@ router.get("/reports/export", permit("reports:read"), async (req, res) => {
     .send(read.reportCsv(report));
 });
 export default router;
+
+router.get("/payment-orders", permit("payments:read"), async (req, res) => res.json(await read.paymentOrders(parse(filters, req.query))));
+router.post("/payment-orders/:id/reconcile", permit("payments:reconcile"), recentAuthentication, loginLimit, async (req, res) => {
+  const orderId = parse(id, req.params.id);
+  const order = await PaymentOrder.findOne({ _id: orderId, appMode: process.env.APP_MODE }).select("shopId").lean()
+    || await PaymentOrderRecovery.findOne({ _id: orderId, appMode: process.env.APP_MODE }).select("shopId").lean();
+  if (!order) throw fail(404, "ADMIN_ORDER_NOT_FOUND", "Payment order not found");
+  await audit(req, "payment.reconciliation.requested", "payment_order", orderId);
+  try {
+    const result = await verifyPayment({ shopId: order.shopId, orderId });
+    await audit(req, "payment.reconciliation.completed", "payment_order", orderId, { status: result.status });
+    res.json({ data: { status: result.status } });
+  } catch (error) {
+    await audit(req, "payment.reconciliation.failed", "payment_order", orderId, {}, undefined, "failure");
+    throw fail(503, "ADMIN_RECONCILIATION_UNAVAILABLE", "Authoritative verification could not complete. The payment reference is retained.");
+  }
+});
+
+router.get("/payment-recovery-events", permit("payments:read"), async (req, res) => res.json(await read.paymentRecoveryEvents(parse(filters, req.query))));
+router.get("/payment-recovery-snapshots", permit("payments:read"), async (req, res) => res.json(await read.paymentRecoverySnapshots(parse(filters, req.query))));
+
+router.get("/payment-refunds", permit("payments:read"), async (req, res) => res.json(await read.paymentRefunds(parse(filters, req.query))));
+router.get("/payment-health", permit("payments:read"), async (req, res) => res.json({ data: await read.paymentHealth() }));

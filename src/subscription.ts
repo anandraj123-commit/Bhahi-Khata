@@ -44,6 +44,10 @@ export type CurrentSubscription = {
     entitlements: Record<string, unknown>;
     configurationVersion: number;
   };
+  offlineGraceMilliseconds?: number;
+  fallbackPlan?: CurrentSubscription["plan"];
+  archivedCustomerIds?: string[];
+  timeline?: { id: string; plan: CurrentSubscription["plan"]; status: "active" | "paused" | "scheduled"; startsAt: string; expiresAt: string | null; durationMonths: number; remainingMilliseconds: number | null; pauseReason: string | null; paymentStatus: string }[];
   status: "active";
   /** Derived from the last verified expiry while offline; never grants access. */
   offlineExpired?: boolean;
@@ -62,7 +66,7 @@ export type CurrentSubscription = {
     expiresAt: string | null;
     durationMonths: number;
   };
-  customerUsage: { used: number; limit: number | null; unlimited: boolean; remaining: number | null };
+  customerUsage: { archived?: number; selectionRequired?: boolean; used: number; limit: number | null; unlimited: boolean; remaining: number | null };
   verifiedAt: string;
   lastSyncedAt: string;
   entitlementVersion: number;
@@ -74,7 +78,7 @@ export type SubscriptionSnapshot = {
   history: {
     id: string;
     plan: { name?: string; code?: string };
-    status: "active" | "scheduled" | "expired" | "cancelled" | "superseded";
+    status: "active" | "paused" | "scheduled" | "expired" | "cancelled" | "superseded";
     startsAt: string | null;
     expiresAt: string | null;
     durationMonths: number;

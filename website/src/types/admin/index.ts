@@ -72,6 +72,8 @@ export type Dashboard = {
   period: { from: string; to: string };
 };
 export type ShopDetail = {
+  counts?: { total: number; active: number; archived: number };
+  queue?: DataRow[];
   shop: DataRow;
   subscription: DataRow;
   history: DataRow[];

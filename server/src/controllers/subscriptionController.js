@@ -1,9 +1,11 @@
+import { acceptPaymentWebhook } from "../services/paymentWebhookInbox.js";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { subscriptionConfig } from "../config/env.js";
 import { error } from "../utils/http.js";
 import {
   createSubscriptionOrder,
+  previewSubscriptionPurchase,
   getCurrentSubscription,
   getPaymentOrderStatus,
   getPaymentAttemptStatus,
@@ -11,7 +13,6 @@ import {
   getSubscriptionUsage,
   listPaymentHistory,
   listSubscriptionPlans,
-  processPaymentWebhook,
   verifyPayment,
 } from "../services/subscriptionService.js";
 
@@ -20,6 +21,8 @@ const purchaseSchema = z.object({
   durationMonths: z.union([z.literal(1), z.literal(3), z.literal(6), z.literal(12)]),
   acceptedPricingVersion: z.number().int().positive().safe().optional(),
   useWallet: z.boolean().optional(),
+  acknowledgeDuplicateRisk: z.boolean().optional(),
+  previewToken: z.string().max(4096).optional(),
 }).strict();
 
 function serviceFailure(res, next, e) {
@@ -28,7 +31,7 @@ function serviceFailure(res, next, e) {
   if (e?.code === "SUBSCRIPTION_PRICE_ACCEPTANCE_REQUIRED")
     return res.status(428).json({ error: e.message, code: e.code });
   if (Number.isInteger(e?.status) && e.status >= 400 && e.status < 600)
-    return error(res, e.status, e.message);
+    return res.status(e.status).json({ error: e.message, ...(typeof e.code === "string" ? { code: e.code } : {}) });
   return next(e);
 }
 
@@ -69,6 +72,8 @@ async function createOrder(req, res, next) {
       months: parsed.data.durationMonths,
       acceptedPricingVersion: parsed.data.acceptedPricingVersion,
       useWallet: parsed.data.useWallet === true,
+      previewToken: parsed.data.previewToken,
+      acknowledgeDuplicateRisk: parsed.data.acknowledgeDuplicateRisk === true,
       idempotencyKey: String(req.headers["idempotency-key"] || ""),
     });
     res.status(201).json({
@@ -130,17 +135,25 @@ export async function handle_post_payment_webhook(req, res, next) {
       return error(res, 400, "Invalid webhook signature");
     const event = JSON.parse(req.body.toString("utf8"));
     const eventType = String(event.type || "");
-    const orderId = String(event.data?.order?.order_id || "");
+    const orderId = String(event.data?.order?.order_id || event.data?.refund?.order_id || event.data?.order_id || event.data?.dispute?.order_id || "");
     const paymentId = String(event.data?.payment?.cf_payment_id || "");
-    if (!orderId || !paymentId || !["PAYMENT_SUCCESS_WEBHOOK", "PAYMENT_FAILED_WEBHOOK", "PAYMENT_USER_DROPPED_WEBHOOK"].includes(eventType))
+    const refundId = String(event.data?.refund?.refund_id || event.data?.refund_id || "");
+    if (!eventType || (!orderId && !eventType.includes("DISPUTE")))
       return res.status(200).json({ received: true, ignored: true });
     const eventId = createHash("sha256")
-      .update(`${eventType}:${orderId}:${paymentId}:${String(event.event_time || "")}`)
+      .update(req.body)
       .digest("hex");
-    await processPaymentWebhook({ eventId, eventType, orderId, paymentId });
-    res.status(200).json({ received: true });
+    const result = await acceptPaymentWebhook({ eventId, eventType, orderId, paymentId, refundId });
+    res.status(200).json(result);
   } catch (e) {
     if (e instanceof SyntaxError) return error(res, 400, "Invalid webhook body");
     serviceFailure(res, next, e);
   }
+}
+
+export async function handle_post_subscription_preview(req, res, next) {
+  const parsed = purchaseSchema.safeParse(req.body);
+  if (!parsed.success) return error(res, 400, "Invalid subscription preview");
+  try { res.json(await previewSubscriptionPurchase({ shopId: req.shopId, planCode: parsed.data.planCode, months: parsed.data.durationMonths, useWallet: parsed.data.useWallet })); }
+  catch (e) { serviceFailure(res, next, e); }
 }

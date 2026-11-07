@@ -180,6 +180,11 @@ async function runMigrations(db: SQLiteTypes.SQLiteDatabase) {
       CREATE TABLE IF NOT EXISTS local_subscription_cache (
         account_id TEXT PRIMARY KEY NOT NULL, snapshot_json TEXT NOT NULL, updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS payment_reference_journal (
+        scope TEXT NOT NULL, reference_key TEXT NOT NULL, record_json TEXT NOT NULL,
+        checked_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (scope, reference_key)
+      );
       CREATE TABLE IF NOT EXISTS sync_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, previous_json TEXT,
         next_json TEXT, change_json TEXT NOT NULL, created_at INTEGER NOT NULL,
@@ -807,6 +812,39 @@ export async function readSubscriptionSnapshot(accountId: string): Promise<unkno
   );
   if (!row) return null;
   try { return JSON.parse(row.snapshot_json); } catch { return null; }
+}
+
+/** Recovery references are not entitlement proof. Retain them in the existing
+ * encrypted database instead of an ever-growing SecureStore JSON value. */
+export async function retainOfflinePaymentReference(scope: string, reference: {
+  shopId?: string; idempotencyKey?: string; orderId?: string;
+}) {
+  const db = await openDatabase();
+  if (!db) throw new Error("Payment reference storage unavailable");
+  const identifier = reference.idempotencyKey || reference.orderId;
+  if (!identifier) throw new Error("Invalid payment reference");
+  const key = `${reference.shopId || "legacy"}:${identifier}`;
+  await withEncryptedTransaction(db, async tx => {
+    const previous = await tx.getFirstAsync<{ record_json: string }>(
+      "SELECT record_json FROM payment_reference_journal WHERE scope = ? AND reference_key = ?", scope, key);
+    const merged = { ...(previous ? JSON.parse(previous.record_json) : {}), ...reference };
+    await tx.runAsync(`INSERT INTO payment_reference_journal (scope, reference_key, record_json)
+      VALUES (?, ?, ?) ON CONFLICT(scope, reference_key) DO UPDATE SET record_json=excluded.record_json`,
+    scope, key, JSON.stringify(merged));
+  });
+}
+
+export async function readOfflinePaymentReferences(scope: string) {
+  const db = await openDatabase();
+  if (!db) throw new Error("Payment reference storage unavailable");
+  return db.getAllAsync<{ reference_key: string; record_json: string }>(
+    "SELECT reference_key, record_json FROM payment_reference_journal WHERE scope = ? ORDER BY checked_at, reference_key LIMIT 20", scope);
+}
+
+export async function markOfflinePaymentReferenceChecked(scope: string, key: string) {
+  const db = await openDatabase();
+  if (!db) throw new Error("Payment reference storage unavailable");
+  await db.runAsync("UPDATE payment_reference_journal SET checked_at = ? WHERE scope = ? AND reference_key = ?", Date.now(), scope, key);
 }
 
 /** Remove only cached subscription authorization metadata; customer, ledger and sync data stay intact. */

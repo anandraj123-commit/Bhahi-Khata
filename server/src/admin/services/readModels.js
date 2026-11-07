@@ -1,11 +1,15 @@
 import mongoose from "mongoose";
 import {
   Shop,
+  Customer,
   User,
   ShopSubscription,
   SubscriptionPlan,
   PaymentTransaction,
   PaymentOrder,
+  PaymentWebhookEvent,
+  PaymentRefund,
+  PaymentOrderRecovery,
   SubscriptionAuditLog,
 } from "../../models.js";
 import { AdminAudit } from "../models/index.js";
@@ -20,7 +24,7 @@ export function dateRange(f, field = "createdAt") {
   return Object.keys(bounds).length ? { [field]: bounds } : {};
 }
 export const activeSubscriptionMatch = (now) => ({
-  status: { $in: ["active", "scheduled"] },
+  status: { $in: ["active", "paused", "scheduled"] },
   startsAt: { $lte: now },
   $or: [{ expiresAt: { $gt: now } }, { expiresAt: null }],
 });
@@ -36,11 +40,12 @@ export function subscriptionStatusMatch(status, now = new Date()) {
     return {
       $or: [
         { status: "expired" },
-        { status: { $in: ["active", "scheduled"] }, expiresAt: { $lte: now } },
+        { status: { $in: ["active", "paused", "scheduled"] }, expiresAt: { $lte: now } },
       ],
     };
   if (status === "scheduled")
     return { status: "scheduled", startsAt: { $gt: now } };
+  if (status === "paused") return { status: "paused", startsAt: { $gt: now } };
   if (status === "cancelled") return { status };
   throw fail(400, "ADMIN_FILTER_INVALID", "Unknown subscription status");
 }
@@ -51,6 +56,9 @@ export const subscriptionProjection = {
   status: 1,
   startsAt: 1,
   expiresAt: 1,
+  remainingMilliseconds: 1,
+  pauseReason: 1,
+  segments: 1,
   amountPaidMinor: 1,
   durationMonths: 1,
   createdAt: 1,
@@ -114,11 +122,12 @@ const paymentDetailsJoin = () => [
       as: "purchaseOrder",
     },
   },
-  {
-    $match: {
-      "purchaseOrder.appMode": process.env.APP_MODE,
-    },
-  },
+  { $lookup: { from: PaymentOrderRecovery.collection.name, localField: "orderId", foreignField: "_id", as: "recoveryOrder" } },
+  { $match: { $or: [
+    { "purchaseOrder.appMode": process.env.APP_MODE },
+    { "purchaseOrder.0": { $exists: false }, "recoveryOrder.appMode": process.env.APP_MODE },
+    { "purchaseOrder.0": { $exists: false }, appMode: process.env.APP_MODE },
+  ] } },
   {
     $lookup: {
       from: ShopSubscription.collection.name,
@@ -140,7 +149,7 @@ const paymentDetailsJoin = () => [
       subscriptionStatus: { $arrayElemAt: ["$subscription.status", 0] },
     },
   },
-  { $unset: ["purchaseOrder", "subscription"] },
+  { $unset: ["purchaseOrder", "recoveryOrder", "subscription"] },
 ];
 async function aggregate(model, pipeline) {
   return model.aggregate(pipeline).option({ maxTimeMS: 10000 }).exec();
@@ -272,6 +281,10 @@ export async function subscriptions(f) {
           ...(f.shopId ? { shopId: oid(f.shopId) } : {}),
         },
       },
+      { $set: { status: { $cond: [
+        { $in: ["$status", ["active", "paused", "scheduled"]] },
+        { $cond: [{ $lte: ["$expiresAt", new Date()] }, "expired", { $cond: [{ $lte: ["$startsAt", new Date()] }, "active", "$status"] }] }, "$status",
+      ] } } },
       shopLookup,
       ...shopFields(),
       ...searchStage(f, ["shopName", "planCode"]),
@@ -322,6 +335,9 @@ export async function payments(f) {
       currency: 1,
       status: 1,
       verificationStatus: 1,
+      gatewayStatus: 1,
+      reviewStatus: 1,
+      reviewReason: 1,
       refundedAmountMinor: 1,
       verifiedAt: 1,
       gatewayCreatedAt: 1,
@@ -392,6 +408,12 @@ export async function shopDetail(id, support) {
         .maxTimeMS(5000)
         .lean();
   return {
+    counts: {
+      total: await Customer.countDocuments({ shopId: id, deletedAt: { $exists: false } }),
+      active: await Customer.countDocuments({ shopId: id, deletedAt: { $exists: false }, status: { $ne: false }, disabled: { $ne: true }, removed: { $ne: true }, subscriptionArchived: { $ne: true } }),
+      archived: await Customer.countDocuments({ shopId: id, deletedAt: { $exists: false }, subscriptionArchived: true }),
+    },
+    queue: support ? [] : await ShopSubscription.find({ shopId: id, status: { $in: ["paused", "scheduled", "active"] }, startsAt: { $gt: new Date() } }).select(subscriptionProjection).sort({ startsAt: 1 }).lean(),
     shop: rows[0],
     subscription: current || {
       planCode: "free",
@@ -578,4 +600,36 @@ export function reportCsv(report) {
     ]),
   ];
   return rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+}
+
+export async function paymentOrders(f) {
+  return page(PaymentOrder, [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f), ...(f.shopId ? { shopId: oid(f.shopId) } : {}) } }, shopLookup, ...shopFields()], f,
+    { _id: 1, shopId: 1, shopName: 1, planCode: 1, durationMonths: 1, status: 1, gatewayOrderId: 1, amountMinor: 1, currency: 1, createdAt: 1, verifiedAt: 1, paymentReconciliationAttempts: 1, paymentReconciliationLastCode: 1, paymentReconciliationNextAt: 1, paymentReconciliationAttemptedAt: 1, paymentReconciliationCheckedAt: 1, gatewayOrderStatus: 1, latestPaymentStatus: 1, latestPaymentId: 1, refundReconciliationCheckedAt: 1, refundReconciliationLastCode: 1 });
+}
+
+export async function paymentRecoveryEvents(f) {
+  return page(PaymentWebhookEvent, [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f) } }], f,
+    { eventId: 1, eventType: 1, orderId: 1, paymentId: 1, status: 1, attempts: 1, nextAttemptAt: 1, lastErrorCode: 1, createdAt: 1, processedAt: 1 });
+}
+export async function paymentRecoverySnapshots(f) {
+  return page(PaymentOrderRecovery, [{ $match: { appMode: process.env.APP_MODE, reconciliationLastCode: { $exists: true } } }], f,
+    { shopId: 1, reconciliationNextAt: 1, reconciliationLastCode: 1, createdAt: 1 });
+}
+
+export async function paymentRefunds(f) {
+  return page(PaymentRefund, [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f), ...(f.shopId ? { shopId: oid(f.shopId) } : {}) } }], f,
+    { shopId: 1, orderId: 1, gatewayOrderId: 1, gatewayPaymentId: 1, gatewayRefundId: 1, amountMinor: 1, currency: 1, gatewayStatus: 1, verifiedAt: 1, entitlementReviewRequired: 1 });
+}
+
+export async function paymentHealth() {
+  const mode = { appMode: process.env.APP_MODE };
+  const cutoff = new Date(Date.now() - 3600_000);
+  const [webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews] = await Promise.all([
+    PaymentWebhookEvent.countDocuments({ ...mode, status: { $ne: "processed" } }),
+    PaymentWebhookEvent.countDocuments({ ...mode, status: { $ne: "processed" }, createdAt: { $lt: cutoff } }),
+    PaymentOrder.countDocuments({ ...mode, paymentReconciliationLastCode: { $exists: true } }),
+    PaymentOrder.countDocuments({ ...mode, refundReconciliationLastCode: { $exists: true } }),
+    PaymentOrderRecovery.countDocuments({ ...mode, reconciliationLastCode: { $exists: true } }),
+  ]);
+  return { webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews, observedAt: new Date() };
 }

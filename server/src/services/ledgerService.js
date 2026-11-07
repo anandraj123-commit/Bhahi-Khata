@@ -14,7 +14,7 @@ function serviceError(message, status, details = {}) {
 const entrySignedPaise = (entry) =>
   entry.type === "payment" ? -entry.amountPaise : entry.amountPaise;
 
-async function lockCustomerFinancials(shopId, clientId, session) {
+async function lockCustomerFinancials(shopId, clientId, session, collectionAmount) {
   const customer = await Customer.findOne({ shopId, clientId, deletedAt: { $exists: false } })
     .session(session).lean();
   if (!customer) throw serviceError("Customer not found", 404);
@@ -24,6 +24,10 @@ async function lockCustomerFinancials(shopId, clientId, session) {
   if (!active) throw serviceError("This customer is disabled or removed", 409, {
     code: "CUSTOMER_NOT_ACTIVE", current: null,
   });
+  const { assertCustomerOperation } = await import("./customerEntitlements.js");
+  const restricted = await assertCustomerOperation(shopId, customer, session, collectionAmount !== undefined);
+  if (restricted && collectionAmount !== undefined && collectionAmount > Math.max(0, await currentNetBalancePaise(shopId, clientId, session)))
+    throw serviceError("Archived customers can only pay their existing outstanding balance", 409, { code: "CUSTOMER_LIMIT_REACHED" });
   const result = await Customer.updateOne(
     { shopId, clientId, deletedAt: { $exists: false }, status: { $ne: false }, disabled: { $ne: true }, removed: { $ne: true } },
     { $inc: { financialVersion: 1 } },
@@ -164,7 +168,7 @@ export async function createLedgerEntry({ shopId, actorId, entry, audit, key, us
         duplicate = true;
         return;
       }
-      await lockCustomerFinancials(shopId, entry.customerId, session);
+      await lockCustomerFinancials(shopId, entry.customerId, session, entry.type === "payment" ? paise(entry.amount) : undefined);
       if (entry.type === "refund") {
         const netPaise = await currentNetBalancePaise(shopId, entry.customerId, session);
         if (netPaise >= 0 || paise(entry.amount) > -netPaise)

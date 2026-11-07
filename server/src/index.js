@@ -8,6 +8,7 @@ import { ensureCustomerLifecycleDefaults, ensureCustomerMobileIndex, ensureIndex
 import { startReminderWorker } from "./reminders.js";
 import { ensureSubscriptionPlans } from "./services/subscriptionService.js";
 import { startSubscriptionReminderWorker } from "./subscriptionReminders.js";
+import { startSubscriptionTransitionWorker } from "./subscriptionTransitions.js";
 import { startPaymentReconciliationWorker } from "./paymentReconciliation.js";
 
 try {
@@ -60,7 +61,7 @@ try {
   process.exit(1);
 }
 
-if (subscriptionConfig.checkoutEnabled) {
+if (subscriptionConfig.checkoutEnabled || (subscriptionConfig.cashfreeClientId && subscriptionConfig.cashfreeClientSecret)) {
   try {
     await ensureIndexes();
   } catch (error) {
@@ -90,6 +91,7 @@ server.on("error", (error) => {
 startReminderWorker(log);
 startSubscriptionReminderWorker(log);
 startPaymentReconciliationWorker(log);
+startSubscriptionTransitionWorker(log);
 async function shutdown(signal) {
   log.info({ signal }, "shutting down");
   server.close(async () => {

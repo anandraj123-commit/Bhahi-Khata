@@ -1,4 +1,5 @@
 const config = require("./app.json");
+require("./plugins/validateReleasePaymentConfig.cjs").validateReleasePaymentConfig(process.env);
 
 // EAS profiles are authoritative when present: preview APKs need cleartext
 // access to a developer's local HTTP API, while production remains HTTPS-only.

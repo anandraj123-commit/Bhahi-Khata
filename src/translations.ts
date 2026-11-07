@@ -1,4 +1,5 @@
-/** Locally reviewed core labels. Other strings deliberately fall back to English. */
+import { subscriptionTranslations } from "./subscriptionTranslations.ts";
+/** Bundled dictionaries; untranslated, unknown server text falls back to English. */
 export const localeDictionaries: Record<string, Record<string, string>> = {
   bn: {
     Home: "হোম", Customers: "গ্রাহক", Add: "যোগ করুন", Khata: "খাতা", More: "আরও", All: "সব", Due: "বাকি", Paid: "পরিশোধিত",
@@ -3888,6 +3889,20 @@ const downloadReportRows: Array<[string, ...string[]]> = [
 ];
 for (const [key, ...values] of downloadReportRows)
   downloadReportLocales.forEach((locale, index) => { localeDictionaries[locale][key] = values[index]; });
+
+for (const [locale, messages] of Object.entries(subscriptionTranslations)) {
+  const dictionary = localeDictionaries[locale];
+  for (const [key, value] of Object.entries(messages)) {
+    if (!dictionary[key]) dictionary[key] = value;
+  }
+}
+
+// Server status identifiers remain unchanged; only their displayed labels are localized.
+for (const dictionary of Object.values(localeDictionaries)) {
+  for (const [status, label] of Object.entries({ active: "Active", paid: "Paid", pending: "Pending", created: "Pending", failed: "Payment not completed", paused: "Paused subscription", scheduled: "Upcoming subscription" })) {
+    if (!dictionary[status] && dictionary[label]) dictionary[status] = dictionary[label];
+  }
+}
 
 export const CORE_TRANSLATION_KEYS = [
   "Home", "Customers", "Add", "Khata", "More", "All", "Due", "Paid",

@@ -170,3 +170,16 @@ export const handle_patch_customer_lifecycle = async (req, res, next) => {
     next(e);
   }
 };
+
+export async function handle_customer_selection(req, res, next) {
+  try {
+    const { getCustomerSelection, applyCustomerSelection } = await import("../services/customerEntitlements.js");
+    if (req.method === "GET") return res.json(await getCustomerSelection(req.shopId));
+    const parsed = z.object({ activeIds: z.array(z.string().min(1).max(80)).max(100000), operationId: z.string().uuid(), expectedVersion: z.string().length(64) }).strict().safeParse(req.body);
+    if (!parsed.success) return error(res, 400, "Invalid customer selection");
+    res.json(await applyCustomerSelection({ shopId: req.shopId, actorId: req.user._id, ...parsed.data }));
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message, code: e.code });
+    next(e);
+  }
+}

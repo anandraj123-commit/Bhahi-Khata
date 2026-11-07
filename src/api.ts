@@ -636,6 +636,8 @@ export async function createSubscriptionCheckout(input: {
   acceptedPricingVersion: number;
   idempotencyKey: string;
   useWallet?: boolean;
+  previewToken?: string;
+  acknowledgeDuplicateRisk?: boolean;
 }) {
   return request("/subscription/checkout", {
     method: "POST",
@@ -645,6 +647,8 @@ export async function createSubscriptionCheckout(input: {
       durationMonths: input.durationMonths,
       acceptedPricingVersion: input.acceptedPricingVersion,
       useWallet: input.useWallet === true,
+      previewToken: input.previewToken,
+      acknowledgeDuplicateRisk: input.acknowledgeDuplicateRisk === true,
     }),
   });
 }
@@ -656,6 +660,10 @@ export async function verifySubscriptionPayment(input: { orderId: string }) {
 export async function getSubscriptionPaymentStatus(orderId: string): Promise<{
   id: string;
   status: "created" | "pending" | "paid" | "failed";
+  hasPendingAttempts?: boolean;
+  requiresReview?: boolean;
+  latestPaymentStatus?: string;
+  latestPaymentId?: string;
   amountMinor: number;
   totalAmountMinor?: number;
   walletAppliedMinor?: number;
@@ -669,6 +677,10 @@ export async function getSubscriptionPaymentStatus(orderId: string): Promise<{
 export async function getSubscriptionPaymentAttemptStatus(idempotencyKey: string): Promise<{
   id: string;
   status: "created" | "pending" | "paid" | "failed";
+  hasPendingAttempts?: boolean;
+  requiresReview?: boolean;
+  latestPaymentStatus?: string;
+  latestPaymentId?: string;
   amountMinor: number;
   currency: string;
 }> {
@@ -912,4 +924,14 @@ export async function syncChange(previous: Data, next: Data, recordedAtAuthority
     ...createSyncDelta(previous, next),
     ...(recordedAtAuthority ? { recordedAtAuthority } : {}),
   });
+}
+
+export type SubscriptionPreview = { token: string; pricing: { pricingVersion: number; basePriceMinor: number; discountAmountMinor: number; taxAmountMinor: number; finalAmountMinor: number }; message: string; startsAt: string; expiresAt: string; customerLimit: number | null; unlimitedCustomers: boolean };
+export function previewSubscriptionPurchase(input: { planCode: string; durationMonths: number; useWallet: boolean }): Promise<SubscriptionPreview> {
+  return request("/subscription/preview", { method: "POST", body: JSON.stringify(input) });
+}
+export type CustomerSelection = { version: string; limit: number | null; customers: { id: string; name: string; archived: boolean }[]; suggestedIds: string[] };
+export function getCustomerSelection(): Promise<CustomerSelection> { return request("/customers/selection"); }
+export function applyCustomerSelection(input: { activeIds: string[]; operationId: string; expectedVersion: string }): Promise<{ activeIds: string[]; archivedIds: string[] }> {
+  return request("/customers/selection", { method: "POST", body: JSON.stringify(input) });
 }

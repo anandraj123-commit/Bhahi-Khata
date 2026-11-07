@@ -34,6 +34,7 @@ type Plan = {
   entitlements: Record<string, string | number | boolean | null>;
   features: string[];
   enabled: boolean;
+  tier?: number;
   displayOrder: number;
   configurationVersion: number;
   pricingVersion: number;
@@ -48,6 +49,7 @@ type Draft = {
   entitlements: string;
   features: string;
   enabled: boolean;
+  tier: string;
   displayOrder: string;
   durations: DurationDraft[];
 };
@@ -63,6 +65,7 @@ function draftFrom(plan: Plan): Draft {
     entitlements: JSON.stringify(plan.entitlements || {}, null, 2),
     features: (plan.features || []).join("\n"),
     enabled: plan.enabled,
+    tier: String(plan.tier ?? ({ free: 0, pro: 1, business: 2 }[plan.code])),
     displayOrder: String(plan.displayOrder || 0),
     durations: (plan.durations || []).map((item) => ({
       months: item.months,
@@ -171,6 +174,7 @@ export function PlanLimitManagement() {
           features: draft.features.split("\n").map((item) => item.trim()).filter(Boolean),
           entitlements,
           enabled: selected.code === "free" ? true : draft.enabled,
+          tier: Number(draft.tier),
           displayOrder: Number(draft.displayOrder),
           durations,
         },
@@ -244,6 +248,7 @@ export function PlanLimitManagement() {
             </div></div>
             <label className="a-field"><span>Plan benefits (one per line)</span><textarea className="a-input" value={draft.features} disabled={busy} onChange={(event) => setDraft({ ...draft, features: event.target.value })} /></label>
             <label className="a-field"><span>Entitlements (JSON object)</span><textarea className="a-input" rows={5} value={draft.entitlements} disabled={busy} onChange={(event) => setDraft({ ...draft, entitlements: event.target.value })} /></label>
+            <label className="a-field"><span>Plan tier (Free &lt; Pro &lt; Business)</span><input className="a-input" type="number" min="0" max="100" step="1" value={draft.tier} disabled={busy} onChange={(event) => setDraft({ ...draft, tier: event.target.value })} /></label>
             <label className="a-field"><span>Display order</span><input className="a-input" type="number" min="0" max="1000" step="1" value={draft.displayOrder} disabled={busy} onChange={(event) => setDraft({ ...draft, displayOrder: event.target.value })} /></label>
             {selected.code !== "free" && <label><input type="checkbox" checked={draft.enabled} disabled={busy} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} /> Plan available for new purchases</label>}
             {selected.code === "free" ? <p className="a-definition">Free remains active at ₹0 as the permanent fallback. No Cashfree payment is created.</p> : <>

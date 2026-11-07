@@ -13,6 +13,7 @@ export const permissions = Object.freeze({
     "plans:manage",
     "referrals:manage",
     "payments:read",
+    "payments:reconcile",
     "reports:read",
     "audit:read",
     "administrators:manage",

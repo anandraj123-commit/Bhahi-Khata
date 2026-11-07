@@ -14,6 +14,7 @@ export const customerOut = (d) => ({
   openingAdvance: (d.openingAdvancePaise || 0) / 100,
   limit: d.limitPaise / 100,
   reminder: d.reminder,
+  subscriptionArchived: d.subscriptionArchived === true,
   status: d.status ?? true,
   disabled: d.disabled ?? false,
   removed: d.removed ?? false,

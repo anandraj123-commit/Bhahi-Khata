@@ -4,6 +4,10 @@ const baseUrl = () => subscriptionConfig.cashfreeEnvironment === "production"
   ? "https://api.cashfree.com/pg"
   : "https://sandbox.cashfree.com/pg";
 
+const inflightReads = new Map();
+let retryAfterUntil = 0;
+let activeRequests = 0;
+
 function headers(idempotencyKey) {
   return {
     "Content-Type": "application/json",
@@ -16,6 +20,19 @@ function headers(idempotencyKey) {
 }
 
 async function cashfreeRequest(path, { method = "GET", body, idempotencyKey } = {}) {
+  if (method === "GET" && inflightReads.has(path)) return inflightReads.get(path);
+  if (Date.now() < retryAfterUntil || activeRequests >= 8)
+    throw Object.assign(new Error("Payment provider verification will retry"), {
+      status: 503, code: "CASHFREE_RATE_LIMITED", retryAfterMs: Math.max(1000, retryAfterUntil - Date.now()),
+    });
+  activeRequests += 1;
+  const request = performRequest(path, { method, body, idempotencyKey });
+  if (method === "GET") inflightReads.set(path, request);
+  try { return await request; }
+  finally { activeRequests -= 1; if (method === "GET") inflightReads.delete(path); }
+}
+
+async function performRequest(path, { method, body, idempotencyKey }) {
   let response;
   try {
     response = await fetch(`${baseUrl()}${path}`, {
@@ -29,9 +46,17 @@ async function cashfreeRequest(path, { method = "GET", body, idempotencyKey } = 
   }
   const value = await response.json().catch(() => null);
   if (!response.ok) {
+    if (response.status === 429) {
+      const raw = response.headers.get("retry-after") || "60";
+      const seconds = Number(raw);
+      const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(raw) - Date.now();
+      retryAfterUntil = Date.now() + Math.min(86400_000, Math.max(1000, Number.isFinite(delay) ? delay : 60_000));
+    }
     throw Object.assign(new Error("Payment provider request failed"), {
       status: response.status === 429 ? 503 : 502,
-      code: "CASHFREE_REQUEST_FAILED",
+      code: response.status === 429 ? "CASHFREE_RATE_LIMITED" : "CASHFREE_REQUEST_FAILED",
+      providerStatus: response.status,
+      ...(response.status === 429 ? { retryAfterMs: retryAfterUntil - Date.now() } : {}),
     });
   }
   return value;
@@ -108,6 +133,13 @@ export async function fetchCashfreePayment({ orderId, paymentId }) {
   );
   if (String(value?.cf_payment_id || "") !== String(paymentId))
     throw Object.assign(new Error("Payment could not be verified"), { status: 502, code: "CASHFREE_PAYMENT_MISMATCH" });
+  return value;
+}
+
+export async function fetchCashfreeRefunds(orderId) {
+  const value = await cashfreeRequest(`/orders/${encodeURIComponent(orderId)}/refunds`);
+  if (!Array.isArray(value))
+    throw Object.assign(new Error("Refund status could not be verified"), { status: 502, code: "CASHFREE_INVALID_REFUNDS" });
   return value;
 }
 

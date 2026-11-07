@@ -106,6 +106,6 @@ Use your own release signing credentials before publishing. Keep the generated n
 - `server/src/reminders.js`: opt-in scheduled reminder worker.
 - `docker-compose.yml`: optional local MongoDB replica set and API service.
 
-The isolated Admin integration suite is run with `node --test server/src/admin/tests/unit.test.mjs server/src/admin/tests/integration.test.mjs`; its MongoDB fixture is restricted to the local `digital_khata_testing` replica set. Mobile and payment checks are run with `npm run typecheck`, `npm run test:subscription-security`, and `npm --prefix server run test:payments`.
+Automated testing is postponed until explicitly requested by the project owner. Use the available typecheck, syntax-check and application-build commands during development. Deployment environment and index-management commands remain unchanged.
 
  * Node.js version: v22.14.0

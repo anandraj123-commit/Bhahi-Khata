@@ -58,6 +58,8 @@ export const handle_post_ledger = async (req, res, next) => {
   } catch (e) {
     if (e.status === 409 && e.code === "CUSTOMER_NOT_ACTIVE")
       return res.status(409).json({ error: e.message, code: e.code, type: "transaction_conflict", current: null, serverVersion: 1, resolutionVersion: 1 });
+    if (e.status === 409 && e.code === "CUSTOMER_LIMIT_REACHED")
+      return res.status(409).json({ error: e.message, code: e.code });
     if (e.status === 400 || e.status === 404 || e.status === 409)
       return error(res, e.status, e.message);
     next(e);

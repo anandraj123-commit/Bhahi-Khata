@@ -259,8 +259,8 @@ export async function transitionCustomer({ shopId, actorId, customerId, target, 
           });
       }
       if (from !== target) {
-        if (from === "active" && target !== "active") await releaseCustomerCapacity({ shopId, session });
-        if (from !== "active" && target === "active") await reserveCustomerCapacity({ shopId, session });
+        if (!doc.subscriptionArchived && from === "active" && target !== "active") await releaseCustomerCapacity({ shopId, session });
+        if (!doc.subscriptionArchived && from !== "active" && target === "active") await reserveCustomerCapacity({ shopId, session });
         doc.set({ ...targetFlags, serverVersion: actualVersion + 1, resolutionVersion: actualResolutionVersion + 1 });
         await doc.save({ session });
       }
@@ -320,7 +320,7 @@ export async function deleteCustomer({ shopId, actorId, id, base, baseVersion, b
       customer.serverVersion = actualVersion + 1;
       customer.resolutionVersion = (customer.resolutionVersion || 1) + 1;
       await customer.save({ session });
-      await releaseCustomerCapacity({ shopId, session });
+      if (!customer.subscriptionArchived && customerStatusName(customerOut(customer)) === "active") await releaseCustomerCapacity({ shopId, session });
       if (audit) await saveAudit({ shopId, actorId, session }, audit);
     });
   } finally {
@@ -391,7 +391,7 @@ export async function resolveCustomerConflict({
             customer.deletedAt = new Date();
             customer.phoneActive = false;
             customer.serverVersion = actualVersion + 1;
-            await releaseCustomerCapacity({ shopId, session });
+            if (!customer.subscriptionArchived && customerStatusName(customerOut(customer)) === "active") await releaseCustomerCapacity({ shopId, session });
           }
           selected = null;
         } else {
@@ -413,9 +413,13 @@ export async function resolveCustomerConflict({
           const openingAdvancePaise = paise(proposed.openingAdvance || 0);
           const changed = wasDeleted || currentStatus !== proposedStatus || !sameCustomerValues(customerOut(customer), proposed);
           if (changed) {
-            if (wasDeleted) await reserveCustomerCapacity({ shopId, session });
-            else if (input.lifecycleChange && currentStatus === "active" && proposedStatus !== "active") await releaseCustomerCapacity({ shopId, session });
-            else if (input.lifecycleChange && currentStatus !== "active" && proposedStatus === "active") await reserveCustomerCapacity({ shopId, session });
+            if (openingPaise !== customer.openingPaise || openingAdvancePaise !== (customer.openingAdvancePaise || 0)) {
+              const { assertCustomerOperation } = await import('./customerEntitlements.js');
+              await assertCustomerOperation(shopId, customer, session);
+            }
+            if (wasDeleted && !customer.subscriptionArchived && proposedStatus === "active") await reserveCustomerCapacity({ shopId, session });
+            else if (!customer.subscriptionArchived && input.lifecycleChange && currentStatus === "active" && proposedStatus !== "active") await releaseCustomerCapacity({ shopId, session });
+            else if (!customer.subscriptionArchived && input.lifecycleChange && currentStatus !== "active" && proposedStatus === "active") await reserveCustomerCapacity({ shopId, session });
             customer.set({
               name: proposed.name,
               nameFolded: proposed.name.toLocaleLowerCase("en"),
