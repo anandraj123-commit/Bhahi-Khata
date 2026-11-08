@@ -113,7 +113,7 @@ export function FilterSelect({
   );
 }
 type Shop = { id: string; name: string };
-function ShopSelect({
+export function ShopSelect({
   value,
   onChange,
   onLabel,

@@ -1,3 +1,4 @@
+import { attachOrderLinks } from "./paymentOrders.js";
 import mongoose from "mongoose";
 import {
   Shop,
@@ -40,7 +41,10 @@ export function subscriptionStatusMatch(status, now = new Date()) {
     return {
       $or: [
         { status: "expired" },
-        { status: { $in: ["active", "paused", "scheduled"] }, expiresAt: { $lte: now } },
+        {
+          status: { $in: ["active", "paused", "scheduled"] },
+          expiresAt: { $lte: now },
+        },
       ],
     };
   if (status === "scheduled")
@@ -118,22 +122,75 @@ const paymentDetailsJoin = () => [
       from: PaymentOrder.collection.name,
       localField: "orderId",
       foreignField: "_id",
-      pipeline: [{ $project: { appMode: 1, planCode: 1, durationMonths: 1, pricingSnapshot: 1, createdAt: 1 } }],
+      let: { paymentShop: "$shopId", providerOrder: "$gatewayOrderId" },
+      pipeline: [
+        {
+          $match: {
+            appMode: process.env.APP_MODE,
+            $expr: {
+              $and: [
+                { $eq: ["$shopId", "$$paymentShop"] },
+                { $eq: ["$gatewayOrderId", "$$providerOrder"] },
+              ],
+            },
+          },
+        },
+        {
+          $project: {
+            appMode: 1,
+            planCode: 1,
+            durationMonths: 1,
+            pricingSnapshot: 1,
+            createdAt: 1,
+          },
+        },
+      ],
       as: "purchaseOrder",
     },
   },
-  { $lookup: { from: PaymentOrderRecovery.collection.name, localField: "orderId", foreignField: "_id", as: "recoveryOrder" } },
-  { $match: { $or: [
-    { "purchaseOrder.appMode": process.env.APP_MODE },
-    { "purchaseOrder.0": { $exists: false }, "recoveryOrder.appMode": process.env.APP_MODE },
-    { "purchaseOrder.0": { $exists: false }, appMode: process.env.APP_MODE },
-  ] } },
+  {
+    $lookup: {
+      from: PaymentOrderRecovery.collection.name,
+      localField: "orderId",
+      foreignField: "_id",
+      let: { paymentShop: "$shopId" },
+      pipeline: [
+        {
+          $match: {
+            appMode: process.env.APP_MODE,
+            $expr: { $eq: ["$shopId", "$$paymentShop"] },
+          },
+        },
+        { $project: { appMode: 1 } },
+      ],
+      as: "recoveryOrder",
+    },
+  },
+  {
+    $match: {
+      $or: [
+        { "purchaseOrder.appMode": process.env.APP_MODE },
+        {
+          "purchaseOrder.0": { $exists: false },
+          "recoveryOrder.appMode": process.env.APP_MODE,
+        },
+        {
+          "purchaseOrder.0": { $exists: false },
+          appMode: process.env.APP_MODE,
+        },
+      ],
+    },
+  },
   {
     $lookup: {
       from: ShopSubscription.collection.name,
       localField: "_id",
       foreignField: "sourcePaymentId",
-      pipeline: [{ $project: { startsAt: 1, expiresAt: 1, status: 1 } }],
+      let: { paymentShop: "$shopId" },
+      pipeline: [
+        { $match: { $expr: { $eq: ["$shopId", "$$paymentShop"] } } },
+        { $project: { startsAt: 1, expiresAt: 1, status: 1 } },
+      ],
       as: "subscription",
     },
   },
@@ -141,7 +198,9 @@ const paymentDetailsJoin = () => [
     $addFields: {
       planCode: { $arrayElemAt: ["$purchaseOrder.planCode", 0] },
       durationMonths: { $arrayElemAt: ["$purchaseOrder.durationMonths", 0] },
-      planName: { $arrayElemAt: ["$purchaseOrder.pricingSnapshot.plan.name", 0] },
+      planName: {
+        $arrayElemAt: ["$purchaseOrder.pricingSnapshot.plan.name", 0],
+      },
       pricingSnapshot: { $arrayElemAt: ["$purchaseOrder.pricingSnapshot", 0] },
       orderCreatedAt: { $arrayElemAt: ["$purchaseOrder.createdAt", 0] },
       subscriptionStartsAt: { $arrayElemAt: ["$subscription.startsAt", 0] },
@@ -281,10 +340,29 @@ export async function subscriptions(f) {
           ...(f.shopId ? { shopId: oid(f.shopId) } : {}),
         },
       },
-      { $set: { status: { $cond: [
-        { $in: ["$status", ["active", "paused", "scheduled"]] },
-        { $cond: [{ $lte: ["$expiresAt", new Date()] }, "expired", { $cond: [{ $lte: ["$startsAt", new Date()] }, "active", "$status"] }] }, "$status",
-      ] } } },
+      {
+        $set: {
+          status: {
+            $cond: [
+              { $in: ["$status", ["active", "paused", "scheduled"]] },
+              {
+                $cond: [
+                  { $lte: ["$expiresAt", new Date()] },
+                  "expired",
+                  {
+                    $cond: [
+                      { $lte: ["$startsAt", new Date()] },
+                      "active",
+                      "$status",
+                    ],
+                  },
+                ],
+              },
+              "$status",
+            ],
+          },
+        },
+      },
       shopLookup,
       ...shopFields(),
       ...searchStage(f, ["shopName", "planCode"]),
@@ -305,12 +383,16 @@ export async function payments(f) {
     ].includes(f.status)
   )
     throw fail(400, "ADMIN_FILTER_INVALID", "Unknown payment status");
-  return page(
+  const result = await page(
     PaymentTransaction,
     [
       {
         $match: {
           ...dateRange(f),
+          $or: [
+            { appMode: process.env.APP_MODE },
+            { appMode: { $exists: false } },
+          ],
           ...(f.status ? { status: f.status } : {}),
           ...(f.shopId ? { shopId: oid(f.shopId) } : {}),
         },
@@ -323,6 +405,7 @@ export async function payments(f) {
     f,
     {
       _id: 1,
+      orderId: 1,
       planCode: 1,
       durationMonths: 1,
       planName: 1,
@@ -348,6 +431,8 @@ export async function payments(f) {
       subscriptionStatus: 1,
     },
   );
+  result.data = await attachOrderLinks(result.data);
+  return result;
 }
 export async function auditLogs(f) {
   return page(
@@ -409,11 +494,34 @@ export async function shopDetail(id, support) {
         .lean();
   return {
     counts: {
-      total: await Customer.countDocuments({ shopId: id, deletedAt: { $exists: false } }),
-      active: await Customer.countDocuments({ shopId: id, deletedAt: { $exists: false }, status: { $ne: false }, disabled: { $ne: true }, removed: { $ne: true }, subscriptionArchived: { $ne: true } }),
-      archived: await Customer.countDocuments({ shopId: id, deletedAt: { $exists: false }, subscriptionArchived: true }),
+      total: await Customer.countDocuments({
+        shopId: id,
+        deletedAt: { $exists: false },
+      }),
+      active: await Customer.countDocuments({
+        shopId: id,
+        deletedAt: { $exists: false },
+        status: { $ne: false },
+        disabled: { $ne: true },
+        removed: { $ne: true },
+        subscriptionArchived: { $ne: true },
+      }),
+      archived: await Customer.countDocuments({
+        shopId: id,
+        deletedAt: { $exists: false },
+        subscriptionArchived: true,
+      }),
     },
-    queue: support ? [] : await ShopSubscription.find({ shopId: id, status: { $in: ["paused", "scheduled", "active"] }, startsAt: { $gt: new Date() } }).select(subscriptionProjection).sort({ startsAt: 1 }).lean(),
+    queue: support
+      ? []
+      : await ShopSubscription.find({
+          shopId: id,
+          status: { $in: ["paused", "scheduled", "active"] },
+          startsAt: { $gt: new Date() },
+        })
+          .select(subscriptionProjection)
+          .sort({ startsAt: 1 })
+          .lean(),
     shop: rows[0],
     subscription: current || {
       planCode: "free",
@@ -603,36 +711,177 @@ export function reportCsv(report) {
 }
 
 export async function paymentOrders(f) {
-  return page(PaymentOrder, [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f), ...(f.shopId ? { shopId: oid(f.shopId) } : {}) } }, shopLookup, ...shopFields()], f,
-    { _id: 1, shopId: 1, shopName: 1, planCode: 1, durationMonths: 1, status: 1, gatewayOrderId: 1, amountMinor: 1, currency: 1, createdAt: 1, verifiedAt: 1, paymentReconciliationAttempts: 1, paymentReconciliationLastCode: 1, paymentReconciliationNextAt: 1, paymentReconciliationAttemptedAt: 1, paymentReconciliationCheckedAt: 1, gatewayOrderStatus: 1, latestPaymentStatus: 1, latestPaymentId: 1, refundReconciliationCheckedAt: 1, refundReconciliationLastCode: 1 });
+  return page(
+    PaymentOrder,
+    [
+      {
+        $match: {
+          appMode: process.env.APP_MODE,
+          ...dateRange(f),
+          ...(f.shopId ? { shopId: oid(f.shopId) } : {}),
+        },
+      },
+      shopLookup,
+      ...shopFields(),
+    ],
+    f,
+    {
+      _id: 1,
+      shopId: 1,
+      shopName: 1,
+      planCode: 1,
+      durationMonths: 1,
+      status: 1,
+      gatewayOrderId: 1,
+      amountMinor: 1,
+      currency: 1,
+      createdAt: 1,
+      verifiedAt: 1,
+      paymentReconciliationAttempts: 1,
+      paymentReconciliationLastCode: 1,
+      paymentReconciliationNextAt: 1,
+      paymentReconciliationAttemptedAt: 1,
+      paymentReconciliationCheckedAt: 1,
+      gatewayOrderStatus: 1,
+      latestPaymentStatus: 1,
+      latestPaymentId: 1,
+      refundReconciliationCheckedAt: 1,
+      refundReconciliationLastCode: 1,
+    },
+  );
 }
 
 export async function paymentRecoveryEvents(f) {
-  return page(PaymentWebhookEvent, [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f) } }], f,
-    { eventId: 1, eventType: 1, orderId: 1, paymentId: 1, status: 1, attempts: 1, nextAttemptAt: 1, lastErrorCode: 1, createdAt: 1, processedAt: 1 });
+  const result = await page(
+    PaymentWebhookEvent,
+    [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f) } }],
+    f,
+    {
+      eventId: 1,
+      eventType: 1,
+      orderId: 1,
+      paymentId: 1,
+      status: 1,
+      attempts: 1,
+      nextAttemptAt: 1,
+      lastErrorCode: 1,
+      createdAt: 1,
+      processedAt: 1,
+    },
+  );
+  result.data = await attachOrderLinks(result.data, {
+    providerReference: true,
+  });
+  return result;
 }
 export async function paymentRecoverySnapshots(f) {
-  return page(PaymentOrderRecovery, [{ $match: { appMode: process.env.APP_MODE, reconciliationLastCode: { $exists: true } } }], f,
-    { shopId: 1, reconciliationNextAt: 1, reconciliationLastCode: 1, createdAt: 1 });
+  return page(
+    PaymentOrderRecovery,
+    [
+      {
+        $match: {
+          appMode: process.env.APP_MODE,
+          reconciliationLastCode: { $exists: true },
+        },
+      },
+    ],
+    f,
+    {
+      shopId: 1,
+      reconciliationNextAt: 1,
+      reconciliationLastCode: 1,
+      createdAt: 1,
+    },
+  );
 }
 
 export async function paymentRefunds(f) {
-  return page(PaymentRefund, [{ $match: { appMode: process.env.APP_MODE, ...dateRange(f), ...(f.shopId ? { shopId: oid(f.shopId) } : {}) } }], f,
-    { shopId: 1, orderId: 1, gatewayOrderId: 1, gatewayPaymentId: 1, gatewayRefundId: 1, amountMinor: 1, currency: 1, gatewayStatus: 1, verifiedAt: 1, entitlementReviewRequired: 1 });
+  const result = await page(
+    PaymentRefund,
+    [
+      {
+        $match: {
+          appMode: process.env.APP_MODE,
+          ...dateRange(f),
+          ...(f.shopId ? { shopId: oid(f.shopId) } : {}),
+        },
+      },
+    ],
+    f,
+    {
+      shopId: 1,
+      orderId: 1,
+      gatewayOrderId: 1,
+      gatewayPaymentId: 1,
+      gatewayRefundId: 1,
+      amountMinor: 1,
+      currency: 1,
+      gatewayStatus: 1,
+      verifiedAt: 1,
+      entitlementReviewRequired: 1,
+    },
+  );
+  result.data = await attachOrderLinks(result.data, {
+    providerReference: false,
+  });
+  return result;
 }
 
 export async function paymentHealth() {
   const mode = { appMode: process.env.APP_MODE };
   const cutoff = new Date(Date.now() - 3600_000);
-  const [webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews, pendingReconciliation, verifiedRefunds, failedWebhookEvents] = await Promise.all([
-    PaymentWebhookEvent.countDocuments({ ...mode, status: { $ne: "processed" } }),
-    PaymentWebhookEvent.countDocuments({ ...mode, status: { $ne: "processed" }, createdAt: { $lt: cutoff } }),
-    PaymentOrder.countDocuments({ ...mode, paymentReconciliationLastCode: { $exists: true } }),
-    PaymentOrder.countDocuments({ ...mode, refundReconciliationLastCode: { $exists: true } }),
-    PaymentOrderRecovery.countDocuments({ ...mode, reconciliationLastCode: { $exists: true } }),
-    PaymentOrder.countDocuments({ ...mode, status: { $in: ["created", "pending"] } }).maxTimeMS(10000),
-    PaymentRefund.countDocuments({ ...mode, verifiedAt: { $type: "date" } }).maxTimeMS(10000),
-    PaymentWebhookEvent.countDocuments({ ...mode, status: "failed" }).maxTimeMS(10000),
+  const [
+    webhookBacklog,
+    overdueWebhooks,
+    orderErrors,
+    refundErrors,
+    missingOrderReviews,
+    pendingReconciliation,
+    verifiedRefunds,
+    failedWebhookEvents,
+  ] = await Promise.all([
+    PaymentWebhookEvent.countDocuments({
+      ...mode,
+      status: { $ne: "processed" },
+    }),
+    PaymentWebhookEvent.countDocuments({
+      ...mode,
+      status: { $ne: "processed" },
+      createdAt: { $lt: cutoff },
+    }),
+    PaymentOrder.countDocuments({
+      ...mode,
+      paymentReconciliationLastCode: { $exists: true },
+    }),
+    PaymentOrder.countDocuments({
+      ...mode,
+      refundReconciliationLastCode: { $exists: true },
+    }),
+    PaymentOrderRecovery.countDocuments({
+      ...mode,
+      reconciliationLastCode: { $exists: true },
+    }),
+    PaymentOrder.countDocuments({
+      ...mode,
+      status: { $in: ["created", "pending"] },
+    }).maxTimeMS(10000),
+    PaymentRefund.countDocuments({
+      ...mode,
+      verifiedAt: { $type: "date" },
+    }).maxTimeMS(10000),
+    PaymentWebhookEvent.countDocuments({ ...mode, status: "failed" }).maxTimeMS(
+      10000,
+    ),
   ]);
-  return { webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews, pendingReconciliation, verifiedRefunds, failedWebhookEvents, observedAt: new Date() };
+  return {
+    webhookBacklog,
+    overdueWebhooks,
+    orderErrors,
+    refundErrors,
+    missingOrderReviews,
+    pendingReconciliation,
+    verifiedRefunds,
+    failedWebhookEvents,
+    observedAt: new Date(),
+  };
 }

@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import Link from "next/link";
+import { PaymentOrderLink } from "../shared/payment-order-link";
 import { Search, ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
 import type { DataRow, Dashboard } from "../../../types/admin";
 import {
@@ -80,6 +81,7 @@ const columns: Record<Resource, Column[]> = {
     { key: "pauseReason", label: "Pause reason" },
   ],
   payments: [
+    { key: "resolvedOrderId", label: "Payment Order ID", render: r => <PaymentOrderLink id={r.resolvedOrderId} /> },
     { key: "gatewayStatus", label: "Cashfree attempt status" },
     {
       key: "reviewStatus",

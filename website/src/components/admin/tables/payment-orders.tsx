@@ -1,4 +1,5 @@
 "use client";
+import { PaymentOrderLink } from "../shared/payment-order-link";
 import { useId, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -510,6 +511,7 @@ export function PaymentOrders({
                 <thead>
                   <tr>
                     <th>Shop / order</th>
+                    <th>Payment Order ID</th>
                     <th>Plan</th>
                     <th className="a-payment-number">Amount</th>
                     <th>Status</th>
@@ -527,6 +529,9 @@ export function PaymentOrders({
                           {text(row.gatewayOrderId || row._id)}
                         </small>
                         <small>{timestamp(row.createdAt)}</small>
+                      </td>
+                      <td>
+                        <PaymentOrderLink id={row._id} />
                       </td>
                       <td>{text(row.planCode)}</td>
                       <td className="a-payment-number">{amount(row)}</td>
@@ -684,6 +689,7 @@ export function PaymentOrders({
                     <th>Provider status</th>
                     <th className="a-payment-number">Amount</th>
                     <th>Provider checked</th>
+                    <th>Payment Order ID</th>
                     <th>Entitlement review</th>
                   </tr>
                 </thead>
@@ -701,6 +707,9 @@ export function PaymentOrders({
                       </td>
                       <td className="a-payment-number">{amount(row)}</td>
                       <td>{timestamp(row.verifiedAt)}</td>
+                      <td>
+                        <PaymentOrderLink id={row.resolvedOrderId} />
+                      </td>
                       <td>
                         {row.entitlementReviewRequired === true ? (
                           <Badge>Review required</Badge>
@@ -734,6 +743,7 @@ export function PaymentOrders({
                     <tr>
                       <th>Event</th>
                       <th>Order reference</th>
+                      <th>Payment Order ID</th>
                       <th>Status</th>
                       <th>Diagnostic code</th>
                       <th className="a-payment-number">Retries</th>
@@ -746,6 +756,9 @@ export function PaymentOrders({
                         <td>{text(row.eventType)}</td>
                         <td className="a-payment-reference">
                           {text(row.orderId)}
+                        </td>
+                        <td>
+                          <PaymentOrderLink id={row.resolvedOrderId} />
                         </td>
                         <td>
                           <Status value={row.status} />

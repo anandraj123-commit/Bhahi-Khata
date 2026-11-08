@@ -6,6 +6,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import {
+  ReceiptText,
   ArrowLeftRight,
   LayoutDashboard,
   Store,
@@ -72,6 +73,12 @@ export const navigation = [
     href: "/admin/payments",
     label: "Payments",
     icon: Wallet,
+    permission: "payments:read",
+  },
+  {
+    href: "/admin/payment-orders",
+    label: "Payment Orders",
+    icon: ReceiptText,
     permission: "payments:read",
   },
   {
@@ -178,6 +185,7 @@ export function AdminShell({
       ? { label: "Shop details" }
       : path.startsWith("/admin/customers/")
         ? { label: "Customer details" }
+        : path.startsWith("/admin/payment-orders/") ? { label: "Payment order details" }
         : { label: "Administration" });
   const sidebar = (
     <>

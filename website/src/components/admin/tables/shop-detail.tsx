@@ -160,7 +160,7 @@ export function ShopDetail({ id }: { id: string }) {
           )}
           {session.permissions.includes("subscriptions:read") && (
             <>
-              <h2 className="a-title" style={{ margin: "24px 0 14px" }}>
+              <h2 className="a-title" style={{ margin: "24px 0 14px" }} id="shop-subscription-records">
                 Subscription records
               </h2>
               <ResourceTable resource="subscriptions" shopId={id} />

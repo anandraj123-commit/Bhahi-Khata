@@ -1317,3 +1317,17 @@ body:has(.dk-admin-root[data-theme="dark"]) .dk-admin {
 .a-opening-comparison p { margin:6px 0 0; }
 @media(max-width:900px) { .a-opening-cards { grid-template-columns:repeat(2,minmax(0,1fr)); } .a-opening-explanations { grid-template-columns:1fr; gap:16px; } }
 @media(max-width:540px) { .a-opening-header { flex-direction:column; } .a-opening-cards { grid-template-columns:1fr; } .a-opening-summary { padding:16px; } }
+
+/* Read-only payment order management. */
+.a-order-page h1 { display:flex; align-items:center; gap:10px; }
+.a-order-table { min-width:2400px; }
+.a-order-section { padding:20px; margin:18px 0; }
+.a-order-section h2 { margin-top:0; }
+.a-order-tabs { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+.dk-admin .a-order-link { color:var(--a-accent); text-decoration:underline; overflow-wrap:anywhere; }
+button.a-order-link { border:0; background:none; font:inherit; text-align:left; cursor:pointer; padding:0; }
+.a-order-copy { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; overflow-wrap:anywhere; }
+.a-order-timeline { padding-left:22px; }
+.a-order-timeline li { padding:8px 0; }
+.a-order-timeline time { display:inline-block; margin-right:12px; color:var(--a-muted); font-size:var(--a-font-secondary); }
+@media(max-width:600px){ .a-order-section { padding:14px; } .a-order-page .a-page-heading { flex-direction:column; } }
