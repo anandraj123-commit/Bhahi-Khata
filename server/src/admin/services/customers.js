@@ -78,8 +78,7 @@ const customerProjection = {
 function registrationRange(filters) {
   const createdAt = {};
   if (filters.from) createdAt.$gte = new Date(filters.from);
-  if (filters.to)
-    createdAt.$lt = new Date(Date.parse(filters.to) + 86400000);
+  if (filters.to) createdAt.$lt = new Date(Date.parse(filters.to) + 86400000);
   return Object.keys(createdAt).length ? { createdAt } : {};
 }
 
@@ -167,9 +166,7 @@ export async function listCustomers(filters, forcedShopId) {
           ...(Object.keys(requested).length ? [{ $match: requested }] : []),
           { $count: "count" },
         ],
-        summary: [
-          { $group: { _id: "$lifecycleStatus", count: { $sum: 1 } } },
-        ],
+        summary: [{ $group: { _id: "$lifecycleStatus", count: { $sum: 1 } } }],
       },
     },
   ])
@@ -207,7 +204,14 @@ export async function customerDetail(id) {
     },
     { $unwind: "$shop" },
     { $addFields: { lifecycleStatus: lifecycleExpression } },
-    { $project: customerProjection },
+    {
+      $project: {
+        ...customerProjection,
+        phone: 1,
+        address: 1,
+        subscriptionArchived: 1,
+      },
+    },
   ])
     .option({ maxTimeMS: 5000 })
     .exec();
@@ -218,7 +222,15 @@ export async function customerDetail(id) {
 
 export async function customerShopOptions(filters) {
   const query = filters.q
-    ? { name: { $regex: literalSearch(filters.q), $options: "i" } }
+    ? {
+        $or: [
+          { name: { $regex: literalSearch(filters.q), $options: "i" } },
+          { phone: { $regex: literalSearch(filters.q), $options: "i" } },
+          ...(/^[a-f\d]{24}$/i.test(filters.q)
+            ? [{ _id: new mongoose.Types.ObjectId(filters.q) }]
+            : []),
+        ],
+      }
     : {};
   const [rows, total] = await Promise.all([
     Shop.find(query)

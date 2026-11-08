@@ -1,3 +1,4 @@
+import { adminFontVariables } from "../../lib/admin/fonts";
 import type { Metadata } from "next";
 import { AdminProviders } from "../../components/admin/layout/providers";
 import "./admin.css";
@@ -11,7 +12,7 @@ export const metadata: Metadata = {
 };
 export default function Layout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="dk-admin dk-admin-root">
+    <div className={`dk-admin dk-admin-root ${adminFontVariables}`}>
       <a className="a-skip" href="#admin-content">
         Skip to content
       </a>

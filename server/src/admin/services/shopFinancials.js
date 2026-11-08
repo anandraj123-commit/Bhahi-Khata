@@ -31,11 +31,11 @@ export const customerViews = new Set([
   "outstanding",
   "availableAdvance",
 ]);
-function chronology(shopId, filters = {}) {
+export function chronology(shopId, filters = {}, beforeWindow = []) {
   return [
     {
       $match: {
-        shopId,
+        ...(shopId ? { shopId } : {}),
         ...live,
         ...(filters.exactCustomerId
           ? { customerClientId: filters.exactCustomerId }
@@ -44,6 +44,9 @@ function chronology(shopId, filters = {}) {
     },
     {
       $project: {
+        shopId: 1,
+        reference: 1,
+        serverVersion: 1,
         clientId: 1,
         customerClientId: 1,
         type: 1,
@@ -63,7 +66,7 @@ function chronology(shopId, filters = {}) {
         pipeline: [
           {
             $match: {
-              shopId,
+              ...(shopId ? { shopId } : {}),
               ...live,
               ...(filters.exactCustomerId
                 ? { clientId: filters.exactCustomerId }
@@ -72,6 +75,7 @@ function chronology(shopId, filters = {}) {
           },
           {
             $project: {
+              shopId: 1,
               customerClientId: "$clientId",
               clientId: { $concat: ["opening:", "$clientId"] },
               type: { $literal: "opening" },
@@ -85,10 +89,11 @@ function chronology(shopId, filters = {}) {
     {
       $lookup: {
         from: Customer.collection.name,
+        let: { ledgerShop: "$shopId" },
         localField: "customerClientId",
         foreignField: "clientId",
         pipeline: [
-          { $match: { shopId, ...live } },
+          { $match: { ...live, $expr: { $eq: ["$shopId", "$$ledgerShop"] } } },
           {
             $project: {
               clientId: 1,
@@ -209,6 +214,7 @@ function chronology(shopId, filters = {}) {
         ),
       ),
     },
+    ...beforeWindow,
     {
       $set: {
         clock: {
@@ -268,7 +274,11 @@ function chronology(shopId, filters = {}) {
     },
     {
       $setWindowFields: {
-        partitionBy: { customer: "$customerClientId", segment: "$segment" },
+        partitionBy: {
+          shop: "$shopId",
+          customer: "$customerClientId",
+          segment: "$segment",
+        },
         sortBy: { date: 1, clock: 1, openingOrder: 1, clientId: 1 },
         output: {
           balance: {

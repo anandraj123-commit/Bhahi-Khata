@@ -1,4 +1,5 @@
 "use client";
+import { adminFontVariables } from "../../../lib/admin/fonts";
 import * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
@@ -131,7 +132,9 @@ export function Modal({
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="a-dialog-overlay" />
-        <DialogPrimitive.Content className="dk-admin a-dialog">
+        <DialogPrimitive.Content
+          className={`dk-admin a-dialog ${adminFontVariables}`}
+        >
           <DialogPrimitive.Title className="a-title">
             {title}
           </DialogPrimitive.Title>

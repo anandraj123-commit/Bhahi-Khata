@@ -1,10 +1,12 @@
 "use client";
+import { adminFontVariables } from "../../../lib/admin/fonts";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import {
+  ArrowLeftRight,
   LayoutDashboard,
   Store,
   Users,
@@ -47,6 +49,12 @@ export const navigation = [
     label: "Customers",
     icon: Users,
     permission: "customers:read",
+  },
+  {
+    href: "/admin/transactions",
+    label: "Transactions",
+    icon: ArrowLeftRight,
+    permission: "customers:transactions:read",
   },
   {
     href: "/admin/subscriptions",
@@ -161,7 +169,8 @@ export function AdminShell({
     } catch {}
   };
   const links = navigation.filter(
-    (item) => !item.permission || currentSession.permissions.includes(item.permission),
+    (item) => (!item.permission || currentSession.permissions.includes(item.permission)) &&
+      (item.href !== "/admin/transactions" || ["shops:read", "customers:read", "customers:financial:read"].every(permission => currentSession.permissions.includes(permission))),
   );
   const current =
     navigation.find((item) => item.href === path) ||
@@ -211,7 +220,7 @@ export function AdminShell({
         <Dialog.Root open={drawer} onOpenChange={setDrawer}>
           <Dialog.Portal>
             <Dialog.Overlay className="a-dialog-overlay" />
-            <Dialog.Content className="dk-admin a-mobile-drawer">
+            <Dialog.Content className={`dk-admin a-mobile-drawer ${adminFontVariables}`}>
               <Dialog.Title className="a-sr-only">Navigation</Dialog.Title>
               <Dialog.Description className="a-sr-only">
                 Administration pages
@@ -274,7 +283,7 @@ export function AdminShell({
                 </Dropdown.Trigger>
                 <Dropdown.Portal>
                   <Dropdown.Content
-                    className="dk-admin a-menu"
+                    className={`dk-admin a-menu ${adminFontVariables}`}
                     align="end"
                     sideOffset={10}
                   >

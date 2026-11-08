@@ -18,6 +18,9 @@ export type AdminSession = {
 export type Pagination = { page: number; limit: number; total: number; pages?: number };
 export type CustomerStatus = "active" | "disabled" | "removed" | "invalid";
 export type AdminCustomer = {
+  phone?: string;
+  address?: string;
+  subscriptionArchived?: boolean;
   _id: string;
   customerId: string;
   name: string;
