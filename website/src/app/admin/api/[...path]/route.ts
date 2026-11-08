@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { serverConfig } from "../../../../lib/admin/server";
 const allowed =
-  /^(auth\/(login|logout|me|reauth|forgot-password|reset-password)|dashboard|shops(?:\/[a-f\d]{24}(?:\/customers)?)?|customers(?:\/[a-f\d]{24}(?:\/(financial-summary|transactions|statement))?)?|customer-shops|plans|plans\/[a-f\d]{24}(?:\/customer-limit)?|subscriptions|payments|administrators(?:\/[a-f\d]{24})?|reports(?:\/export)?|audit-logs|referrals\/settings|settings(?:\/(profile|password|sessions\/[a-f\d]{24}))?)$/i;
+  /^(auth\/(login|logout|me|reauth|forgot-password|reset-password)|dashboard|shops(?:\/[a-f\d]{24}(?:\/(customers|financial-overview|financial-records))?)?|customers(?:\/[a-f\d]{24}(?:\/(financial-summary|transactions|statement))?)?|customer-shops|plans|plans\/[a-f\d]{24}(?:\/customer-limit)?|subscriptions|payments|payment-orders(?:\/[a-f\d]{24}\/reconcile)?|payment-recovery-events|payment-recovery-snapshots|payment-refunds|payment-health|administrators(?:\/[a-f\d]{24})?|reports(?:\/export)?|audit-logs|referrals\/settings|settings(?:\/(profile|password|sessions\/[a-f\d]{24}))?)$/i;
 function failure(status: number, code: string, message: string) {
   return NextResponse.json(
     { error: { code, message } },
@@ -16,6 +16,17 @@ async function proxy(
   const route = path.join("/");
   if (!allowed.test(route))
     return failure(404, "ADMIN_ROUTE_NOT_FOUND", "Endpoint not found");
+  if (route.startsWith("payment-")) {
+    const method = /^payment-orders\/[a-f\d]{24}\/reconcile$/i.test(route)
+      ? "POST"
+      : "GET";
+    if (req.method !== method)
+      return failure(
+        405,
+        "ADMIN_METHOD_NOT_ALLOWED",
+        `This endpoint requires ${method}`,
+      );
+  }
   try {
     const config = serverConfig();
     const origin = req.headers.get("origin");

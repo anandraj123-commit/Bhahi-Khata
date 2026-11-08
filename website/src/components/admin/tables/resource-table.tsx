@@ -10,7 +10,7 @@ import {
 import { date, money } from "../../../lib/admin/api";
 import { Badge, Button, Empty, ErrorState, Skeleton } from "../shared/ui";
 import { DateFilter } from "../shared/date-filter";
-import { PaymentOrders } from "./payment-orders";
+import { PaymentOrders, PaymentNotice } from "./payment-orders";
 import { PlanLimitManagement } from "./plan-limit-management";
 export type Resource =
   "shops" | "subscriptions" | "payments" | "audit-logs" | "administrators";
@@ -24,7 +24,7 @@ const status = (value: unknown) => (
 );
 const paymentPricing = (row: DataRow) =>
   row.pricingSnapshot && typeof row.pricingSnapshot === "object"
-    ? row.pricingSnapshot as Record<string, unknown>
+    ? (row.pricingSnapshot as Record<string, unknown>)
     : null;
 const columns: Record<Resource, Column[]> = {
   shops: [
@@ -69,20 +69,43 @@ const columns: Record<Resource, Column[]> = {
     { key: "startsAt", label: "Starts", render: (r) => date(r.startsAt) },
     { key: "expiresAt", label: "Expires", render: (r) => date(r.expiresAt) },
     { key: "durationMonths", label: "Months" },
-    { key: "remainingMilliseconds", label: "Preserved time", render: r => r.remainingMilliseconds ? `${Math.ceil(Number(r.remainingMilliseconds) / 60000)} min` : "—" },
+    {
+      key: "remainingMilliseconds",
+      label: "Preserved time",
+      render: (r) =>
+        r.remainingMilliseconds
+          ? `${Math.ceil(Number(r.remainingMilliseconds) / 60000)} min`
+          : "—",
+    },
     { key: "pauseReason", label: "Pause reason" },
   ],
   payments: [
     { key: "gatewayStatus", label: "Cashfree attempt status" },
-    { key: "reviewStatus", label: "Payment review", render: (r) => `${String(r.reviewStatus || "none")} · ${String(r.reviewReason || "—")}` },
-    { key: "planCode", label: "Purchased plan", render: (r) => String(r.planName || r.planCode || "—") },
-    { key: "durationMonths", label: "Duration", render: (r) => Number(r.durationMonths) > 0 ? `${r.durationMonths} months` : "—" },
+    {
+      key: "reviewStatus",
+      label: "Payment review",
+      render: (r) =>
+        `${String(r.reviewStatus || "none")} · ${String(r.reviewReason || "—")}`,
+    },
+    {
+      key: "planCode",
+      label: "Purchased plan",
+      render: (r) => String(r.planName || r.planCode || "—"),
+    },
+    {
+      key: "durationMonths",
+      label: "Duration",
+      render: (r) =>
+        Number(r.durationMonths) > 0 ? `${r.durationMonths} months` : "—",
+    },
     {
       key: "pricingSnapshot.basePriceMinor",
       label: "Base price",
       render: (r) => {
         const p = paymentPricing(r);
-        return p && Number.isSafeInteger(p.basePriceMinor) ? money(Number(p.basePriceMinor), "INR") : "—";
+        return p && Number.isSafeInteger(p.basePriceMinor)
+          ? money(Number(p.basePriceMinor), "INR")
+          : "—";
       },
     },
     {
@@ -90,8 +113,11 @@ const columns: Record<Resource, Column[]> = {
       label: "Discount",
       render: (r) => {
         const p = paymentPricing(r);
-        return p && Number.isFinite(p.discountPercent) && Number.isSafeInteger(p.discountAmountMinor)
-          ? `${p.discountPercent}% · −${money(Number(p.discountAmountMinor), "INR")}` : "—";
+        return p &&
+          Number.isFinite(p.discountPercent) &&
+          Number.isSafeInteger(p.discountAmountMinor)
+          ? `${p.discountPercent}% · −${money(Number(p.discountAmountMinor), "INR")}`
+          : "—";
       },
     },
     {
@@ -99,8 +125,11 @@ const columns: Record<Resource, Column[]> = {
       label: "Tax",
       render: (r) => {
         const p = paymentPricing(r);
-        return p && Number.isFinite(p.taxPercent) && Number.isSafeInteger(p.taxAmountMinor)
-          ? `${p.taxPercent}% · ${money(Number(p.taxAmountMinor), "INR")}` : "—";
+        return p &&
+          Number.isFinite(p.taxPercent) &&
+          Number.isSafeInteger(p.taxAmountMinor)
+          ? `${p.taxPercent}% · ${money(Number(p.taxAmountMinor), "INR")}`
+          : "—";
       },
     },
     {
@@ -137,9 +166,21 @@ const columns: Record<Resource, Column[]> = {
       label: "Verification",
       render: (r) => status(r.verificationStatus),
     },
-    { key: "subscriptionStartsAt", label: "Subscription starts", render: (r) => date(r.subscriptionStartsAt) },
-    { key: "subscriptionExpiresAt", label: "Subscription expires", render: (r) => date(r.subscriptionExpiresAt) },
-    { key: "gatewayCreatedAt", label: "Payment date", render: (r) => date(r.gatewayCreatedAt || r.verifiedAt || r.createdAt) },
+    {
+      key: "subscriptionStartsAt",
+      label: "Subscription starts",
+      render: (r) => date(r.subscriptionStartsAt),
+    },
+    {
+      key: "subscriptionExpiresAt",
+      label: "Subscription expires",
+      render: (r) => date(r.subscriptionExpiresAt),
+    },
+    {
+      key: "gatewayCreatedAt",
+      label: "Payment date",
+      render: (r) => date(r.gatewayCreatedAt || r.verifiedAt || r.createdAt),
+    },
   ],
   "audit-logs": [
     { key: "action", label: "Action" },
@@ -183,7 +224,14 @@ const columns: Record<Resource, Column[]> = {
 };
 const statuses: Partial<Record<Resource, string[]>> = {
   shops: ["enabled", "disabled", "unavailable"],
-  subscriptions: ["active", "expiring", "expired", "paused", "scheduled", "cancelled"],
+  subscriptions: [
+    "active",
+    "expiring",
+    "expired",
+    "paused",
+    "scheduled",
+    "cancelled",
+  ],
   payments: ["captured", "pending", "failed", "refunded", "partially_refunded"],
 };
 export function ResourceTable({
@@ -322,10 +370,17 @@ export function ResourceTable({
       {query.isPending || waiting ? (
         <Skeleton />
       ) : query.isError ? (
-        <ErrorState
-          message={query.error.message}
-          retry={() => void query.refetch()}
-        />
+        resource === "payments" ? (
+          <PaymentNotice
+            error={query.error}
+            retry={() => void query.refetch()}
+          />
+        ) : (
+          <ErrorState
+            message={query.error.message}
+            retry={() => void query.refetch()}
+          />
+        )
       ) : !query.data?.data.length ? (
         <Empty />
       ) : (
@@ -334,7 +389,16 @@ export function ResourceTable({
             <thead>
               <tr>
                 {columns[resource].map((c) => (
-                  <th key={c.key} scope="col">
+                  <th
+                    key={c.key}
+                    scope="col"
+                    className={
+                      resource === "payments" &&
+                      /amount|price|percent/i.test(c.key)
+                        ? "a-payment-number"
+                        : undefined
+                    }
+                  >
                     {c.label}
                   </th>
                 ))}
@@ -345,7 +409,15 @@ export function ResourceTable({
               {query.data.data.map((row) => (
                 <tr key={String(row._id || row.id)}>
                   {columns[resource].map((c) => (
-                    <td key={c.key}>
+                    <td
+                      key={c.key}
+                      className={
+                        resource === "payments" &&
+                        /amount|price|percent/i.test(c.key)
+                          ? "a-payment-number"
+                          : undefined
+                      }
+                    >
                       {c.render ? c.render(row) : String(row[c.key] ?? "—")}
                     </td>
                   ))}
@@ -391,6 +463,17 @@ export function ResourcePage({
 }: {
   resource: "shops" | "subscriptions" | "payments" | "audit-logs";
 }) {
+  if (resource === "payments")
+    return (
+      <PaymentOrders
+        verification={
+          <>
+            <SubscriptionSummary payments />
+            <ResourceTable resource="payments" />
+          </>
+        }
+      />
+    );
   const title = {
     shops: "Shops",
     subscriptions: "Subscriptions",
@@ -408,7 +491,6 @@ export function ResourcePage({
   }[resource];
   return (
     <>
-      {resource === "payments" && <PaymentOrders />}
       <div className="a-page-heading">
         <div>
           <div className="a-eyebrow">
@@ -419,12 +501,13 @@ export function ResourcePage({
           <h1>{title}</h1>
           <p>{description}</p>
         </div>
-        <Badge>{resource === "subscriptions" ? "Plan and pricing management" : "Read-only"}</Badge>
+        <Badge>
+          {resource === "subscriptions"
+            ? "Plan and pricing management"
+            : "Read-only"}
+        </Badge>
       </div>
       {resource === "subscriptions" && <PlanLimitManagement />}
-      {(resource === "subscriptions" || resource === "payments") && (
-        resource === "payments" && <SubscriptionSummary payments />
-      )}
       <ResourceTable resource={resource} />
       {resource === "subscriptions" && (
         <p className="a-definition">
@@ -433,10 +516,10 @@ export function ResourcePage({
           without a subscription record is not listed. Free-plan fallback limits
           use the current plan record. Paid subscriptions retain the customer
           limit in their plan snapshot until a new subscription or renewal is
-          recorded; changing a plan does not rewrite existing subscription terms.
-          Lowering a limit never deletes existing customers; the existing
-          capacity check prevents additional customer creation once the applicable
-          limit is reached.
+          recorded; changing a plan does not rewrite existing subscription
+          terms. Lowering a limit never deletes existing customers; the existing
+          capacity check prevents additional customer creation once the
+          applicable limit is reached.
         </p>
       )}
     </>
@@ -447,7 +530,9 @@ function SubscriptionSummary({ payments }: { payments: boolean }) {
   const d = query.data?.data;
   if (query.isPending) return <Skeleton rows={1} />;
   if (query.isError)
-    return (
+    return payments ? (
+      <PaymentNotice error={query.error} retry={() => void query.refetch()} />
+    ) : (
       <ErrorState
         message={query.error.message}
         retry={() => void query.refetch()}

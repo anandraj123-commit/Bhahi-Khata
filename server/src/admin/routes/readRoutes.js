@@ -6,7 +6,20 @@ import { audit } from "../services/audit.js";
 import { PaymentOrder, PaymentOrderRecovery } from "../../models.js";
 import { verifyPayment } from "../../services/subscriptionService.js";
 import { fail } from "../utils/security.js";
+import { shopFinancials } from "../services/shopFinancials.js";
+import { financialFilters } from "../validators/shopFinancials.js";
 const router = Router();
+for (const detail of [false, true]) router.get(
+  `/shops/:id/financial-${detail ? "records" : "overview"}`,
+  permit("shops:read"), permit("customers:read"), permit("customers:financial:read"), permit("customers:transactions:read"),
+  async (req, res) => {
+    const shopId = parse(id, req.params.id);
+    const f = detail ? parse(financialFilters, req.query) : null;
+    const result = await shopFinancials(shopId, f);
+    await audit(req, "shop.financial.read", "shop", shopId, { view: f?.view || "overview", page: String(f?.page || 1) });
+    res.json({ data: result });
+  },
+);
 function reportFilters(query) {
   const f = parse(filters, query);
   const end = f.to ? Date.parse(f.to) : Date.now();

@@ -624,12 +624,15 @@ export async function paymentRefunds(f) {
 export async function paymentHealth() {
   const mode = { appMode: process.env.APP_MODE };
   const cutoff = new Date(Date.now() - 3600_000);
-  const [webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews] = await Promise.all([
+  const [webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews, pendingReconciliation, verifiedRefunds, failedWebhookEvents] = await Promise.all([
     PaymentWebhookEvent.countDocuments({ ...mode, status: { $ne: "processed" } }),
     PaymentWebhookEvent.countDocuments({ ...mode, status: { $ne: "processed" }, createdAt: { $lt: cutoff } }),
     PaymentOrder.countDocuments({ ...mode, paymentReconciliationLastCode: { $exists: true } }),
     PaymentOrder.countDocuments({ ...mode, refundReconciliationLastCode: { $exists: true } }),
     PaymentOrderRecovery.countDocuments({ ...mode, reconciliationLastCode: { $exists: true } }),
+    PaymentOrder.countDocuments({ ...mode, status: { $in: ["created", "pending"] } }).maxTimeMS(10000),
+    PaymentRefund.countDocuments({ ...mode, verifiedAt: { $type: "date" } }).maxTimeMS(10000),
+    PaymentWebhookEvent.countDocuments({ ...mode, status: "failed" }).maxTimeMS(10000),
   ]);
-  return { webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews, observedAt: new Date() };
+  return { webhookBacklog, overdueWebhooks, orderErrors, refundErrors, missingOrderReviews, pendingReconciliation, verifiedRefunds, failedWebhookEvents, observedAt: new Date() };
 }

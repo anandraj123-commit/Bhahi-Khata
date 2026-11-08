@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
+import { useRef } from "react";
+import { ArrowLeft, Wallet } from "lucide-react";
 import type { ShopDetail as Detail } from "../../../types/admin";
 import { useAdminQuery } from "../../../hooks/admin/use-admin-query";
 import { date } from "../../../lib/admin/api";
@@ -9,10 +10,21 @@ import { Badge, Button, Empty, ErrorState, Skeleton } from "../shared/ui";
 import { ResourceTable } from "./resource-table";
 import { PaymentOrders } from "./payment-orders";
 import { ShopCustomers } from "./customer-management";
+import { ShopFinancialOverview } from "./shop-financial-overview";
 export function ShopDetail({ id }: { id: string }) {
   const query = useAdminQuery<Detail>(`shops/${id}`);
   const session = useAdmin();
   const d = query.data?.data;
+  const financialPanel = useRef<HTMLDivElement>(null);
+  const financialOverview = useRef<{ showOverview: () => void }>(null);
+  function openFinancialOverview() {
+    financialOverview.current?.showOverview();
+    financialPanel.current?.focus({ preventScroll: true });
+    financialPanel.current?.scrollIntoView({
+      block: "start",
+      behavior: "auto",
+    });
+  }
   return (
     <>
       <div className="a-page-heading">
@@ -20,16 +32,62 @@ export function ShopDetail({ id }: { id: string }) {
           <div className="a-eyebrow">SHOP DIRECTORY</div>
           <h1>{d ? String(d.shop.name || "Unnamed shop") : "Shop details"}</h1>
           <p>
-            Read-only account information. Customer ledgers and balances are not
-            exposed.
+            Read-only account information. Financial records are available below
+            to authorized administrators.
           </p>
         </div>
-        <Button asChild variant="outline">
-          <Link href="/admin/shops">
-            <ArrowLeft size={15} />
-            All shops
-          </Link>
-        </Button>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          <Button
+            type="button"
+            onClick={openFinancialOverview}
+            aria-controls="shop-financial-overview-panel"
+          >
+            <Wallet size={16} aria-hidden />
+            Shop Financial Overview
+          </Button>
+          <Button asChild variant="outline">
+            <Link href="/admin/shops">
+              <ArrowLeft size={15} />
+              All shops
+            </Link>
+          </Button>
+        </div>
+      </div>
+      <div
+        id="shop-financial-overview-panel"
+        ref={financialPanel}
+        tabIndex={-1}
+        role="region"
+        aria-label="Shop Financial Overview"
+        style={{ scrollMarginTop: 80 }}
+      >
+        {[
+          "shops:read",
+          "customers:read",
+          "customers:financial:read",
+          "customers:transactions:read",
+        ].every((permission) => session.permissions.includes(permission)) ? (
+          <ShopFinancialOverview
+            key={id}
+            shopId={id}
+            overviewRef={financialOverview}
+          />
+        ) : (
+          <section
+            className="a-card"
+            style={{ marginBottom: 24 }}
+            aria-label="Shop Financial Overview"
+          >
+            <div className="a-card-head">
+              <h2>Shop Financial Overview</h2>
+            </div>
+            <div className="a-card-body">
+              Your administrator role does not have permission to view customer
+              financial records. Contact a super administrator if you need
+              access.
+            </div>
+          </section>
+        )}
       </div>
       {query.isPending ? (
         <Skeleton />
@@ -134,8 +192,10 @@ export function ShopDetail({ id }: { id: string }) {
               <h2 className="a-title" style={{ margin: "24px 0 14px" }}>
                 Payment history
               </h2>
-              <PaymentOrders shopId={id} />
-              <ResourceTable resource="payments" shopId={id} />
+              <PaymentOrders
+                shopId={id}
+                verification={<ResourceTable resource="payments" shopId={id} />}
+              />
             </>
           )}
           <p className="a-definition">
