@@ -2,11 +2,21 @@
 import { adminFontVariables } from "../../../lib/admin/fonts";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import {
   ReceiptText,
+  Webhook,
+  FileQuestion,
+  RotateCcw,
   ArrowLeftRight,
   LayoutDashboard,
   Store,
@@ -71,7 +81,7 @@ export const navigation = [
   },
   {
     href: "/admin/payments",
-    label: "Payments",
+    label: "Payment Dashboard",
     icon: Wallet,
     permission: "payments:read",
   },
@@ -79,6 +89,31 @@ export const navigation = [
     href: "/admin/payment-orders",
     label: "Payment Orders",
     icon: ReceiptText,
+    permission: "payments:read",
+  },
+
+  {
+    href: "/admin/payment-transactions",
+    label: "Payment Transactions",
+    icon: CreditCard,
+    permission: "payments:read",
+  },
+  {
+    href: "/admin/webhook-events",
+    label: "Webhook Events",
+    icon: Webhook,
+    permission: "payments:read",
+  },
+  {
+    href: "/admin/payment-recoveries",
+    label: "Payment Recoveries",
+    icon: FileQuestion,
+    permission: "payments:read",
+  },
+  {
+    href: "/admin/refunds-disputes",
+    label: "Refunds & Disputes",
+    icon: RotateCcw,
     permission: "payments:read",
   },
   {
@@ -128,6 +163,7 @@ export function AdminShell({
   const toast = useToast();
   const [collapsed, setCollapsed] = useState(false);
   const [drawer, setDrawer] = useState(false);
+  const [paymentsOpen, setPaymentsOpen] = useState(true);
   const [dark, setDark] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [currentSession, setCurrentSession] = useState(session);
@@ -176,8 +212,13 @@ export function AdminShell({
     } catch {}
   };
   const links = navigation.filter(
-    (item) => (!item.permission || currentSession.permissions.includes(item.permission)) &&
-      (item.href !== "/admin/transactions" || ["shops:read", "customers:read", "customers:financial:read"].every(permission => currentSession.permissions.includes(permission))),
+    (item) =>
+      (!item.permission ||
+        currentSession.permissions.includes(item.permission)) &&
+      (item.href !== "/admin/transactions" ||
+        ["shops:read", "customers:read", "customers:financial:read"].every(
+          (permission) => currentSession.permissions.includes(permission),
+        )),
   );
   const current =
     navigation.find((item) => item.href === path) ||
@@ -185,8 +226,9 @@ export function AdminShell({
       ? { label: "Shop details" }
       : path.startsWith("/admin/customers/")
         ? { label: "Customer details" }
-        : path.startsWith("/admin/payment-orders/") ? { label: "Payment order details" }
-        : { label: "Administration" });
+        : path.startsWith("/admin/payment-orders/")
+          ? { label: "Payment order details" }
+          : { label: "Administration" });
   const sidebar = (
     <>
       <Link href="/admin" className="a-brand">
@@ -199,19 +241,71 @@ export function AdminShell({
       </Link>
       <div className="a-nav-label">WORKSPACE</div>
       <nav aria-label="Administration">
-        {links.map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            title={collapsed ? item.label : undefined}
-            onClick={() => setDrawer(false)}
-            className={`a-nav-link ${path === item.href || (item.href !== "/admin" && path.startsWith(item.href + "/")) ? "is-active" : ""}`}
-            aria-current={path === item.href ? "page" : undefined}
-          >
-            <item.icon size={19} />
-            <span>{item.label}</span>
-          </Link>
-        ))}
+        {links
+          .filter(
+            (item) =>
+              item.permission !== "payments:read" ||
+              item.href === "/admin/payments",
+          )
+          .map((item) =>
+            item.href === "/admin/payments" ? (
+              <div key="payments" className="a-payment-nav-group">
+                <button
+                  type="button"
+                  className={`a-nav-link a-payment-nav-toggle ${links.some((link) => link.permission === "payments:read" && (path === link.href || path.startsWith(link.href + "/"))) ? "is-active" : ""}`}
+                  aria-label="Payments navigation"
+                  aria-expanded={paymentsOpen}
+                  onClick={() => setPaymentsOpen(!paymentsOpen)}
+                  title="Payments"
+                >
+                  <Wallet size={19} />
+                  <span>Payments</span>
+                  <ChevronDown
+                    size={15}
+                    style={{
+                      transform: paymentsOpen ? undefined : "rotate(-90deg)",
+                    }}
+                  />
+                </button>
+                {paymentsOpen && (
+                  <div className="a-payment-nav-children">
+                    {links
+                      .filter((link) => link.permission === "payments:read")
+                      .map((link) => (
+                        <Link
+                          key={link.href}
+                          href={link.href}
+                          title={link.label}
+                          onClick={() => setDrawer(false)}
+                          className={`a-nav-link ${path === link.href || path.startsWith(link.href + "/") ? "is-active" : ""}`}
+                          aria-current={
+                            path === link.href ||
+                            path.startsWith(link.href + "/")
+                              ? "page"
+                              : undefined
+                          }
+                        >
+                          <link.icon size={18} />
+                          <span>{link.label}</span>
+                        </Link>
+                      ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <Link
+                key={item.href}
+                href={item.href}
+                title={collapsed ? item.label : undefined}
+                onClick={() => setDrawer(false)}
+                className={`a-nav-link ${path === item.href || (item.href !== "/admin" && path.startsWith(item.href + "/")) ? "is-active" : ""}`}
+                aria-current={path === item.href ? "page" : undefined}
+              >
+                <item.icon size={19} />
+                <span>{item.label}</span>
+              </Link>
+            ),
+          )}
       </nav>
       <div className="a-sidebar-note">
         <ShieldCheck size={18} />
@@ -228,7 +322,9 @@ export function AdminShell({
         <Dialog.Root open={drawer} onOpenChange={setDrawer}>
           <Dialog.Portal>
             <Dialog.Overlay className="a-dialog-overlay" />
-            <Dialog.Content className={`dk-admin a-mobile-drawer ${adminFontVariables}`}>
+            <Dialog.Content
+              className={`dk-admin a-mobile-drawer ${adminFontVariables}`}
+            >
               <Dialog.Title className="a-sr-only">Navigation</Dialog.Title>
               <Dialog.Description className="a-sr-only">
                 Administration pages
@@ -277,7 +373,9 @@ export function AdminShell({
               <Dropdown.Root>
                 <Dropdown.Trigger className="a-profile">
                   <span className="a-avatar">
-                    {currentSession.administrator.name.slice(0, 2).toUpperCase()}
+                    {currentSession.administrator.name
+                      .slice(0, 2)
+                      .toUpperCase()}
                   </span>
                   <span className="a-profile-text">
                     {currentSession.administrator.name}

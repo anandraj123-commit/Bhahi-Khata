@@ -1,4 +1,5 @@
 "use client";
+import Link from "next/link";
 import { PaymentOrderLink } from "../shared/payment-order-link";
 import { useId, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -64,6 +65,8 @@ function amount(row: DataRow) {
 function paymentError(error: Error | null) {
   if (!(error instanceof AdminApiError))
     return "Unable to retrieve payment records";
+  if (error.code === "ADMIN_PAYMENT_QUERY_FAILED") return "Database query failed — payment records could not be loaded";
+  if (error.code === "ADMIN_INVALID_RESPONSE") return "Incompatible API response — records could not be displayed";
   if (error.status === 401) return "Session expired — please sign in";
   if (error.status === 403) return "Access denied";
   if (error.status === 404) return "Endpoint or record unavailable";
@@ -362,6 +365,13 @@ export function PaymentOrders({
           </Button>
         </div>
       </header>
+      {!shopId && <nav aria-label="Payment monitoring shortcuts" className="a-payment-shortcuts">
+        <Link href="/admin/payment-orders?attention=true">Orders requiring attention</Link>
+        <Link href="/admin/payment-transactions">All payment transactions</Link>
+        <Link href="/admin/webhook-events?status=failed">Failed webhook events</Link>
+        <Link href="/admin/payment-recoveries?status=parent_missing">Missing-parent recovery evidence</Link>
+        <Link href="/admin/refunds-disputes">Refunds &amp; disputes</Link>
+      </nav>}
       <div className="a-payment-metrics">
         {summaries.map(
           ({ title, value, icon: Icon, target, note, loading }) => (

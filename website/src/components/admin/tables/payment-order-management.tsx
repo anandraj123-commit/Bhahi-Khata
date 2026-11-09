@@ -690,13 +690,13 @@ function Fields({ entries }: { entries: [string, unknown][] }) {
     </dl>
   );
 }
-function AttemptModal({
+export function PaymentAttemptModal({
   id,
   parentId,
   close,
 }: {
   id: string;
-  parentId: string;
+  parentId?: string;
   close: () => void;
 }) {
   const query = useAdminQuery<Row>("payments/" + id);
@@ -717,7 +717,7 @@ function AttemptModal({
           message={query.error.message}
           retry={() => void query.refetch()}
         />
-      ) : r && r.resolvedOrderId === parentId ? (
+      ) : r && (!parentId || r.resolvedOrderId === parentId) ? (
         <>
           <PaymentOrderLink id={r.resolvedOrderId} />
           <CopyId value={r._id} />
@@ -1265,7 +1265,7 @@ export function PaymentOrderDetail({ id }: { id: string }) {
         )
       )}
       {attempt && (
-        <AttemptModal
+        <PaymentAttemptModal
           id={attempt}
           parentId={id}
           close={() => setAttempt(null)}

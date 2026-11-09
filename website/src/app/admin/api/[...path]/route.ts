@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { serverConfig } from "../../../../lib/admin/server";
 const allowed =
-  /^(auth\/(login|logout|me|reauth|forgot-password|reset-password)|dashboard|shops(?:\/[a-f\d]{24}(?:\/(customers|financial-overview|financial-records))?)?|customers(?:\/[a-f\d]{24}(?:\/(financial-summary|transactions|statement))?)?|transactions(?:\/[a-f\d]{24})?|customer-shops|plans|plans\/[a-f\d]{24}(?:\/customer-limit)?|subscriptions|payments(?:\/[a-f\d]{24})?|payment-orders(?:\/[a-f\d]{24}(?:\/(reconcile|records))?)?|payment-recovery-events|payment-recovery-snapshots|payment-refunds|payment-health|administrators(?:\/[a-f\d]{24})?|reports(?:\/export)?|audit-logs|referrals\/settings|settings(?:\/(profile|password|sessions\/[a-f\d]{24}))?)$/i;
+  /^(auth\/(login|logout|me|reauth|forgot-password|reset-password)|dashboard|shops(?:\/[a-f\d]{24}(?:\/(customers|financial-overview|financial-records))?)?|customers(?:\/[a-f\d]{24}(?:\/(financial-summary|transactions|statement))?)?|transactions(?:\/[a-f\d]{24})?|customer-shops|plans|plans\/[a-f\d]{24}(?:\/customer-limit)?|subscriptions|payments(?:\/[a-f\d]{24})?|payment-orders(?:\/[a-f\d]{24}(?:\/(reconcile|records))?)?|payment-recovery-events|payment-recovery-snapshots|payment-refunds|payment-health|payment-monitoring\/(attempts|webhooks|recoveries|refunds)|administrators(?:\/[a-f\d]{24})?|reports(?:\/export)?|audit-logs|referrals\/settings|settings(?:\/(profile|password|sessions\/[a-f\d]{24}))?)$/i;
 function failure(status: number, code: string, message: string) {
   return NextResponse.json(
     { error: { code, message } },

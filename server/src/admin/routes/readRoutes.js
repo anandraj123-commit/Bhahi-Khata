@@ -1,3 +1,5 @@
+import { monitoringKind, monitoringFilters } from "../validators/paymentMonitoring.js";
+import { paymentMonitoring } from "../services/paymentMonitoring.js";
 import { Router } from "express";
 import {
   permit,
@@ -196,4 +198,8 @@ router.get(
 );
 router.get("/payments/:id", permit("payments:read"), async (req, res) =>
   res.json({ data: await paymentAttemptDetail(parse(id, req.params.id)) }),
+);
+
+router.get("/payment-monitoring/:kind", permit("payments:read"), async (req, res) =>
+  res.json(await paymentMonitoring(parse(monitoringKind, req.params.kind), parse(monitoringFilters, req.query))),
 );
