@@ -156,10 +156,17 @@ export async function retryOfflineStorageInitialization() {
 async function runMigrations(db: SQLiteTypes.SQLiteDatabase) {
   const currentVersion =
     (await db.getFirstAsync<{ user_version: number }>("PRAGMA user_version"))?.user_version || 0;
-  if (currentVersion > 6) throw new Error("Offline database version is newer than this app");
+  if (currentVersion > 8) throw new Error("Offline database version is newer than this app");
   await db.execAsync("PRAGMA journal_mode = WAL;");
   await withEncryptedTransaction(db, async (tx) => {
     await tx.execAsync(`
+      CREATE TABLE IF NOT EXISTS local_notification_counts (account_id TEXT PRIMARY KEY NOT NULL, unread INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS local_notifications (
+        account_id TEXT NOT NULL, notification_id TEXT NOT NULL, record_json TEXT NOT NULL,
+        read_local INTEGER NOT NULL DEFAULT 0, pending_read INTEGER NOT NULL DEFAULT 0,
+        visible INTEGER NOT NULL DEFAULT 1, published_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, notification_id)
+      );
       CREATE TABLE IF NOT EXISTS local_accounts (
         account_id TEXT PRIMARY KEY NOT NULL, shop_json TEXT NOT NULL,
         preferences_json TEXT NOT NULL, updated_at INTEGER NOT NULL
@@ -243,6 +250,7 @@ async function runMigrations(db: SQLiteTypes.SQLiteDatabase) {
       }
       await tx.execAsync("PRAGMA user_version = 6;");
     }
+    if (currentVersion < 8) await tx.execAsync("PRAGMA user_version = 8;");
   });
 }
 
@@ -1672,7 +1680,7 @@ export async function clearOfflineAccount(accountId: string) {
   const db = await openDatabase();
   if (db)
     await withEncryptedTransaction(db, async (transaction) => {
-      for (const table of ["local_accounts", "local_customers", "local_ledger", "local_audit", "local_subscription_cache", "sync_queue"])
+      for (const table of ["local_accounts", "local_customers", "local_ledger", "local_audit", "local_subscription_cache", "local_notifications", "local_notification_counts", "sync_queue"])
         await transaction.runAsync(`DELETE FROM ${table} WHERE account_id = ?`, accountId);
     });
   await SecureStore.deleteItemAsync(OFFLINE_SESSION);
@@ -1704,4 +1712,147 @@ export async function rotateOfflineSessionToken(
   } catch {
     await clearOfflineSession();
   }
+}
+
+// Notification reads are monotonic commands in the existing encrypted database.
+// They are isolated from financially ordered ledger deltas.
+export async function readNotificationCache(
+  accountId: string,
+  limit = 20,
+  offset = 0,
+) {
+  const db = await openDatabase();
+  if (!db)
+    return {
+      items: [] as import("./notificationTypes").InboxNotice[],
+      unread: 0,
+      total: 0,
+    };
+  const rows = await db.getAllAsync<{
+    record_json: string;
+    read_local: number;
+  }>(
+    "SELECT record_json, read_local FROM local_notifications WHERE account_id=? AND visible=1 ORDER BY published_at DESC, notification_id DESC LIMIT ? OFFSET ?",
+    accountId,
+    Math.min(10, limit),
+    Math.max(0, offset),
+  );
+  const counts = await db.getFirstAsync<{ total: number }>(
+    "SELECT COUNT(*) AS total FROM local_notifications WHERE account_id=? AND visible=1",
+    accountId,
+  );
+  const snapshot = await db.getFirstAsync<{ unread: number }>(
+    "SELECT unread FROM local_notification_counts WHERE account_id=?", accountId,
+  );
+  return {
+    items: rows.map((r) => ({
+      ...JSON.parse(r.record_json),
+      read: !!r.read_local,
+    })) as import("./notificationTypes").InboxNotice[],
+    unread: snapshot?.unread ?? 0,
+    total: counts?.total || 0,
+  };
+}
+export async function cacheNotifications(
+  accountId: string,
+  items: import("./notificationTypes").InboxNotice[],
+  hiddenIds: string[] = [],
+) {
+  const db = await openDatabase();
+  if (!db) throw Error("Encrypted notification storage unavailable");
+  await withEncryptedTransaction(db, async (tx) => {
+    const stored = await tx.getFirstAsync<{ bytes: number }>(
+      "SELECT COALESCE(SUM(length(CAST(record_json AS BLOB))),0) AS bytes FROM local_notifications WHERE account_id=?", accountId,
+    );
+    let bytes = stored?.bytes || 0;
+    for (const row of items) {
+      let aliasRead = 0, aliasPending = 0;
+      for (const alias of row.aliases || []) {
+        if (alias === row.id) continue;
+        const old = await tx.getFirstAsync<{ read_local: number; pending_read: number; bytes: number }>(
+          "SELECT read_local,pending_read,length(CAST(record_json AS BLOB)) AS bytes FROM local_notifications WHERE account_id=? AND notification_id=?", accountId, alias,
+        );
+        if (old) {
+          aliasRead = Math.max(aliasRead, old.read_local); aliasPending = Math.max(aliasPending, old.pending_read);
+          bytes -= old.bytes;
+          await tx.runAsync("DELETE FROM local_notifications WHERE account_id=? AND notification_id=?", accountId, alias);
+        }
+      }
+      const previous = await tx.getFirstAsync<{ bytes: number }>(
+        "SELECT length(CAST(record_json AS BLOB)) AS bytes FROM local_notifications WHERE account_id=? AND notification_id=?", accountId, row.id,
+      );
+      const serialized = JSON.stringify(row);
+      bytes += new TextEncoder().encode(serialized).length - (previous?.bytes || 0);
+      if (bytes > 100 * 1024 * 1024) throw Error("Notification cache reached its 100 MiB account limit; existing cached content and read changes are preserved.");
+      await tx.runAsync(
+        "INSERT INTO local_notifications(account_id,notification_id,record_json,read_local,published_at) VALUES(?,?,?,?,?) ON CONFLICT(account_id,notification_id) DO UPDATE SET record_json=excluded.record_json, read_local=MAX(local_notifications.read_local,excluded.read_local),visible=1,published_at=excluded.published_at",
+        accountId,
+        row.id,
+        JSON.stringify(row),
+        row.read || aliasRead ? 1 : 0,
+        row.date,
+      );
+      if (aliasPending) await tx.runAsync("UPDATE local_notifications SET pending_read=1 WHERE account_id=? AND notification_id=?", accountId, row.id);
+    }
+    for (const id of hiddenIds)
+      await tx.runAsync(
+        "UPDATE local_notifications SET visible=0 WHERE account_id=? AND notification_id=?",
+        accountId,
+        id,
+      );
+  });
+}
+export async function readNotificationCommands(accountId: string) {
+  const db = await openDatabase();
+  return db
+    ? db.getAllAsync<{ notification_id: string }>(
+        "SELECT notification_id FROM local_notifications WHERE account_id=? AND pending_read=1 LIMIT 100",
+        accountId,
+      )
+    : [];
+}
+export async function cacheNotificationIds(accountId: string, after: string) {
+  const db = await openDatabase();
+  return db
+    ? db.getAllAsync<{ notification_id: string }>(
+        "SELECT notification_id FROM local_notifications WHERE account_id=? AND visible=1 AND notification_id>? ORDER BY notification_id LIMIT 2",
+        accountId,
+        after,
+      )
+    : [];
+}
+export async function markLocalNotificationRead(accountId: string, id: string) {
+  const db = await openDatabase();
+  if (!db) throw Error("Encrypted notification storage unavailable");
+  await withEncryptedTransaction(db, async (tx) => {
+    const result = await tx.runAsync(
+      "UPDATE local_notifications SET read_local=1,pending_read=1 WHERE account_id=? AND notification_id=? AND read_local=0", accountId, id,
+    );
+    if (result.changes) await tx.runAsync(
+      "UPDATE local_notification_counts SET unread=MAX(0,unread-1) WHERE account_id=?", accountId,
+    );
+  });
+}
+export async function acknowledgeNotificationReads(
+  accountId: string,
+  ids: string[],
+) {
+  const db = await openDatabase();
+  if (!db) return;
+  await withEncryptedTransaction(db, async (tx) => {
+    for (const id of ids)
+      await tx.runAsync(
+        "UPDATE local_notifications SET pending_read=0 WHERE account_id=? AND notification_id=?",
+        accountId,
+        id,
+      );
+  });
+}
+
+// Server-wide count, never a total inferred from the downloaded page.
+export async function cacheNotificationUnread(accountId: string, unread: number) {
+  if (!Number.isSafeInteger(unread) || unread < 0) return;
+  const db = await openDatabase();
+  if (!db) return;
+  await db.runAsync("INSERT INTO local_notification_counts(account_id,unread) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET unread=excluded.unread", accountId, unread);
 }

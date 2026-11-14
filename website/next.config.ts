@@ -1,4 +1,5 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 
 const nextConfig: NextConfig = {
   /* config options here */
@@ -40,7 +41,7 @@ const nextConfig: NextConfig = {
     ];
   },
   turbopack: {
-    root: __dirname,
+    root: path.join(__dirname, ".."),
     rules: {
       "*.css": {
         loaders: ["@tailwindcss/turbopack"],

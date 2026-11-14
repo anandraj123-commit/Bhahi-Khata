@@ -1,4 +1,5 @@
 import "./config/startupGuard.js";
+import { startAdminNotificationWorker } from "./notifications/publication.js";
 import mongoose from "mongoose";
 import { env, subscriptionConfig } from "./config/env.js";
 import { log, safeErrorContext } from "./config/logger.js";
@@ -88,6 +89,7 @@ server.on("error", (error) => {
     .catch(() => {})
     .finally(() => process.exit(1));
 });
+startAdminNotificationWorker(log);
 startReminderWorker(log);
 startSubscriptionReminderWorker(log);
 startPaymentReconciliationWorker(log);

@@ -30,6 +30,7 @@ module.exports = {
 
     android: {
       ...config.expo.android,
+      ...(process.env.GOOGLE_SERVICES_JSON ? { googleServicesFile: process.env.GOOGLE_SERVICES_JSON } : {}),
       usesCleartextTraffic: !production,
     },
   },

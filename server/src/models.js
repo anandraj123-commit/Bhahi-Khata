@@ -186,6 +186,23 @@ export const Notification = mongoose.model(
   new Schema(
     {
       shopId: { type: Schema.Types.ObjectId, required: true },
+      campaignId: Schema.Types.ObjectId,
+      visibleAfter: Date,
+      subscriptionReminderId: Schema.Types.ObjectId,
+      campaignMode: String,
+      recipientUserId: Schema.Types.ObjectId,
+      readAt: Date,
+      pushState: { type: String, enum: ["pending", "claimed", "ticket_accepted", "failed", "unknown", "skipped"] },
+      pushClaimedAt: Date,
+      pushAttempts: {type:Number,default:0},
+      pushNextAt: Date,
+      pushAccepted: Number,
+      pushRejected: Number,
+      pushError: String,
+      category: String,
+      pushTickets: {type:[new Schema({id:String,token:String,deviceUpdatedAt:Date,status:{type:String,enum:["pending","ok","error","unknown"]},code:String,checkedAt:Date},{_id:false})],select:false,default:undefined},
+      receiptState: {type:String,enum:["pending","complete","unknown"]},
+      receiptNextAt: Date, receiptLeaseUntil: Date, receiptAttempts:{type:Number,default:0},
       clientId: String,
       title: String,
       body: String,
@@ -196,6 +213,7 @@ export const Notification = mongoose.model(
   ),
 );
 Notification.schema.index({ shopId: 1, createdAt: -1, _id: -1 });
+Notification.schema.index({ campaignId: 1, shopId: 1, recipientUserId: 1 });
 export const Device = mongoose.model(
   "Device",
   new Schema(
@@ -466,6 +484,8 @@ export const SubscriptionNotificationLog = mongoose.model(
       scheduledAt: Date,
       status: { type: String, enum: ["scheduled", "sent", "failed", "delivered"], default: "scheduled" },
       deduplicationKey: { type: String, required: true },
+      deliveryUncertain: {type:Boolean,default:false},
+      attempts: {type:Number,default:1},
       sentAt: Date,
     },
     base,

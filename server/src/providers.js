@@ -112,7 +112,7 @@ export async function verifyOtp(phone, code) {
   }
   throw new Error("OTP service is not configured");
 }
-export async function sendPush(tokens, title, body, data = {}) {
+export async function sendPush(tokens, title, body, data = {}, options = {}) {
   if (!tokens.length) return;
   const receipts = [];
   for (let offset = 0; offset < tokens.length; offset += 100) {
@@ -121,6 +121,7 @@ export async function sendPush(tokens, title, body, data = {}) {
       .map((to) => ({ to, title, body, data, sound: "default", priority: "high" }));
     const response = await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
+      ...(options.signal ? { signal: options.signal } : {}),
       headers: {
         "content-type": "application/json",
         ...(env.EXPO_ACCESS_TOKEN

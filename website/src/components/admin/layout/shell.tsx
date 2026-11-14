@@ -13,6 +13,7 @@ import {
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import {
+  Bell,
   ReceiptText,
   Webhook,
   FileQuestion,
@@ -116,6 +117,7 @@ export const navigation = [
     icon: RotateCcw,
     permission: "payments:read",
   },
+  { href: "/admin/notifications", label: "Notifications", icon: Bell, permission: "notifications:read" },
   {
     href: "/admin/administrators",
     label: "Administrators",

@@ -1,0 +1,9 @@
+{
+  "sourceBytes": 2097152,
+  "maxDimension": 1200,
+  "maxSourceDimension": 4096,
+  "imageDataBytes": 512000,
+  "totalImageDataBytes": 3145728,
+  "documentBytes": 4194304,
+  "imagesPerField": 8
+}

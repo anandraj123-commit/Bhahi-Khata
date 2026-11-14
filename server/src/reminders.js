@@ -1,3 +1,7 @@
+import {
+  ownedPushDevices,
+  removeInvalidPushDevices,
+} from "./services/pushOwnership.js";
 import cron from "node-cron";
 import mongoose from "mongoose";
 import {
@@ -59,7 +63,7 @@ export function startReminderWorker(log) {
       try {
         const now = localParts(new Date(), timezone);
         const shops = await Shop.find({ "reminders.enabled": true })
-          .select("_id name reminders")
+          .select("_id ownerId name reminders")
           .lean();
         for (const shop of shops) {
           if (shop.reminders.time !== `${now.hour}:${now.minute}`) continue;
@@ -106,10 +110,15 @@ export function startReminderWorker(log) {
             const outstanding =
               Math.max(
                 0,
-                (customer.openingPaise || 0) - (customer.openingAdvancePaise || 0) +
+                (customer.openingPaise || 0) -
+                  (customer.openingAdvancePaise || 0) +
                   (totals.get(customer.clientId) || 0),
               ) / 100;
-            if (outstanding <= 0 || outstanding < Number(shop.reminders.minimum || 0)) continue;
+            if (
+              outstanding <= 0 ||
+              outstanding < Number(shop.reminders.minimum || 0)
+            )
+              continue;
             for (const channel of ["whatsapp", "sms"]) {
               if (!shop.reminders[channel]) continue;
               if (
@@ -119,11 +128,7 @@ export function startReminderWorker(log) {
                   !process.env.WHATSAPP_TEMPLATE_NAME)
               )
                 continue;
-              if (
-                channel === "sms" &&
-                !isSmsConfigured()
-              )
-                continue;
+              if (channel === "sms" && !isSmsConfigured()) continue;
               const phone = intlPhone(customer.phone);
               if (!phone) continue;
               let claim;
@@ -147,22 +152,25 @@ export function startReminderWorker(log) {
                     [customer.name, `₹${outstanding.toFixed(2)}`, shop.name],
                   );
                 else
-                  await sendSms(
-                    phone,
-                    { customer: customer.name, shop: shop.name, amount: outstanding },
-                  );
+                  await sendSms(phone, {
+                    customer: customer.name,
+                    shop: shop.name,
+                    amount: outstanding,
+                  });
                 await ReminderDelivery.updateOne(
                   { _id: claim._id },
                   { $set: { status: "sent", sentAt: new Date() } },
                 );
                 const notification = await Notification.create({
+                  _id: claim._id,
                   shopId: shop._id,
+                  recipientUserId: shop.ownerId,
+                  category: "balance_reminder",
                   title: "Reminder sent",
                   body: `A ${channel === "sms" ? "SMS" : "WhatsApp"} balance reminder was sent to ${customer.name}.`,
                 });
-                const tokens = await Device.find({ shopId: shop._id }).distinct(
-                  "token",
-                );
+                const devices = await ownedPushDevices(shop._id);
+                const tokens = devices.map((d) => d.token);
                 if (tokens.length) {
                   try {
                     const receipts = await sendPush(
@@ -170,20 +178,12 @@ export function startReminderWorker(log) {
                       "Khata reminder sent",
                       `A balance reminder was sent to ${customer.name}.`,
                     );
-                    const invalid = (receipts?.data || [])
-                      .map((r, i) =>
-                        r.status === "error" &&
-                        r.details?.error === "DeviceNotRegistered"
-                          ? tokens[i]
-                          : null,
-                      )
-                      .filter(Boolean);
-                    if (invalid.length)
-                      await Device.deleteMany({
-                        shopId: shop._id,
-                        token: { $in: invalid },
-                      });
-                } catch (e) {
+                    await removeInvalidPushDevices(
+                      shop._id,
+                      devices,
+                      receipts?.data,
+                    );
+                  } catch (e) {
                     log.warn(
                       {
                         errorName: e?.name || "Error",

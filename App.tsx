@@ -1,3 +1,7 @@
+import { NotificationBell, NotificationBadge } from "./src/NotificationBell";
+import { useNotificationInbox } from "./src/useNotificationInbox";
+import { NotificationContent } from "./src/NotificationContent";
+import type { InboxNotice } from "./src/notificationTypes";
 import { TransactionTypeBadge } from "./src/TransactionTypeBadge";
 import { CustomerContactInfo } from "./src/CustomerContactInfo";
 import { openCustomerContact } from "./src/customerContactActions";
@@ -36,6 +40,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  RefreshControl,
   Share,
   StyleSheet,
   TextInput,
@@ -43,7 +48,7 @@ import {
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import { isExpoGo, loadNotifications } from "./src/notificationRuntime";
+import { isExpoGo, loadNotifications, notificationProjectId } from "./src/notificationRuntime";
 import * as Device from "expo-device";
 import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
@@ -824,7 +829,12 @@ function AppContent() {
   const [otp, setOtp] = useState("");
   const [otpHint, setOtpHint] = useState<{ key: string; parameters?: Record<string, string | number> } | null>(null);
   const [otpVerified, setOtpVerified] = useState(false);
-  const [notices, setNotices] = useState<{id:string;title:string;body:string;read:boolean;date:string}[]>([]);
+  const notificationAccount = data.signedIn && data.shopExists !== false ? accountKey(data.shop.phone || "") : null;
+  const inbox = useNotificationInbox(notificationAccount || null, Boolean(notificationAccount));
+  const notices = inbox.items;
+  const [selectedNotice, setSelectedNotice] = useState<InboxNotice | null>(null);
+  useEffect(() => { setSelectedNotice(null); }, [notificationAccount]);
+  useEffect(() => { if (inbox.accessBlocked) setSelectedNotice(null); }, [inbox.accessBlocked]);
   const [seconds, setSeconds] = useState(30);
   const [busy, setBusy] = useState(false);
   const [syncStatus, setSyncStatus] = useState<SyncStatusState | { kind: "loading" }>({ kind: "loading" });
@@ -1684,16 +1694,23 @@ function AppContent() {
     if (!data.signedIn || data.shopExists === false) return;
     if (isExpoGo) return;
     let live = true;
+    let tokenListener: {remove:()=>void} | undefined;
     (async () => {
       try {
         const Notifications = await loadNotifications();
         if (Platform.OS === "android") await Notifications.setNotificationChannelAsync("default", { name: "Digital Khata", importance: Notifications.AndroidImportance.DEFAULT });
-        if (!Device.isDevice || !process.env.EXPO_PUBLIC_EAS_PROJECT_ID) return;
+        const projectId = notificationProjectId();
+        if (!Device.isDevice || !projectId) return;
+        Notifications.setNotificationHandler({ handleNotification: async () => ({
+          shouldShowAlert: true, shouldPlaySound: false, shouldSetBadge: false,
+          shouldShowBanner: true, shouldShowList: true,
+        }) });
         const current = await Notifications.getPermissionsAsync();
         const permission = current.granted ? current : await Notifications.requestPermissionsAsync();
         if (!permission.granted) return;
-        const token = await Notifications.getExpoPushTokenAsync({ projectId: process.env.EXPO_PUBLIC_EAS_PROJECT_ID });
+        const token = await Notifications.getExpoPushTokenAsync({ projectId });
         if (live) await api.registerPushToken(token.data, Platform.OS === "ios" ? "ios" : "android");
+        if(live) tokenListener=Notifications.addPushTokenListener(()=>{void Notifications.getExpoPushTokenAsync({projectId}).then(fresh=>{if(live)return api.registerPushToken(fresh.data,Platform.OS === "ios" ? "ios" : "android");}).catch(()=>{});});
       } catch {
         if (live)
           Alert.alert(
@@ -1702,8 +1719,8 @@ function AppContent() {
           );
       }
     })();
-    return () => { live = false; };
-  }, [data.signedIn, data.shopExists]);
+    return () => { live = false; tokenListener?.remove(); };
+  }, [data.signedIn, data.shopExists, data.shop.phone]);
   useEffect(() => observeConnectivity(setConnectivityStatus), []);
   useEffect(() => {
     if (route.screen !== "referral" || !data.signedIn || data.shopExists === false) return;
@@ -1833,6 +1850,22 @@ function AppContent() {
         const Notifications = await loadNotifications();
         const openSubscription = (response: any) => {
           const target = response?.notification?.request?.content?.data;
+          if (target?.screen === "notifications") {
+            if (target.shopId === subscriptionSnapshotRef.current?.current?.shopId)
+              go("notifications");
+            if (typeof target.notificationId === "string" && /^[a-f\d]{24}$/i.test(target.notificationId)) {
+              const account = offlineAccountRef.current;
+              // Backend ownership validation works even before subscription data loads.
+              void api.getNotification(target.notificationId).then(notice => {
+                if (live && account === offlineAccountRef.current) {
+                  go("notifications");
+                  setSelectedNotice(notice);
+                  void inbox.read(notice);
+                }
+              }).catch(() => {});
+            }
+          }
+
           if (
             target?.screen === "subscription" &&
             (target?.accountId === offlineAccountRef.current ||
@@ -1849,19 +1882,8 @@ function AppContent() {
       live = false;
       subscription?.remove();
     };
-  }, [data.signedIn, data.shopExists]);
-  useEffect(() => {
-    if (route.screen !== "notifications" || !data.signedIn || data.shopExists === false) return;
-    api
-      .getNotifications()
-      .then((result) => setNotices(result.items))
-      .catch(() =>
-        Alert.alert(
-          "Unable to load notifications",
-          "Check your connection and open Notifications again to retry.",
-        ),
-      );
-  }, [route.screen, data.signedIn, data.shopExists]);
+  }, [data.signedIn, data.shopExists, data.shop.phone]);
+  useEffect(() => { if (["home", "more", "notifications"].includes(route.screen)) void inbox.refresh(); }, [route.screen]);
   useEffect(() => {
     if (route.screen !== "otp" || seconds <= 0) return;
     const t = setTimeout(() => setSeconds(seconds - 1), 1000);
@@ -3756,12 +3778,7 @@ function AppContent() {
               </Text>
               <Hint>{data.shop.name}</Hint>
             </View>
-            <Pressable
-              accessibilityLabel="Notifications"
-              onPress={() => go("notifications")}
-            >
-              <Icon name="notifications-outline" />
-            </Pressable>
+            <NotificationBell unread={inbox.unread} onPress={() => go("notifications")} />
           </View>
           <View style={s.split}>
             {stat("Current Outstanding", money(financial.outstandingPaise / 100), financial.outstandingPaise > 0 ? "red" : "neutral", true, "wallet-outline")}
@@ -5022,54 +5039,47 @@ function AppContent() {
       break;
     case "notifications":
       {
-      const noticesPage = pageRecords(notices);
-      const recentActivityPage = pageRecords(data.audit.slice(0, 30));
+      const noticesPage = { items: notices, hasMore: false };
       content = (
         <>
           <Hint>Account updates and delivery activity</Hint>
+          {!inbox.online && <Hint>Offline · showing previously synchronized notifications.</Hint>}
+          {inbox.error ? <Hint>{inbox.error}</Hint> : null}
+          <Button title={inbox.busy ? "Refreshing notifications…" : "Refresh notifications"} onPress={() => { void inbox.refresh(); }} />
+          {!notices.length && !inbox.busy && <Hint>{inbox.online ? "No eligible notifications yet." : "No cached notifications. Connect to synchronize new messages."}</Hint>}
           {noticesPage.items.map((notice) => (
             <Card key={notice.id} style={{ backgroundColor: notice.read ? "white" : colors.pale }}>
               <Row title={notice.title} subtitle={`${notice.body}\n${new Date(notice.date).toLocaleString("en-IN")}`} value={notice.read ? "Read" : "New"} onPress={() => {
-                if (notice.read) return;
-                api.markNotificationsRead([notice.id]).then(() => setNotices(old => old.map(n => n.id === notice.id ? { ...n, read: true } : n))).catch(error => Alert.alert("Unable to update", errorMessage(error, "Please try again.")));
+                setSelectedNotice({ ...notice, read: true }); void inbox.read(notice);
               }} />
             </Card>
           ))}
           {listFooter(noticesPage.hasMore)}
-          <Hint>Recent activity</Hint>
-          {data.audit.length === 0 && (
-            <Empty
-              title="You’re all caught up"
-              description="New customers and transaction confirmations appear here."
-            />
-          )}
-          {recentActivityPage.items.map((a) => (
-            <Card
-              key={a.id}
-              style={{
-                backgroundColor: data.read.includes(a.id)
-                  ? "white"
-                  : colors.pale,
-              }}
-            >
-              <Row
-                title={a.action}
-                subtitle={new Date(a.date).toLocaleString("en-IN")}
-                value={data.read.includes(a.id) ? "Read" : "New"}
-                onPress={() => {
-                  commit({ ...data, read: [...new Set([...data.read, a.id])] });
-                }}
-              />
-            </Card>
-          ))}
-          {listFooter(recentActivityPage.hasMore)}
-          {outstanding > 0 && (
-            <Row
-              title="Monthly statements available"
-              subtitle="Review pending balances in Khata"
-              onPress={() => go("khata")}
-            />
-          )}
+          {inbox.hasMore && <Button title="Load more notifications" onPress={inbox.loadMore} />}
+          <Modal visible={Boolean(selectedNotice)} animationType="slide" onRequestClose={()=>setSelectedNotice(null)}>
+            <SafeAreaView style={{ flex: 1, backgroundColor: "white" }}>
+              <View style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border }}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to notifications"
+                  onPress={() => setSelectedNotice(null)}
+                  style={({ pressed }) => ({ minWidth: 48, minHeight: 48, alignItems: "center", justifyContent: "center", borderRadius: 24, backgroundColor: pressed ? colors.pale : "transparent" })}
+                >
+                  <Icon name="arrow-back" size={24} color={colors.dark} />
+                </Pressable>
+                <Text accessibilityRole="header" style={{ flex: 1, fontSize: 18, fontWeight: "600", color: colors.dark, marginLeft: 8 }}>Notification</Text>
+              </View>
+              <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 24, paddingBottom: 32 }}>
+                <View style={{ width: "100%", maxWidth: 720, alignSelf: "center" }}>
+                  {selectedNotice?.description ? (
+                    <NotificationContent key={`${notificationAccount}:${selectedNotice.id}:full`} notificationId={selectedNotice.id} document={selectedNotice.description} />
+                  ) : (
+                    <Text selectable style={{ fontSize: 16, lineHeight: 26, color: colors.dark }}>{selectedNotice?.body}</Text>
+                  )}
+                </View>
+              </ScrollView>
+            </SafeAreaView>
+          </Modal>
         </>
       );
       break;
@@ -5182,7 +5192,8 @@ function AppContent() {
             <Row
               key={screen}
               title={screen === "downloadReports" ? t("Download", data.language) : titles[screen] || screen}
-              icon={screen === "downloadReports" ? "download-outline" : screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "notifications" ? "notifications-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "referral" ? "gift-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
+              iconOverlay={screen === "notifications" ? <NotificationBadge unread={inbox.unread} /> : undefined}
+              icon={screen === "notifications" ? "notifications-outline" : screen === "downloadReports" ? "download-outline" : screen === "profile" ? "person-circle-outline" : screen === "manageCustomers" ? "people-outline" : screen === "reports" ? "bar-chart-outline" : screen === "settings" ? "settings-outline" : screen === "help" ? "help-circle-outline" : screen === "subscription" ? "card-outline" : screen === "referral" ? "gift-outline" : screen === "audit" ? "document-text-outline" : "log-out-outline"}
               onPress={() => go(screen)}
             />
           ))}
@@ -6129,6 +6140,7 @@ function AppContent() {
           ) : (
             <ScrollView
               key={`${route.screen}-${route.id || ""}`}
+              refreshControl={route.screen === "notifications" ? <RefreshControl refreshing={inbox.busy} onRefresh={() => { void inbox.refresh(); }} /> : undefined}
               keyboardShouldPersistTaps="handled"
               contentContainerStyle={s.content}
               onScroll={handleListScroll}

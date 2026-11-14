@@ -568,17 +568,13 @@ export async function restoreBackup(data: Data) {
   });
   return loadAccount();
 }
-export async function getNotifications() {
-  return request("/notifications") as Promise<{
-    items: {
-      id: string;
-      title: string;
-      body: string;
-      read: boolean;
-      date: string;
-    }[];
-  }>;
+export async function getNotifications(page=1) {
+  return request(`/notifications?page=${page}&limit=2`) as Promise<{items:import("./notificationTypes").InboxNotice[];unread:number;hasMore:boolean;total:number}>;
 }
+export async function reconcileNotifications(ids:string[]) {
+  return request("/notifications/reconcile",{method:"POST",body:JSON.stringify({ids})}) as Promise<{items:import("./notificationTypes").InboxNotice[];hiddenIds:string[]}>;
+}
+export async function getNotification(id:string) { return request(`/notifications/${encodeURIComponent(id)}`) as Promise<import("./notificationTypes").InboxNotice>; }
 export async function markNotificationsRead(ids: string[]) {
   return request("/notifications/read", {
     method: "PATCH",
@@ -934,4 +930,10 @@ export type CustomerSelection = { version: string; limit: number | null; custome
 export function getCustomerSelection(): Promise<CustomerSelection> { return request("/customers/selection"); }
 export function applyCustomerSelection(input: { activeIds: string[]; operationId: string; expectedVersion: string }): Promise<{ activeIds: string[]; archivedIds: string[] }> {
   return request("/customers/selection", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function getNotificationImage(id:string,mediaId:string):Promise<{contentType:string;data:string;width:number;height:number}>{ return request(`/notifications/${encodeURIComponent(id)}/media/${encodeURIComponent(mediaId)}`); }
+
+export async function prepareSubscriptionInbox() {
+  return request("/notifications/subscription-reminders", { method: "POST", body: "{}" });
 }

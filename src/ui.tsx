@@ -300,6 +300,7 @@ export function Row({
   onPress,
   icon,
   color = colors.dark,
+  iconOverlay,
 }: {
   title: string;
   subtitle?: string;
@@ -307,6 +308,7 @@ export function Row({
   onPress?: () => void;
   icon?: React.ComponentProps<typeof Ionicons>["name"];
   color?: string;
+  iconOverlay?: React.ReactNode;
 }) {
   const rowIcon = icon || (onPress ? "chevron-forward" : undefined);
   return (
@@ -321,7 +323,7 @@ export function Row({
         {subtitle && <Text style={s.small}>{subtitle}</Text>}
       </View>
       {value && <Text style={{ color, fontWeight: "700" }}>{value}</Text>}
-      {rowIcon && <Icon name={rowIcon} color={onPress ? colors.muted : color} size={18} />}
+      {rowIcon && (iconOverlay ? <View style={{ position: "relative", overflow: "visible" }}><Icon name={rowIcon} color={onPress ? colors.muted : color} size={18} />{iconOverlay}</View> : <Icon name={rowIcon} color={onPress ? colors.muted : color} size={18} />)}
     </Pressable>
   );
 }

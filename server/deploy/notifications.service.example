@@ -1,0 +1,19 @@
+# Install only after approval. Use instead of the in-API notification scheduler.
+# Use a separate deployment directory/environment from the API (whose notification flag stays false).
+# Selected .env.production must pass the existing environment guard.
+[Unit]
+Description=Digital Khata notification publisher
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=digital-khata
+WorkingDirectory=/opt/digital-khata-notifications/server
+ExecStart=/usr/bin/node --env-file=.env.production --import=./src/config/startupGuard.js src/notifications/worker.mjs
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=35
+NoNewPrivileges=true
+PrivateTmp=true
+[Install]
+WantedBy=multi-user.target

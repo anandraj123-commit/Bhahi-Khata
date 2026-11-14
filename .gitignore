@@ -50,3 +50,6 @@ server/.env
 # Extracted reference pages and local build output
 .reference/
 artifacts/
+
+# Next.js shared-workspace build cache
+/.next/
